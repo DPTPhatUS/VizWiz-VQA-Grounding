@@ -1,6 +1,6 @@
 import argparse
 import torch
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -15,6 +15,11 @@ from models import TextEncoder, ImageEncoder, GroundingModel
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--data-root", type=str, default="data/vizwiz")
+parser.add_argument("--num-epochs", type=int, default=None, help="Override num_epochs from config.yml")
+parser.add_argument("--batch-size", type=int, default=None, help="Override batch_size from config.yml")
+parser.add_argument("--lr", type=float, default=None, help="Override lr from config.yml")
+parser.add_argument("--num-workers", type=int, default=None, help="Override num_workers from config.yml")
+parser.add_argument("--resume-checkpoint", type=str, default=None, help="Override resume_checkpoint from config.yml; pass empty string to disable resume")
 args = parser.parse_args()
 
 # create output directory if not exists
@@ -29,6 +34,18 @@ config["dataset"]["train_image_root"] = os.path.join(args.data_root, "train")
 config["dataset"]["train_mask_root"] = os.path.join(args.data_root, "binary_masks_png", "train")
 config["dataset"]["val_image_root"] = os.path.join(args.data_root, "val")
 config["dataset"]["val_mask_root"] = os.path.join(args.data_root, "binary_masks_png", "val")
+
+# CLI overrides — only apply if explicitly provided
+if args.num_epochs is not None:
+    config["num_epochs"] = args.num_epochs
+if args.batch_size is not None:
+    config["batch_size"] = args.batch_size
+if args.lr is not None:
+    config["lr"] = args.lr
+if args.num_workers is not None:
+    config["num_workers"] = args.num_workers
+if args.resume_checkpoint is not None:
+    config["resume_checkpoint"] = args.resume_checkpoint
 
 # dataset
 train_set = VizWizGroundingDataset(
@@ -102,7 +119,7 @@ for epoch in range(start_epoch, config["num_epochs"]):
         masks = batch["mask"]
         texts = batch["text"]
 
-        with autocast():
+        with autocast('cuda'):
             pred_masks = model(images, texts)
             pred_masks = nn.functional.interpolate(pred_masks, size=masks.shape[-2:], mode='bilinear')
             loss = loss_fn(pred_masks, masks)
