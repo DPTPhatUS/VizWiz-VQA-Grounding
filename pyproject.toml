@@ -1,0 +1,14 @@
+[project]
+name = "vizwiz-vqa-grounding"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pyyaml>=6.0.3",
+    "torch>=2.12.1",
+    "torchaudio>=2.11.0",
+    "torchvision>=0.27.1",
+    "tqdm>=4.68.4",
+    "transformers>=5.13.0",
+]
