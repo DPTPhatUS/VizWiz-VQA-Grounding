@@ -18,9 +18,9 @@ class GroundingModel(nn.Module):
         self.decoder = UNetDecoder(in_channels=self.hidden_dim)
 
     def forward(self, image, text):
-        img_feat = self.image_encoder(image)  # (B, D, H, W)
-        B, D, H, W = img_feat.shape
-        img_tokens = img_feat.flatten(2).permute(0, 2, 1)  # (B, N, D)
+        enc_feat1, enc_feat2, enc_feat3, bottleneck = self.image_encoder(image)
+        B, D, H, W = bottleneck.shape
+        img_tokens = bottleneck.flatten(2).permute(0, 2, 1)  # (B, N, D)
 
         text_tokens = self.text_encoder(text)              # (B, L, D_text)
         text_tokens = self.text_proj(text_tokens)          # align to (B, L, D)
@@ -28,5 +28,5 @@ class GroundingModel(nn.Module):
         attn_output, _ = self.cross_attn(query=img_tokens, key=text_tokens, value=text_tokens)
         fused = attn_output.permute(0, 2, 1).view(B, D, H, W)
 
-        output = self.decoder(fused)
+        output = self.decoder(fused, enc_feat3, enc_feat2, enc_feat1)
         return output
