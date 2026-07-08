@@ -1,4 +1,4 @@
-# metric IoU 값 계산
+# compute IoU metric
 
 import torch
 import torch.nn.functional as F

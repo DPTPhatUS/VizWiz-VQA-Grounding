@@ -1,1 +1,1 @@
-# 놀랍다... 여기 왜 아무것도 없는데, 뭐가 되냐?
+# Amazing... why is there nothing here but it works?

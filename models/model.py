@@ -8,10 +8,10 @@ class GroundingModel(nn.Module):
         self.image_encoder = ImageEncoder()
         self.text_encoder = TextEncoder()
 
-        # 이미지 hidden dim 기준으로 고정
-        self.hidden_dim = self.image_encoder.out_channels  # 일반적으로 768
+        # fixed based on image hidden dim
+        self.hidden_dim = self.image_encoder.out_channels  # typically 768
 
-        # 텍스트 차원이 다른 경우를 대비해 강제 변환
+        # project text dim to match hidden dim
         self.text_proj = nn.Linear(self.text_encoder.output_dim, self.hidden_dim)
 
         self.cross_attn = nn.MultiheadAttention(embed_dim=self.hidden_dim, num_heads=n_heads, batch_first=True)
@@ -23,7 +23,7 @@ class GroundingModel(nn.Module):
         img_tokens = img_feat.flatten(2).permute(0, 2, 1)  # (B, N, D)
 
         text_tokens = self.text_encoder(text)              # (B, L, D_text)
-        text_tokens = self.text_proj(text_tokens)          # 🔧 (B, L, D)로 맞춤
+        text_tokens = self.text_proj(text_tokens)          # align to (B, L, D)
 
         attn_output, _ = self.cross_attn(query=img_tokens, key=text_tokens, value=text_tokens)
         fused = attn_output.permute(0, 2, 1).view(B, D, H, W)

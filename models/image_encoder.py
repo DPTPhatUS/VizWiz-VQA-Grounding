@@ -17,7 +17,7 @@ class ImageEncoder(nn.Module):
         outputs = self.vision_encoder(x, output_hidden_states=True)
         hidden_states = outputs.hidden_states
 
-        # 예: 중간 레이어 3개 + 마지막 bottleneck
+        # intermediate layers + final bottleneck
         enc_feat1 = hidden_states[4]  # (B, seq, D)
         enc_feat2 = hidden_states[7]
         enc_feat3 = hidden_states[9]

@@ -7,21 +7,20 @@ import torch.nn.functional as F
 
 from torchvision import transforms as T
 
-# 경로 설정
 val_json = "data/vizwiz/val_grounding.json"
 image_dir = "data/vizwiz/val"
 mask_dir = "data/vizwiz/binary_masks_png/val"
 
-# 1. 모델 로드
+# 1. load model
 model = GroundingModel()
 model.load_state_dict(torch.load("outputs/cross_model_final_epoch100.pt"))
 model.eval().cuda()
 
-# 2. val json 불러오기
+# 2. load val json
 with open(val_json, "r") as f:
     val_data = json.load(f)
 
-# 3. IoU 계산
+# 3. compute IoU
 ious = []
 
 transform = T.Compose([
@@ -45,5 +44,5 @@ for filename, meta in val_data.items():
     iou = compute_iou(pred_mask, true_mask)
     ious.append(iou)    
 
-# 4. 평균 IoU 출력
+# 4. output mean IoU
 print(f"Mean IoU over {len(ious)} samples: {sum(ious)/len(ious):.4f}")

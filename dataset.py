@@ -35,27 +35,27 @@ class VizWizGroundingDataset(Dataset):
         else:
             mask = Image.new("L", self.image_size)
 
-        # Resize 이미지/마스크 (동일하게)
+        # resize image and mask
         image = self.resize(image)
         mask = self.resize(mask)
 
-        # 동일한 증강 적용 (rotation + flip)
+        # apply same augmentation (rotation + flip)
         if not self.is_test:
-            # 회전
+            # rotation
             angle = random.choice([0, 90, 180, 270])
             if angle != 0:
                 image = image.rotate(angle)
                 mask = mask.rotate(angle)
 
-            # 좌우 반전
+            # horizontal flip
             if random.random() > 0.5:
                 image = TF.hflip(image)
                 mask = TF.hflip(mask)
 
-        # 텐서 변환
+        # convert to tensor
         image = self.to_tensor(image)
         mask = self.to_tensor(mask)
-        mask = (mask > 0.5).float()  # Binary mask 처리
+        mask = (mask > 0.5).float()
 
         return {
             "image": image,

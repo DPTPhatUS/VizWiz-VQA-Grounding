@@ -1,5 +1,6 @@
+import argparse
 import torch
-from torch.cuda.amp import autocast, GradScaler  # ✅ 추가
+from torch.cuda.amp import autocast, GradScaler
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -12,12 +13,22 @@ from dataset import VizWizGroundingDataset
 from utils import to_device, compute_iou
 from models import TextEncoder, ImageEncoder, GroundingModel
 
-# 출력 디렉토리 생성 (없으면)
+parser = argparse.ArgumentParser()
+parser.add_argument("--data-root", type=str, default="data/vizwiz")
+args = parser.parse_args()
+
+# create output directory if not exists
 os.makedirs("outputs", exist_ok=True)
 
-# config
 with open("config.yml", "r") as f:
     config = yaml.safe_load(f)
+
+config["dataset"]["train_json"] = os.path.join(args.data_root, "train_grounding.json")
+config["dataset"]["val_json"] = os.path.join(args.data_root, "val_grounding.json")
+config["dataset"]["train_image_root"] = os.path.join(args.data_root, "train")
+config["dataset"]["train_mask_root"] = os.path.join(args.data_root, "binary_masks_png", "train")
+config["dataset"]["val_image_root"] = os.path.join(args.data_root, "val")
+config["dataset"]["val_mask_root"] = os.path.join(args.data_root, "binary_masks_png", "val")
 
 # dataset
 train_set = VizWizGroundingDataset(
@@ -36,17 +47,17 @@ train_loader = DataLoader(
     train_set,
     batch_size=config["batch_size"],
     shuffle=True,
-    num_workers=config["num_workers"],  # ✅ 24 → 8~12 정도로 줄이자
+    num_workers=config["num_workers"],  # reduce to 8~12 if OOM
     pin_memory=True,
-    prefetch_factor=2  # 4 → 2로 줄이면 부담 덜함
+    prefetch_factor=2  # reduced from 4 to 2 to lower cpu load
 )
 val_loader = DataLoader(
     val_set,
     batch_size=config["batch_size"],
     shuffle=True,
-    num_workers=config["num_workers"],  # ✅ 24 → 8~12 정도로 줄이자
+    num_workers=config["num_workers"],  # reduce to 8~12 if OOM
     pin_memory=True,
-    prefetch_factor=2  # 4 → 2로 줄이면 부담 덜함
+    prefetch_factor=2  # reduced from 4 to 2 to lower cpu load
 )
 
 # model
@@ -62,20 +73,13 @@ scaler = GradScaler()
 resume_path = config.get("resume_checkpoint", None)
 start_epoch = 0
 
-
-#10 Epoch마다 저장장
-    # start_epoch = int(resume_path.split("epoch")[1].split(".")[0])  # 파일명에서 에폭 추출하는 방식 (선택)
-    # 그 다음 range(start_epoch, config["num_epochs"])로 바꿔서 학습 재시작 가능하게 만들기
-    # config 파일 예시: resume_checkpoint: outputs/checkpoint_epoch10.pt 등등
-
 if resume_path and os.path.exists(resume_path):
     model.load_state_dict(torch.load(resume_path))
     print(f"✅ Resumed model from {resume_path}")
-    # 자동으로 epoch 번호 추정
     try:
         start_epoch = int(resume_path.split("epoch")[1].split(".")[0])
     except Exception:
-        start_epoch = 0  # 실패 시 0부터 시작
+        start_epoch = 0
 
 # training loop
 for epoch in range(start_epoch, config["num_epochs"]):
@@ -125,20 +129,12 @@ for epoch in range(start_epoch, config["num_epochs"]):
 
     avg_val_loss = val_loss / len(val_loader)
     print(f"[Epoch {epoch+1}] Average Validation Loss: {avg_val_loss:.4f}")
-    # 10 epoch마다 체크포인트 저장
+    # save checkpoint every 10 epochs
     if (epoch + 1) % 10 == 0:
         checkpoint_path = f"outputs/cross_checkpoint_epoch{epoch+1}.pt"
         torch.save(model.state_dict(), checkpoint_path)
         print(f"✅ Checkpoint saved at {checkpoint_path}")
 
-
-
-# 최종save
+# save final model
 torch.save(model.state_dict(), f"outputs/cross_model_final_epoch{config['num_epochs']}.pt")
 print(f" Final model saved")
-
-
-'''
-# GPU 병렬 사용
-torch.save(model.module.state_dict(), "outputs/clip-vit-large-patch14-336_epoch100.pt")
-'''
