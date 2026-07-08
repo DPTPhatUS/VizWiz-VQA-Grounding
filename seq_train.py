@@ -1,5 +1,5 @@
 import torch
-from torch.amp import autocast, GradScaler
+from torch.cuda.amp import autocast, GradScaler
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -44,13 +44,21 @@ start_epoch = 100
 total_epochs = 300
 
 # load checkpoint
-checkpoint_path = f"outputs/baic_checkpoint_epoch{start_epoch}.pt"
+checkpoint_path = f"outputs/checkpoint_epoch{start_epoch}.pt"
 if os.path.exists(checkpoint_path):
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-    print(f"✅ Loaded model checkpoint from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scaler_state_dict' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        start_epoch = checkpoint.get('epoch', start_epoch)
+        print(f"✅ Resumed full training state from {checkpoint_path} (epoch {start_epoch})")
+    else:
+        model.load_state_dict(checkpoint)
+        print(f"✅ Loaded model from {checkpoint_path}")
 else:
-    print(f"❌ Checkpoint {checkpoint_path} not found. Starting from scratch.")
-    start_epoch = 0
+    print(f"❌ Checkpoint {checkpoint_path} not found. Starting from epoch {start_epoch}.")
 
 # Training loop
 for epoch in range(start_epoch, total_epochs):
@@ -66,7 +74,7 @@ for epoch in range(start_epoch, total_epochs):
 
         optimizer.zero_grad()
 
-        with autocast(device_type='cuda'):
+        with autocast():
             pred_masks = model(images, texts)
             pred_masks = nn.functional.interpolate(pred_masks, size=masks.shape[-2:], mode='bilinear')
             loss = loss_fn(pred_masks, masks)
@@ -103,10 +111,16 @@ for epoch in range(start_epoch, total_epochs):
 
     # Save checkpoint
     if (epoch + 1) % 10 == 0:
-        ckpt_path = f"outputs/baic_checkpoint_epoch{epoch+1}.pt"
-        torch.save(model.state_dict(), ckpt_path)
+        ckpt_path = f"outputs/checkpoint_epoch{epoch+1}.pt"
+        torch.save({
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'loss': avg_train_loss,
+        }, ckpt_path)
         print(f"✅ Checkpoint saved at {ckpt_path}")
 
 # Save final model
-torch.save(model.state_dict(), f"outputs/baic_model_final_epoch{total_epochs}.pt")
+torch.save(model.state_dict(), f"outputs/model_final_epoch{total_epochs}.pt")
 print("✅ Final model saved.")

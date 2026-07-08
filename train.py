@@ -74,12 +74,21 @@ resume_path = config.get("resume_checkpoint", None)
 start_epoch = 0
 
 if resume_path and os.path.exists(resume_path):
-    model.load_state_dict(torch.load(resume_path))
-    print(f"✅ Resumed model from {resume_path}")
-    try:
-        start_epoch = int(resume_path.split("epoch")[1].split(".")[0])
-    except Exception:
-        start_epoch = 0
+    checkpoint = torch.load(resume_path)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scaler_state_dict' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        start_epoch = checkpoint.get('epoch', 0)
+        print(f"✅ Resumed full training state from {resume_path} (epoch {start_epoch})")
+    else:
+        model.load_state_dict(checkpoint)
+        print(f"✅ Resumed model from {resume_path}")
+        try:
+            start_epoch = int(resume_path.split("epoch")[1].split(".")[0])
+        except Exception:
+            start_epoch = 0
 
 # training loop
 for epoch in range(start_epoch, config["num_epochs"]):
@@ -131,10 +140,16 @@ for epoch in range(start_epoch, config["num_epochs"]):
     print(f"[Epoch {epoch+1}] Average Validation Loss: {avg_val_loss:.4f}")
     # save checkpoint every 10 epochs
     if (epoch + 1) % 10 == 0:
-        checkpoint_path = f"outputs/cross_checkpoint_epoch{epoch+1}.pt"
-        torch.save(model.state_dict(), checkpoint_path)
+        checkpoint_path = f"outputs/checkpoint_epoch{epoch+1}.pt"
+        torch.save({
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'loss': avg_train_loss,
+        }, checkpoint_path)
         print(f"✅ Checkpoint saved at {checkpoint_path}")
 
 # save final model
-torch.save(model.state_dict(), f"outputs/cross_model_final_epoch{config['num_epochs']}.pt")
+torch.save(model.state_dict(), f"outputs/model_final_epoch{config['num_epochs']}.pt")
 print(f" Final model saved")
