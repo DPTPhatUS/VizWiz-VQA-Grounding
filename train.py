@@ -91,7 +91,7 @@ resume_path = config.get("resume_checkpoint", None)
 start_epoch = 0
 
 if resume_path and os.path.exists(resume_path):
-    checkpoint = torch.load(resume_path)
+    checkpoint = torch.load(resume_path, map_location="cpu")
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -99,6 +99,8 @@ if resume_path and os.path.exists(resume_path):
             scaler.load_state_dict(checkpoint['scaler_state_dict'])
         start_epoch = checkpoint.get('epoch', 0)
         print(f"✅ Resumed full training state from {resume_path} (epoch {start_epoch})")
+        del checkpoint
+        torch.cuda.empty_cache()
     else:
         model.load_state_dict(checkpoint)
         print(f"✅ Resumed model from {resume_path}")
