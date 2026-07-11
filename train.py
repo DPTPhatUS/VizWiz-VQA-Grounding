@@ -36,15 +36,9 @@ def setup_distributed():
 
 
 def set_deterministic(seed: int = 42):
-    """Seed everything and force deterministic cuDNN/cuBLAS so multi-GPU
-    training produces bit-exact results identical to single-GPU."""
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    # warn_only=True: won't crash if a specific op has no deterministic impl
-    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def cleanup_distributed():
