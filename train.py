@@ -275,6 +275,7 @@ def main():
                     "loss": avg_train_loss,
                 },
                 ckpt_path,
+                _use_new_zipfile_serialization=False,
             )
             print(f"✅ Checkpoint saved at {ckpt_path}")
 
