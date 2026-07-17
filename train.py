@@ -58,6 +58,8 @@ def main():
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--resume-checkpoint", type=str, default=None)
+    parser.add_argument("--validate-every", type=int, default=0,
+                        help="Validate every N epochs (default: 0 = skip validation).")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -93,6 +95,8 @@ def main():
         config["num_workers"] = args.num_workers
     if args.resume_checkpoint is not None:
         config["resume_checkpoint"] = args.resume_checkpoint
+
+    validate_every = args.validate_every
 
     # Per-GPU batch size  (keeps effective batch size == config["batch_size"])
     per_gpu_bs = config["batch_size"] // world_size
@@ -236,31 +240,32 @@ def main():
             print(f"[Epoch {epoch+1}] Average Training Loss: {avg_train_loss:.4f}")
 
         # ---- Validation ----
-        model.eval()
-        val_loss_sum = 0.0
+        if validate_every > 0 and (epoch + 1) % validate_every == 0:
+            model.eval()
+            val_loss_sum = 0.0
 
-        loop = tqdm(val_loader, desc=f"Epoch {epoch+1}/{config['num_epochs']} (Val)", disable=(rank != 0))
-        with torch.no_grad():
-            for batch in loop:
-                batch = to_device(batch, device)
-                images, masks, texts = batch["image"], batch["mask"], batch["text"]
+            loop = tqdm(val_loader, desc=f"Epoch {epoch+1}/{config['num_epochs']} (Val)", disable=(rank != 0))
+            with torch.no_grad():
+                for batch in loop:
+                    batch = to_device(batch, device)
+                    images, masks, texts = batch["image"], batch["mask"], batch["text"]
 
-                pred = model(images, texts)
-                pred = nn.functional.interpolate(pred, size=masks.shape[-2:], mode="bilinear")
-                loss = loss_fn(pred, masks)
-                val_loss_sum += loss.item()
-                if rank == 0:
-                    loop.set_postfix(loss=f"{loss.item():.4f}")
+                    pred = model(images, texts)
+                    pred = nn.functional.interpolate(pred, size=masks.shape[-2:], mode="bilinear")
+                    loss = loss_fn(pred, masks)
+                    val_loss_sum += loss.item()
+                    if rank == 0:
+                        loop.set_postfix(loss=f"{loss.item():.4f}")
 
-        avg_val_loss = val_loss_sum / len(val_loader)
+            avg_val_loss = val_loss_sum / len(val_loader)
 
-        if is_dist:
-            t = torch.tensor([avg_val_loss], device=device)
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            avg_val_loss = t.item() / world_size
+            if is_dist:
+                t = torch.tensor([avg_val_loss], device=device)
+                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+                avg_val_loss = t.item() / world_size
 
-        if rank == 0:
-            print(f"[Epoch {epoch+1}] Average Validation Loss: {avg_val_loss:.4f}")
+            if rank == 0:
+                print(f"[Epoch {epoch+1}] Average Validation Loss: {avg_val_loss:.4f}")
 
         # ---- Checkpoint (rank 0 only) ----
         if rank == 0 and (epoch + 1) % 10 == 0:
