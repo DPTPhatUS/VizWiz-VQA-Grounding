@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import yaml
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from dataset import VizWizGroundingDataset
 from utils import to_device
