@@ -60,6 +60,8 @@ def main():
     parser.add_argument("--resume-checkpoint", type=str, default=None)
     parser.add_argument("--validate-every", type=int, default=0,
                         help="Validate every N epochs (default: 0 = skip validation).")
+    parser.add_argument("--save-every", type=int, default=10,
+                        help="Save checkpoint every N epochs (default: 10).")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -268,7 +270,7 @@ def main():
                 print(f"[Epoch {epoch+1}] Average Validation Loss: {avg_val_loss:.4f}")
 
         # ---- Checkpoint (rank 0 only) ----
-        if rank == 0 and (epoch + 1) % 10 == 0:
+        if rank == 0 and (epoch + 1) % args.save_every == 0:
             ckpt_path = f"outputs/checkpoint_epoch{epoch+1}.pt"
             underlying_model = model.module if is_dist else model
             torch.save(
