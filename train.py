@@ -197,6 +197,13 @@ def main():
         del checkpoint
         torch.cuda.empty_cache()
 
+    # --- Log file (rank 0 only) ---
+    log_file = None
+    if rank == 0:
+        log_name = f"train_loss_{start_epoch+1}_{config['num_epochs']}.txt"
+        log_path = os.path.join(args.output_dir, log_name)
+        log_file = open(log_path, "w")
+
     # Sync all ranks before starting training
     if is_dist:
         dist.barrier()
@@ -242,6 +249,8 @@ def main():
 
         if rank == 0:
             print(f"[Epoch {epoch+1}] Average Training Loss: {avg_train_loss:.4f}")
+            log_file.write(f"train epoch={epoch+1} loss={avg_train_loss:.6f}\n")
+            log_file.flush()
 
         # ---- Validation ----
         if validate_every > 0 and (epoch + 1) % validate_every == 0:
@@ -270,6 +279,8 @@ def main():
 
             if rank == 0:
                 print(f"[Epoch {epoch+1}] Average Validation Loss: {avg_val_loss:.4f}")
+                log_file.write(f"val epoch={epoch+1} loss={avg_val_loss:.6f}\n")
+                log_file.flush()
 
         # ---- Checkpoint (rank 0 only) ----
         if rank == 0 and (epoch + 1) % args.save_every == 0:
@@ -294,6 +305,8 @@ def main():
         final_path = os.path.join(args.output_dir, f"model_final_epoch{config['num_epochs']}.pt")
         torch.save(underlying_model.state_dict(), final_path)
         print(f"🔚 Final model saved → {final_path}")
+        log_file.close()
+        print(f"📝 Training log saved → {log_path}")
 
     cleanup_distributed()
 
