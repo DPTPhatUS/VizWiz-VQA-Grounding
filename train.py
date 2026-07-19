@@ -62,6 +62,8 @@ def main():
                         help="Validate every N epochs (default: 0 = skip validation).")
     parser.add_argument("--save-every", type=int, default=10,
                         help="Save checkpoint every N epochs (default: 10).")
+    parser.add_argument("--output-dir", type=str, default="outputs",
+                        help="Directory to save checkpoints and final model (default: outputs).")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -74,7 +76,7 @@ def main():
 
     # Only rank 0 writes to disk
     if rank == 0:
-        os.makedirs("outputs", exist_ok=True)
+        os.makedirs(args.output_dir, exist_ok=True)
 
     # --- Config ---
     with open("config.yml", "r") as f:
@@ -271,7 +273,7 @@ def main():
 
         # ---- Checkpoint (rank 0 only) ----
         if rank == 0 and (epoch + 1) % args.save_every == 0:
-            ckpt_path = f"outputs/checkpoint_epoch{epoch+1}.pt"
+            ckpt_path = os.path.join(args.output_dir, f"checkpoint_epoch{epoch+1}.pt")
             underlying_model = model.module if is_dist else model
             torch.save(
                 {
@@ -289,7 +291,7 @@ def main():
     # ---- Final model (rank 0 only) ----
     if rank == 0:
         underlying_model = model.module if is_dist else model
-        final_path = f"outputs/model_final_epoch{config['num_epochs']}.pt"
+        final_path = os.path.join(args.output_dir, f"model_final_epoch{config['num_epochs']}.pt")
         torch.save(underlying_model.state_dict(), final_path)
         print(f"🔚 Final model saved → {final_path}")
 
