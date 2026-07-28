@@ -3,6 +3,7 @@
 Usage:
     uv run eval.py --checkpoint outputs/checkpoint_epoch20.pt --dataset val
     uv run eval.py --checkpoint outputs/checkpoint_epoch20.pt --dataset test
+    uv run eval.py --dataset val                  # uses base model (random weights, no checkpoint)
 """
 
 import argparse
@@ -21,7 +22,7 @@ from metrics import compute_iou_per_sample
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--dataset", type=str, default="val", choices=["val", "test"])
     parser.add_argument("--data-root", type=str, default="data/vizwiz")
     parser.add_argument("--batch-size", type=int, default=8)
@@ -62,14 +63,18 @@ def main():
 
     # --- Model ---
     model = GroundingModel().to(device)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
 
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"])
-        print(f"Loaded checkpoint (epoch {checkpoint.get('epoch', '?')})")
+    if args.checkpoint is not None:
+        checkpoint = torch.load(args.checkpoint, map_location="cpu")
+
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            model.load_state_dict(checkpoint["model_state_dict"])
+            print(f"Loaded checkpoint (epoch {checkpoint.get('epoch', '?')})")
+        else:
+            model.load_state_dict(checkpoint)
+            print("Loaded raw state dict")
     else:
-        model.load_state_dict(checkpoint)
-        print("Loaded raw state dict")
+        print("No checkpoint provided — using base model (random weights)")
     model.eval()
 
     # --- Inference ---
@@ -106,7 +111,7 @@ def main():
         results_file = os.path.join(args.output_dir, f"results_{args.dataset}_{timestamp}.json")
         iou_values = list(per_sample_iou.values())
         summary = {
-            "checkpoint": args.checkpoint,
+            "checkpoint": args.checkpoint or "none (base model)",
             "dataset": args.dataset,
             "num_samples": len(per_sample_iou),
             "mean_iou": round(sum(iou_values) / len(iou_values), 6),
