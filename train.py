@@ -8,7 +8,6 @@ from torch.amp import autocast, GradScaler
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-import yaml
 from tqdm.auto import tqdm
 
 from dataset import VizWizGroundingDataset
@@ -50,13 +49,13 @@ def cleanup_distributed():
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    # --- CLI args (parsed before DDP so every rank sees identical args) ---
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", type=str, default="data/vizwiz")
-    parser.add_argument("--num-epochs", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--num-epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=0.00001)
+    parser.add_argument("--image-size", type=int, default=336)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--resume-checkpoint", type=str, default=None)
     parser.add_argument("--validate-every", type=int, default=0)
     parser.add_argument("--save-every", type=int, default=10)
@@ -75,45 +74,23 @@ def main():
     if rank == 0:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    # --- Config ---
-    with open("config.yml", "r") as f:
-        config = yaml.safe_load(f)
+    image_size = (args.image_size, args.image_size)
 
-    config["dataset"]["train_json"] = os.path.join(args.data_root, "train_grounding.json")
-    config["dataset"]["val_json"]   = os.path.join(args.data_root, "val_grounding.json")
-    config["dataset"]["train_image_root"] = os.path.join(args.data_root, "train")
-    config["dataset"]["train_mask_root"]  = os.path.join(args.data_root, "binary_masks_png", "train")
-    config["dataset"]["val_image_root"]   = os.path.join(args.data_root, "val")
-    config["dataset"]["val_mask_root"]    = os.path.join(args.data_root, "binary_masks_png", "val")
-
-    if args.num_epochs is not None:
-        config["num_epochs"] = args.num_epochs
-    if args.batch_size is not None:
-        config["batch_size"] = args.batch_size
-    if args.lr is not None:
-        config["lr"] = args.lr
-    if args.num_workers is not None:
-        config["num_workers"] = args.num_workers
-    if args.resume_checkpoint is not None:
-        config["resume_checkpoint"] = args.resume_checkpoint
-
-    validate_every = args.validate_every
-
-    # Per-GPU batch size  (keeps effective batch size == config["batch_size"])
-    per_gpu_bs = config["batch_size"] // world_size
+    # Per-GPU batch size  (keeps effective batch size == args.batch_size)
+    per_gpu_bs = args.batch_size // world_size
 
     # --- Datasets ---
     train_set = VizWizGroundingDataset(
-        json_path=config["dataset"]["train_json"],
-        image_root=config["dataset"]["train_image_root"],
-        mask_root=config["dataset"]["train_mask_root"],
-        image_size=tuple(config["image_size"]),
+        json_path=os.path.join(args.data_root, "train_grounding.json"),
+        image_root=os.path.join(args.data_root, "train"),
+        mask_root=os.path.join(args.data_root, "binary_masks_png", "train"),
+        image_size=image_size,
     )
     val_set = VizWizGroundingDataset(
-        json_path=config["dataset"]["val_json"],
-        image_root=config["dataset"]["val_image_root"],
-        mask_root=config["dataset"]["val_mask_root"],
-        image_size=tuple(config["image_size"]),
+        json_path=os.path.join(args.data_root, "val_grounding.json"),
+        image_root=os.path.join(args.data_root, "val"),
+        mask_root=os.path.join(args.data_root, "binary_masks_png", "val"),
+        image_size=image_size,
     )
 
     # --- Samplers & Loaders ---
@@ -126,7 +103,7 @@ def main():
         batch_size=per_gpu_bs,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
-        num_workers=config["num_workers"],
+        num_workers=args.num_workers,
         pin_memory=True,
         prefetch_factor=2,
     )
@@ -142,7 +119,7 @@ def main():
         batch_size=per_gpu_bs,
         shuffle=False,
         sampler=val_sampler,
-        num_workers=config["num_workers"],
+        num_workers=args.num_workers,
         pin_memory=True,
         prefetch_factor=2,
     )
@@ -160,16 +137,15 @@ def main():
                 find_unused_parameters=True)
 
     # --- Optimizer / Loss / Scaler ---
-    optimizer = optim.Adam(model.parameters(), lr=config["lr"])
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = nn.BCEWithLogitsLoss()
     scaler = GradScaler()
 
     # --- Resume checkpoint ---
-    resume_path = config.get("resume_checkpoint", None)
     start_epoch = 0
 
-    if resume_path and os.path.exists(resume_path):
-        checkpoint = torch.load(resume_path, map_location="cpu")
+    if args.resume_checkpoint and os.path.exists(args.resume_checkpoint):
+        checkpoint = torch.load(args.resume_checkpoint, map_location="cpu")
         # Always load into the *unwrapped* model so state-dict keys match
         # regardless of DDP / SyncBN wrapping.
         underlying_model = model.module if is_dist else model
@@ -181,13 +157,13 @@ def main():
                 scaler.load_state_dict(checkpoint["scaler_state_dict"])
             start_epoch = checkpoint.get("epoch", 0)
             if rank == 0:
-                print(f"✅ Resumed full training state from {resume_path} (epoch {start_epoch})")
+                print(f"✅ Resumed full training state from {args.resume_checkpoint} (epoch {start_epoch})")
         else:
             underlying_model.load_state_dict(checkpoint)
             if rank == 0:
-                print(f"✅ Resumed model from {resume_path}")
+                print(f"✅ Resumed model from {args.resume_checkpoint}")
             try:
-                start_epoch = int(resume_path.split("epoch")[1].split(".")[0])
+                start_epoch = int(args.resume_checkpoint.split("epoch")[1].split(".")[0])
             except Exception:
                 start_epoch = 0
 
@@ -196,8 +172,9 @@ def main():
 
     # --- Log file (rank 0 only) ---
     log_file = None
+    log_path = None
     if rank == 0:
-        log_name = f"train_loss_{start_epoch+1}_{config['num_epochs']}.txt"
+        log_name = f"train_loss_{start_epoch+1}_{args.num_epochs}.txt"
         log_path = os.path.join(args.output_dir, log_name)
         log_file = open(log_path, "w")
 
@@ -208,7 +185,7 @@ def main():
     # ===================================================================
     #  Training loop
     # ===================================================================
-    for epoch in range(start_epoch, config["num_epochs"]):
+    for epoch in range(start_epoch, args.num_epochs):
         # Shuffle partitions differently each epoch  (mandatory for DDP)
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -217,7 +194,7 @@ def main():
         model.train()
         train_loss_sum = 0.0
 
-        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['num_epochs']} (Train)", disable=(rank != 0))
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} (Train)", disable=(rank != 0))
         for batch in loop:
             batch = to_device(batch, device)
             images, masks, texts = batch["image"], batch["mask"], batch["text"]
@@ -250,11 +227,11 @@ def main():
             log_file.flush()
 
         # ---- Validation ----
-        if validate_every > 0 and (epoch + 1) % validate_every == 0:
+        if args.validate_every > 0 and (epoch + 1) % args.validate_every == 0:
             model.eval()
             val_loss_sum = 0.0
 
-            loop = tqdm(val_loader, desc=f"Epoch {epoch+1}/{config['num_epochs']} (Val)", disable=(rank != 0))
+            loop = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} (Val)", disable=(rank != 0))
             with torch.no_grad():
                 for batch in loop:
                     batch = to_device(batch, device)
@@ -296,9 +273,9 @@ def main():
     # ---- Final model (rank 0 only) ----
     if rank == 0:
         underlying_model = model.module if is_dist else model
-        final_path = os.path.join(args.output_dir, f"model_final_epoch{config['num_epochs']}.pt")
+        final_path = os.path.join(args.output_dir, f"model_final_epoch{args.num_epochs}.pt")
         ckpt = {
-            "epoch": config["num_epochs"],
+            "epoch": args.num_epochs,
             "model_state_dict": underlying_model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
