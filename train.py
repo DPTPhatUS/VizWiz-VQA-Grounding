@@ -58,12 +58,9 @@ def main():
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--resume-checkpoint", type=str, default=None)
-    parser.add_argument("--validate-every", type=int, default=0,
-                        help="Validate every N epochs (default: 0 = skip validation).")
-    parser.add_argument("--save-every", type=int, default=10,
-                        help="Save checkpoint every N epochs (default: 10).")
-    parser.add_argument("--output-dir", type=str, default="outputs",
-                        help="Directory to save checkpoints and final model (default: outputs).")
+    parser.add_argument("--validate-every", type=int, default=0)
+    parser.add_argument("--save-every", type=int, default=10)
+    parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 

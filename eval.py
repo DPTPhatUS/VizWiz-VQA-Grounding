@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--image-size", type=int, default=336)
-    parser.add_argument("--output-dir", type=str, default=None, help="Save predicted masks and results JSON to this directory")
+    parser.add_argument("--output-dir", type=str, default=None)
     args = parser.parse_args()
 
     device = torch.device(args.device)
