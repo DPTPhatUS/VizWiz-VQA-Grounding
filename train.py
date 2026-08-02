@@ -286,24 +286,28 @@ def main():
         if rank == 0 and (epoch + 1) % args.save_every == 0:
             ckpt_path = os.path.join(args.output_dir, f"checkpoint_epoch{epoch+1}.pt")
             underlying_model = model.module if is_dist else model
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model_state_dict": underlying_model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scaler_state_dict": scaler.state_dict(),
-                    "loss": avg_train_loss,
-                },
-                ckpt_path,
-                _use_new_zipfile_serialization=False,
-            )
+            ckpt = {
+                "epoch": epoch + 1,
+                "model_state_dict": underlying_model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "loss": avg_train_loss,
+            }
+            torch.save(ckpt, ckpt_path, _use_new_zipfile_serialization=False)
             print(f"✅ Checkpoint saved at {ckpt_path}")
 
     # ---- Final model (rank 0 only) ----
     if rank == 0:
         underlying_model = model.module if is_dist else model
         final_path = os.path.join(args.output_dir, f"model_final_epoch{config['num_epochs']}.pt")
-        torch.save(underlying_model.state_dict(), final_path)
+        ckpt = {
+            "epoch": config["num_epochs"],
+            "model_state_dict": underlying_model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "loss": avg_train_loss,
+        }
+        torch.save(ckpt, final_path, _use_new_zipfile_serialization=False)
         print(f"🔚 Final model saved → {final_path}")
         log_file.close()
         print(f"📝 Training log saved → {log_path}")

@@ -3,8 +3,13 @@ import torch.nn as nn
 from models import ImageEncoder, TextEncoder, UNetDecoder
 
 class GroundingModel(nn.Module):
-    def __init__(self, n_heads=8):
+    def __init__(self, n_heads=8, detector=None):
         super().__init__()
+        self.detector = detector  # None or BaseDetector instance
+        if self.detector is not None:
+            from models.box_renderer import BoxRenderer
+            self.box_renderer = BoxRenderer()
+
         self.image_encoder = ImageEncoder()
         self.text_encoder = TextEncoder()
 
@@ -18,6 +23,10 @@ class GroundingModel(nn.Module):
         self.decoder = UNetDecoder(in_channels=self.hidden_dim)
 
     def forward(self, image, text):
+        if self.detector is not None:
+            bboxes = self.detector(image)                    # (B, topk, 4)
+            image = self.box_renderer(image, bboxes)          # overlay boxes on image
+
         enc_feat1, enc_feat2, enc_feat3, bottleneck = self.image_encoder(image)
         B, D, H, W = bottleneck.shape
         img_tokens = bottleneck.flatten(2).permute(0, 2, 1)  # (B, N, D)
