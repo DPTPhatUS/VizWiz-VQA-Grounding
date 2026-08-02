@@ -106,10 +106,7 @@ def main():
     detector.to(args.device)
     detector.eval()
 
-    transform = T.Compose([
-        T.Resize((args.image_size, args.image_size)),
-        T.ToTensor(),
-    ])
+    transform = T.Compose([T.ToTensor()])
 
     all_results: list[tuple] = []  # (gt, [(box, score), ...])
     for filename, meta in tqdm(val_data.items(), desc="Evaluating"):
