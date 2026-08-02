@@ -9,8 +9,6 @@ def main():
     parser.add_argument("--data-root", type=str, default="data/vizwiz")
     parser.add_argument("--model-name", type=str, default="yolov8n")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--image-size", type=int, default=640)
-    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--output-dir", type=str, default="outputs")
     args = parser.parse_args()
 
@@ -94,8 +92,8 @@ def main():
 
     # Train YOLO
     print(f"Training YOLO ({args.model_name}) for {args.epochs} epochs...")
-    from models.detectors import YOLODetector
-    detector = YOLODetector(model_name=args.model_name)
+    from models import ObjectDetector
+    detector = ObjectDetector(model_name=args.model_name)
     detector.train_detector(data_config=data_yaml, epochs=args.epochs)
 
     # Save checkpoint
