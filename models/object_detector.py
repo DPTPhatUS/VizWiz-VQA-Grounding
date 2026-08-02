@@ -38,8 +38,9 @@ class ObjectDetector(nn.Module):
 
     def train_detector(self, data_config: str, epochs: int, resume: str = None, save_every: int = 10, output_dir: str = "outputs"):
         from ultralytics import YOLO
+        import os
         if resume:
             self._yolo = YOLO(resume)
         self._yolo.train(data=data_config, epochs=epochs, verbose=True,
                          save_period=save_every, resume=resume is not None,
-                         project=output_dir, name="detector")
+                         project=os.path.abspath(output_dir), name="detector", exist_ok=True)
