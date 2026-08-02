@@ -6,6 +6,39 @@ import sys
 from models import ObjectDetector
 
 
+def prepare_split(json_path, image_root, label_dir, image_dir):
+    os.makedirs(label_dir, exist_ok=True)
+    os.makedirs(image_dir, exist_ok=True)
+
+    with open(json_path) as f:
+        data = json.load(f)
+
+    processed = 0
+    for filename, meta in data.items():
+        vertices = meta.get("answer_grounding")
+        if not vertices or "width" not in meta or "height" not in meta:
+            continue
+
+        xs = [v["x"] for v in vertices]
+        ys = [v["y"] for v in vertices]
+        cx = ((min(xs) + max(xs)) / 2) / meta["width"]
+        cy = ((min(ys) + max(ys)) / 2) / meta["height"]
+        bw = (max(xs) - min(xs)) / meta["width"]
+        bh = (max(ys) - min(ys)) / meta["height"]
+
+        src = os.path.join(image_root, filename)
+        dst = os.path.join(image_dir, filename)
+        if not os.path.exists(dst) and os.path.exists(src):
+            os.symlink(os.path.abspath(src), dst)
+
+        label_path = os.path.join(label_dir, filename.replace(".jpg", ".txt").replace(".png", ".txt"))
+        with open(label_path, "w") as f:
+            f.write(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+        processed += 1
+
+    return processed
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train YOLO on VizWiz grounding bboxes")
     parser.add_argument("--data-root", type=str, default="data/vizwiz")
@@ -20,80 +53,44 @@ def main():
         print(f"Resuming from {args.resume_checkpoint}...")
         detector = ObjectDetector(model_name=args.resume_checkpoint)
     else:
-        # Load JSON
-        json_path = os.path.join(args.data_root, "train_grounding.json")
-        if not os.path.exists(json_path):
-            print(f"ERROR: {json_path} not found", file=sys.stderr)
-            sys.exit(1)
-
-        print(f"Loading {json_path}...")
-        with open(json_path) as f:
-            data = json.load(f)
-
         # Setup directories
         yolo_dir = os.path.join(args.output_dir, "yolo_data")
-        img_dir = os.path.join(yolo_dir, "images", "train")
-        lbl_dir = os.path.join(yolo_dir, "labels", "train")
-        os.makedirs(img_dir, exist_ok=True)
-        os.makedirs(lbl_dir, exist_ok=True)
-
-        # Write data.yaml
         data_yaml = os.path.join(yolo_dir, "data.yaml")
-        with open(data_yaml, "w") as f:
-            f.write(f"path: {os.path.abspath(yolo_dir)}\n")
-            f.write("train: images/train\n")
-            f.write("val: images/train\n")
-            f.write("nc: 1\n")
-            f.write('names: ["grounded_object"]\n')
 
-        train_img_root = os.path.join(args.data_root, "train")
-        skipped = 0
-        processed = 0
+        # Train split
+        train_count = prepare_split(
+            json_path=os.path.join(args.data_root, "train_grounding.json"),
+            image_root=os.path.join(args.data_root, "train"),
+            label_dir=os.path.join(yolo_dir, "labels", "train"),
+            image_dir=os.path.join(yolo_dir, "images", "train"),
+        )
 
-        for filename, meta in data.items():
-            vertices = meta.get("answer_grounding")
-            if not vertices:
-                print(f"Warning: No answer_grounding for {filename}, skipping")
-                skipped += 1
-                continue
+        # Val split
+        val_json = os.path.join(args.data_root, "val_grounding.json")
+        if os.path.exists(val_json):
+            val_count = prepare_split(
+                json_path=val_json,
+                image_root=os.path.join(args.data_root, "val"),
+                label_dir=os.path.join(yolo_dir, "labels", "val"),
+                image_dir=os.path.join(yolo_dir, "images", "val"),
+            )
+            val_line = "val: images/val\n"
+        else:
+            val_count = train_count
+            val_line = "val: images/train\n"
 
-            if "width" not in meta or "height" not in meta:
-                print(f"Warning: Missing dimensions for {filename}, skipping")
-                skipped += 1
-                continue
-
-            xs = [v["x"] for v in vertices]
-            ys = [v["y"] for v in vertices]
-            min_x, max_x = min(xs), max(xs)
-            min_y, max_y = min(ys), max(ys)
-
-            w_img = meta["width"]
-            h_img = meta["height"]
-
-            x_center = ((min_x + max_x) / 2) / w_img
-            y_center = ((min_y + max_y) / 2) / h_img
-            bbox_w = (max_x - min_x) / w_img
-            bbox_h = (max_y - min_y) / h_img
-
-            src_img = os.path.join(train_img_root, filename)
-            dst_img = os.path.join(img_dir, filename)
-            if not os.path.exists(dst_img):
-                if os.path.exists(src_img):
-                    os.symlink(os.path.abspath(src_img), dst_img)
-
-            label_name = filename.replace(".jpg", ".txt").replace(".png", ".txt")
-            label_path = os.path.join(lbl_dir, label_name)
-            with open(label_path, "w") as f:
-                f.write(f"0 {x_center:.6f} {y_center:.6f} {bbox_w:.6f} {bbox_h:.6f}\n")
-
-            processed += 1
-
-        print(f"Processed {processed} entries, skipped {skipped}")
-
-        if processed == 0:
+        if train_count == 0:
             print("ERROR: No valid training entries found", file=sys.stderr)
             sys.exit(1)
 
+        with open(data_yaml, "w") as f:
+            f.write(f"path: {os.path.abspath(yolo_dir)}\n")
+            f.write("train: images/train\n")
+            f.write(val_line)
+            f.write("nc: 1\n")
+            f.write('names: ["grounded_object"]\n')
+
+        print(f"Train: {train_count}, Val: {val_count}")
         detector = ObjectDetector(model_name=args.model_name)
 
     # Train
