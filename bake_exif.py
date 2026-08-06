@@ -56,11 +56,12 @@ def read_exif(img: Image.Image) -> int:
 
 
 def find_rotated(
-    data_root: Path, splits: list[str]
+    data_root: Path, splits: list[str], all_images: bool = False
 ) -> list[tuple[str, Path, int]]:
     """Yield (split, jpg_path, exif_orientation) for every image that
-    has EXIF orientation != 1.  Already-baked images (no EXIF tag) are
-    skipped, so the script is idempotent.
+    has EXIF orientation != 1, or for every image when ``all_images`` is
+    True.  Already-baked images (no EXIF tag) are skipped, so the script
+    is idempotent.
     """
     out: list[tuple[str, Path, int]] = []
     for split in splits:
@@ -75,7 +76,7 @@ def find_rotated(
                 print(f"  [WARN] {split}/{p.name}: failed to open ({e})", file=sys.stderr)
                 continue
             exif = read_exif(img)
-            if exif != 1:
+            if all_images or exif != 1:
                 out.append((split, p, exif))
     return out
 
@@ -123,6 +124,11 @@ def main() -> None:
         "--dry-run", action="store_true",
         help="Detect and report rotated images, but do not modify any files",
     )
+    ap.add_argument(
+        "--strip-all", action="store_true",
+        help="Re-encode every image (not just EXIF!=1 ones) so all metadata "
+             "is stripped. Slower but leaves a uniform no-EXIF dataset.",
+    )
     args = ap.parse_args()
 
     if args.in_place and args.output_root is not None:
@@ -152,7 +158,7 @@ def main() -> None:
     print(f"Mode:         {mode}")
     print()
 
-    rotated = find_rotated(args.data_root, splits)
+    rotated = find_rotated(args.data_root, splits, all_images=args.strip_all)
 
     if not rotated:
         print("No rotated images found. Nothing to do.")
@@ -164,11 +170,14 @@ def main() -> None:
         by_split.setdefault(split, []).append((path, exif))
         exif_counts[exif] += 1
 
-    print(f"Found {len(rotated)} images with EXIF orientation != 1:")
+    if args.strip_all:
+        print(f"Found {len(rotated)} images to process (--strip-all: every image, all EXIF stripped):")
+    else:
+        print(f"Found {len(rotated)} images with EXIF orientation != 1:")
     for split, items in sorted(by_split.items()):
         split_exif = Counter(e for _, e in items)
         exif_str = ", ".join(f"EXIF={e}:{n}" for e, n in sorted(split_exif.items()))
-        print(f"  {split}: {len(items)} to bake  ({exif_str})")
+        print(f"  {split}: {len(items)} to process  ({exif_str})")
         for path, exif in items[:3]:
             print(f"    {path.name}  EXIF={exif}  size={Image.open(path).size}")
         if len(items) > 3:
@@ -205,7 +214,7 @@ def main() -> None:
                 n_skipped += 1
                 continue
             exif = read_exif(Image.open(src))
-            if exif != 1:
+            if args.strip_all or exif != 1:
                 try:
                     bake_one(src, dst, args.quality)
                     n_baked += 1
@@ -227,7 +236,7 @@ def main() -> None:
         f"Baked {n_baked} images "
         f"(EXIF orientation baked into pixels, all EXIF metadata stripped)."
     )
-    if not args.in_place:
+    if not args.in_place and not args.strip_all:
         print(f"Symlinked {n_symlinked} already-correct images (no rewrite).")
         print(f"Skipped {n_skipped} (already exist in output).")
     if n_fail:
