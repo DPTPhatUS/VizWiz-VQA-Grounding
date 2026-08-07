@@ -274,14 +274,7 @@ def main():
     if rank == 0:
         underlying_model = model.module if is_dist else model
         final_path = os.path.join(args.output_dir, f"model_final_epoch{args.num_epochs}.pt")
-        ckpt = {
-            "epoch": args.num_epochs,
-            "model_state_dict": underlying_model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-            "loss": avg_train_loss,
-        }
-        torch.save(ckpt, final_path, _use_new_zipfile_serialization=False)
+        torch.save(underlying_model.state_dict(), final_path, _use_new_zipfile_serialization=False)
         print(f"🔚 Final model saved → {final_path}")
         log_file.close()
         print(f"📝 Training log saved → {log_path}")
