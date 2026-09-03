@@ -1,4 +1,5 @@
 data/
+.worktrees/
 outputs*/
 results*/
 __pycache__/
