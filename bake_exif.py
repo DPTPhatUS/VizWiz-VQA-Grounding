@@ -7,16 +7,6 @@ order, while any image viewer (and the human annotators who drew the
 binary masks) sees the post-rotation / displayed view.  This causes a
 systematic mismatch between the loaded image and the on-disk mask.
 
-This script eliminates the mismatch at the source: for every image whose
-EXIF orientation is not 1, it transposes the pixels into displayed-view
-order and saves the JPEG with all EXIF metadata stripped.  After
-running, ``Image.open()`` returns exactly the view a human sees in any
-image viewer, and the on-disk mask is naturally aligned without any
-``ImageOps.exif_transpose`` wrapper in the loaders.
-
-This is the image-side analog of ``fix_flipped_masks.py``.  Together they
-make the EXIF orientation flag irrelevant to the data pipeline.
-
 JPEG re-encoding uses quality 95 by default, which adds minimal visible
 degradation.  The original EXIF (camera, GPS, timestamp) is intentionally
 discarded — the script normalizes the data, it does not preserve
