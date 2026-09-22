@@ -59,6 +59,7 @@ class ModelTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(output).all())
         output.square().mean().backward()
         self.assertTrue(torch.isfinite(image.grad).all())
+        self.assertGreater(sum(head.weight.grad.abs().sum().item() for head in model.skip_conditioner.affine), 0)
         clone = self.make_model()
         clone.load_state_dict(model.state_dict(), strict=True)
         model.eval(); clone.eval()

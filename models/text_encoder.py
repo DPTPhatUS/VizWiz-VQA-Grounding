@@ -21,6 +21,8 @@ class TextEncoder(nn.Module):
         self.output_dim = self.model.config.hidden_size
 
     def forward(self, texts, return_features=False):
+        if isinstance(texts, str):
+            texts = [texts]
         inputs = self.tokenizer(
             texts, return_tensors="pt", padding=True, truncation=True,
             max_length=self.model.config.max_position_embeddings,
