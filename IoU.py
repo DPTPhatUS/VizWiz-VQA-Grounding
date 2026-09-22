@@ -1,4 +1,5 @@
 from models.model import GroundingModel
+from models.checkpoint import load_model_weights
 from metrics import compute_iou
 from torchvision.transforms import ToTensor
 from PIL import Image
@@ -13,7 +14,7 @@ mask_dir = "data/vizwiz/binary_masks_png/val"
 
 # 1. load model
 model = GroundingModel()
-model.load_state_dict(torch.load("outputs/cross_model_final_epoch100.pt"))
+load_model_weights(model, torch.load("outputs/cross_model_final_epoch100.pt"))
 model.eval().cuda()
 
 # 2. load val json

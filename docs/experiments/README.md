@@ -1,15 +1,17 @@
 # Grounding architecture experiments
 
 Base commit: `db29b302bf6c3bc49ab743dfd1bd4bd796d7a4b6`.
-This branch defaults to **residual-fusion**: `V + alpha * CrossAttention(V, T)`, with a learned scalar initialized to 0.01 (one extra parameter).
+This branch defaults to **joint-text-skips**: residual fusion plus joint-text FiLM on all three 1,024-channel skips; 768 -> 64 shared reduction and identity-initialized affine heads.
+
+Measured parameter change relative to the original model: **+448,577**. Encoder weights are unchanged. Counts include all added trainable parameters, including residual fusion where present.
 
 ## Run
 
 From this branch checkout, with the project's dependencies installed:
 
 ```bash
-python train.py --data-root /absolute/path/to/data/vizwiz --output-dir outputs/residual-fusion --seed 42 --validate-every 0
-python eval.py --data-root /absolute/path/to/data/vizwiz --dataset val --checkpoint outputs/residual-fusion/checkpoint_epoch100.pt --output-dir results/residual-fusion
+python train.py --data-root /absolute/path/to/data/vizwiz --output-dir outputs/joint-text-skips --seed 42 --validate-every 0
+python eval.py --data-root /absolute/path/to/data/vizwiz --dataset val --checkpoint outputs/joint-text-skips/checkpoint_epoch100.pt --output-dir results/joint-text-skips
 python -m unittest discover -s tests -v
 ```
 
@@ -32,3 +34,11 @@ To avoid mixing unrelated corrections into architectural ablations, image normal
 ## Verification scope
 
 CPU unit tests use small encoder fixtures to avoid pretrained downloads, exercising real fusion/conditioning/decoder modules. They cover gradients, shape contracts, text masks, identity initialization, state-dict round trips and experiment identity rejection. Full-resolution shape checks use meta tensors where appropriate. Full training, CUDA throughput and mean IoU must be measured separately.
+
+## Text spans
+
+One CLIP text-encoder pass produces all tokens. Joint pooling excludes padding and BOS/EOS; separate pooling also excludes the `Q:` / `A:` markers. Separate mode uses the rightmost ` A: ` delimiter from the existing dataset format. Extremely long questions retain the original 77-token truncation policy; when no answer tokens survive, conditioning falls back to the question. Literal delimiter text inside an answer is ambiguous in the existing string format; structured question/answer inputs would be a separate data-interface change.
+
+## Review and verification record
+
+Implemented with CPU forward/backward tests, production-channel meta-tensor checks, strict checkpoint round trips and CLI smoke checks. A separate code review identified single-string tokenization and legacy checkpoint-loading compatibility issues; both were addressed with the shared text-input regression test and checkpoint loader integration. No GPU training or accuracy evaluation was run.
