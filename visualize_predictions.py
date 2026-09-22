@@ -5,10 +5,12 @@ import torchvision.transforms as T
 import os
 from models import TextEncoder, ImageEncoder, GroundingModel
 
+from models.checkpoint import load_model_weights
+
 # load model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = GroundingModel().to(device)
-model.load_state_dict(torch.load("outputs/cross_model_final_epoch100.pt", map_location=device))
+load_model_weights(model, torch.load("outputs/cross_model_final_epoch100.pt", map_location=device))
 model.eval()
 
 # test data

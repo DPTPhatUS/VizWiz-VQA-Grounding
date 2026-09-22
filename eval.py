@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader
 
 from dataset import VizWizGroundingDataset
 from models import GroundingModel
+from models.checkpoint import load_model_weights
 from metrics import compute_iou_per_sample
 
 
@@ -68,10 +69,10 @@ def main():
         checkpoint = torch.load(args.checkpoint, map_location="cpu")
 
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"])
+            load_model_weights(model, checkpoint)
             print(f"Loaded checkpoint (epoch {checkpoint.get('epoch', '?')})")
         else:
-            model.load_state_dict(checkpoint)
+            load_model_weights(model, checkpoint)
             print("Loaded raw state dict")
     else:
         print("No checkpoint provided — using base model (random weights)")

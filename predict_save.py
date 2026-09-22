@@ -5,6 +5,8 @@ import torchvision.transforms.functional as TF
 import os
 from models import GroundingModel
 
+from models.checkpoint import load_model_weights
+
 # ===== Settings =====
 image_path = "data/vizwiz/test/VizWiz_test_00000006.jpg"
 question = "What does it say on here?"
@@ -14,7 +16,7 @@ image_size = (336, 336)
 device = torch.device("cpu")
 # ===== Model load =====
 model = GroundingModel().to(device)
-model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+load_model_weights(model, torch.load(checkpoint_path, map_location=device))
 model.eval()
 
 # ===== Preprocess =====

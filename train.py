@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 from dataset import VizWizGroundingDataset
 from utils import to_device
 from models import GroundingModel
+from models.checkpoint import load_model_weights
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +152,9 @@ def main():
         underlying_model = model.module if is_dist else model
 
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            underlying_model.load_state_dict(checkpoint["model_state_dict"])
+            load_model_weights(underlying_model, checkpoint)
+            if "optimizer_state_dict" not in checkpoint:
+                raise ValueError("Resume requires a training checkpoint with optimizer state; final exports are for evaluation.")
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             if "scaler_state_dict" in checkpoint:
                 scaler.load_state_dict(checkpoint["scaler_state_dict"])
@@ -159,7 +162,7 @@ def main():
             if rank == 0:
                 print(f"✅ Resumed full training state from {args.resume_checkpoint} (epoch {start_epoch})")
         else:
-            underlying_model.load_state_dict(checkpoint)
+            load_model_weights(underlying_model, checkpoint)
             if rank == 0:
                 print(f"✅ Resumed model from {args.resume_checkpoint}")
             try:
@@ -263,6 +266,7 @@ def main():
             ckpt = {
                 "epoch": epoch + 1,
                 "model_state_dict": underlying_model.state_dict(),
+                "experiment_config": underlying_model.experiment_config,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scaler_state_dict": scaler.state_dict(),
                 "loss": avg_train_loss,
@@ -274,7 +278,9 @@ def main():
     if rank == 0:
         underlying_model = model.module if is_dist else model
         final_path = os.path.join(args.output_dir, f"model_final_epoch{args.num_epochs}.pt")
-        torch.save(underlying_model.state_dict(), final_path, _use_new_zipfile_serialization=False)
+        torch.save({"model_state_dict": underlying_model.state_dict(),
+                    "experiment_config": underlying_model.experiment_config},
+                   final_path, _use_new_zipfile_serialization=False)
         print(f"🔚 Final model saved → {final_path}")
         log_file.close()
         print(f"📝 Training log saved → {log_path}")
