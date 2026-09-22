@@ -62,6 +62,7 @@ def main():
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--conditioning", choices=["joint", "separate"], default="joint")
     args = parser.parse_args()
 
     # --- Distributed init ---
@@ -126,7 +127,7 @@ def main():
     )
 
     # --- Model ---
-    model = GroundingModel().to(device)
+    model = GroundingModel(conditioning=args.conditioning).to(device)
 
     # SyncBatchNorm: makes per-GPU BatchNorm stats identical to single-GPU
     if is_dist:

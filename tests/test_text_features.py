@@ -41,6 +41,14 @@ class TextTests(unittest.TestCase):
         self.assertEqual(features.answer_mask[0].sum().item(), 4)
         self.assertEqual(features.question_mask[1].sum().item(), 2)
 
+    def test_single_string_matches_single_item_batch(self):
+        self.encoder.eval()
+        text = 'Q: red? A: blue'
+        single = self.encoder(text, return_features=True)
+        batch = self.encoder([text], return_features=True)
+        for actual, expected in zip(single, batch):
+            torch.testing.assert_close(actual, expected)
+
     def test_empty_and_truncated_answers_remain_finite(self):
         import inspect
         self.assertIn('return_features', inspect.signature(self.encoder.forward).parameters)

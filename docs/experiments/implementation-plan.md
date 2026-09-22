@@ -19,3 +19,7 @@ models/text_encoder.py adds optional return_features=True yielding tokens plus v
 ## Completion checks
 
 Run unittest discovery, CLI smoke checks, diff checks and parameter counts on all five worktrees. Review across branches. Commit each branch, push only the five new refs to origin, verify remote heads. No merge, PR or training job requested.
+
+## Execution status
+
+All five implementations completed in isolated worktrees. CPU tests, full-resolution meta shape checks, parameter measurements, syntax compilation and train/eval CLI checks passed. Independent review findings were fixed: string text inputs, legacy checkpoint loading, and branch-specific documentation; compact legacy scripts expose conditioning selection. Publication status is reported in the task response after remote verification.

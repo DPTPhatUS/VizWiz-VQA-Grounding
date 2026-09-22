@@ -51,6 +51,15 @@ class ModelTests(unittest.TestCase):
         self.assertGreater(model.residual_scale.grad.abs().item(), 0)
         hook.remove()
 
+    def test_separate_conditioning_integration_and_identity_metadata(self):
+        model = self.make_model(conditioning='separate')
+        output = model(torch.rand(2, 3, 16, 16), ['Q: color? A: red'] * 2)
+        output.square().mean().backward()
+        self.assertGreater(sum(h.weight.grad.abs().sum().item() for h in model.decoder.conditioner.affine), 0)
+        self.assertEqual(model.experiment_config['conditioning'], 'separate')
+        with self.assertRaisesRegex(ValueError, 'conditioning'):
+            self.make_model(conditioning='invalid')
+
     def test_checkpoint_roundtrip_and_finite_backward(self):
         model = self.make_model()
         image = torch.rand(2, 3, 16, 16, requires_grad=True)

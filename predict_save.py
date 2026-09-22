@@ -1,3 +1,4 @@
+import argparse
 import torch
 from PIL import Image
 import torchvision.transforms as T
@@ -15,7 +16,10 @@ save_path = "result/clip-vit-L-p14-336-wo-crop_epoch3/VizWiz_test_00000006_pred_
 image_size = (336, 336)
 device = torch.device("cpu")
 # ===== Model load =====
-model = GroundingModel().to(device)
+parser = argparse.ArgumentParser()
+parser.add_argument("--conditioning", choices=["joint", "separate"], default="joint")
+args = parser.parse_args()
+model = GroundingModel(conditioning=args.conditioning).to(device)
 load_model_weights(model, torch.load(checkpoint_path, map_location=device))
 model.eval()
 

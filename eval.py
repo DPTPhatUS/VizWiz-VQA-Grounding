@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--image-size", type=int, default=336)
     parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--conditioning", choices=["joint", "separate"], default="joint")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -63,7 +64,7 @@ def main():
     )
 
     # --- Model ---
-    model = GroundingModel().to(device)
+    model = GroundingModel(conditioning=args.conditioning).to(device)
 
     if args.checkpoint is not None:
         checkpoint = torch.load(args.checkpoint, map_location="cpu")
