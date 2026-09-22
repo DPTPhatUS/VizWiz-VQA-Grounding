@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from models import ImageEncoder, TextEncoder, UNetDecoder
+from models.experiment import DetailRefiner
 
 class GroundingModel(nn.Module):
     def __init__(self, n_heads=8):
@@ -16,8 +17,8 @@ class GroundingModel(nn.Module):
 
         self.cross_attn = nn.MultiheadAttention(embed_dim=self.hidden_dim, num_heads=n_heads, batch_first=True)
         self.decoder = UNetDecoder(in_channels=self.hidden_dim)
-        self.residual_scale = nn.Parameter(torch.tensor(0.01))
-        self.experiment_config = {"architecture": "residual-fusion"}
+        self.experiment_config = {"architecture": "detail-refinement"}
+        self.detail_refiner = DetailRefiner()
 
     def forward(self, image, text):
         enc_feat1, enc_feat2, enc_feat3, bottleneck = self.image_encoder(image)
@@ -28,8 +29,7 @@ class GroundingModel(nn.Module):
         text_tokens = self.text_proj(text_tokens)          # align to (B, L, D)
 
         attn_output, _ = self.cross_attn(query=img_tokens, key=text_tokens, value=text_tokens)
-        fused_tokens = img_tokens + self.residual_scale * attn_output
-        fused = fused_tokens.permute(0, 2, 1).view(B, D, H, W)
+        fused = attn_output.permute(0, 2, 1).view(B, D, H, W)
 
         output = self.decoder(fused, enc_feat3, enc_feat2, enc_feat1)
-        return output
+        return self.detail_refiner(image, output)

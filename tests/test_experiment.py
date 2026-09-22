@@ -36,21 +36,6 @@ class ModelTests(unittest.TestCase):
         with patch.object(model_module, 'ImageEncoder', TinyImage), patch.object(model_module, 'TextEncoder', TinyText), patch.object(model_module, 'UNetDecoder', TinyDecoder):
             return model_module.GroundingModel(n_heads=2, **kwargs)
 
-    def test_residual_preserves_visual_path_and_receives_gradient(self):
-        model = self.make_model()
-        self.assertTrue(hasattr(model, 'residual_scale'), 'learned residual scale is missing')
-        captured = []
-        hook = model.decoder.register_forward_pre_hook(lambda m, args: captured.append(args[0]))
-        image = torch.rand(2, 3, 16, 16)
-        with torch.no_grad():
-            model.residual_scale.zero_()
-        output = model(image, ['Q: color? A: red'] * 2)
-        torch.testing.assert_close(captured[0], model.image_encoder(image)[-1])
-        output.square().mean().backward()
-        self.assertIsNotNone(model.residual_scale.grad)
-        self.assertGreater(model.residual_scale.grad.abs().item(), 0)
-        hook.remove()
-
     def test_checkpoint_roundtrip_and_finite_backward(self):
         model = self.make_model()
         image = torch.rand(2, 3, 16, 16, requires_grad=True)
@@ -59,6 +44,7 @@ class ModelTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(output).all())
         output.square().mean().backward()
         self.assertTrue(torch.isfinite(image.grad).all())
+        self.assertGreater(model.detail_refiner.output.weight.grad.abs().sum().item(), 0)
         clone = self.make_model()
         clone.load_state_dict(model.state_dict(), strict=True)
         model.eval(); clone.eval()

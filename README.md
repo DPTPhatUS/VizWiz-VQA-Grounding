@@ -1,3 +1,7 @@
+# Architecture experiment: detail-refinement
+
+This branch implements the `detail-refinement` experiment. See [experiment design, run commands, and verification](docs/experiments/README.md).
+
 # 🏆Workshop Spotlight at CVPR 2025
 Our work has been selected as a spotlight paper at a workshop in CVPR 2025! ( https://cvpr.thecvf.com/ )
 We are honored that our research was recognized and featured among the notable contributions. 
