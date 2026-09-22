@@ -1,7 +1,9 @@
 # Grounding architecture experiments
 
 Base commit: `db29b302bf6c3bc49ab743dfd1bd4bd796d7a4b6`.
-This branch defaults to **residual-fusion**: `V + alpha * CrossAttention(V, T)`, with a learned scalar initialized to 0.01 (one extra parameter).
+This branch defaults to **residual-fusion**: original model plus learned scalar residual fusion initialized to 0.01.
+
+Measured parameter change relative to the original model: **+1**. Encoder weights are unchanged. Counts include all added trainable parameters, including residual fusion where present.
 
 ## Run
 
@@ -32,3 +34,7 @@ To avoid mixing unrelated corrections into architectural ablations, image normal
 ## Verification scope
 
 CPU unit tests use small encoder fixtures to avoid pretrained downloads, exercising real fusion/conditioning/decoder modules. They cover gradients, shape contracts, text masks, identity initialization, state-dict round trips and experiment identity rejection. Full-resolution shape checks use meta tensors where appropriate. Full training, CUDA throughput and mean IoU must be measured separately.
+
+## Review and verification record
+
+Implemented with CPU forward/backward tests, production-channel meta-tensor checks, strict checkpoint round trips and CLI smoke checks. A separate code review identified single-string tokenization and legacy checkpoint-loading compatibility issues; both were addressed with the shared text-input regression test and checkpoint loader integration. No GPU training or accuracy evaluation was run.
