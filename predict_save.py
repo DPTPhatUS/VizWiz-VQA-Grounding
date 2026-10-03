@@ -36,8 +36,8 @@ text_input = [f"Q: {question}"]
 # ===== Inference =====
 with torch.no_grad():
     output = model(input_tensor, text_input)  # raw logits
-    output = torch.sigmoid(output)            # apply sigmoid
     output = torch.nn.functional.interpolate(output, size=image_size, mode="bilinear", align_corners=False)
+    output = torch.sigmoid(output)            # apply sigmoid after resizing logits
     binary_mask = (output > 0.5).float()[0, 0]  # binary (H, W)
 
 # ===== Save =====
