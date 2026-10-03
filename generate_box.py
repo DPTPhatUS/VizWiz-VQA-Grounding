@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 
 
 def derive_aabb(mask_path: Path) -> tuple[int, int, int, int] | None:
@@ -148,7 +148,7 @@ def process_split(
             n_skipped += 1
             continue
 
-        image = Image.open(img_path).convert("RGB")
+        image = ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")
         line_width = max(2, int(round(max(image.size) * line_width_frac)))
         annotated = draw_box(image, bbox, line_width, color)
         annotated.save(out_img_dir / filename, format="JPEG", quality=jpeg_quality)
