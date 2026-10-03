@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 
 
 def derive_random_box(
@@ -173,6 +173,7 @@ def process_split(
             continue
 
         with Image.open(img_path) as image:
+            image = ImageOps.exif_transpose(image)
             w, h = image.size
             bbox = derive_random_box(w, h, rng, min_size_frac, max_size_frac)
             line_width = max(2, int(round(max(w, h) * line_width_frac)))

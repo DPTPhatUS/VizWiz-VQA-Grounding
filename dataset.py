@@ -1,5 +1,5 @@
 from torch.utils.data import Dataset
-from PIL import Image
+from PIL import Image, ImageOps
 import os, json
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
@@ -24,7 +24,8 @@ class VizWizGroundingDataset(Dataset):
     def __getitem__(self, idx):
         filename, meta = self.entries[idx]
 
-        image = Image.open(os.path.join(self.image_root, filename)).convert("RGB")
+        # Match displayed orientation before resizing; masks already use this view.
+        image = ImageOps.exif_transpose(Image.open(os.path.join(self.image_root, filename))).convert("RGB")
         question = meta["question"]
         answer = meta.get("most_common_answer", "")
         text = f"Q: {question} A: {answer}" if answer else f"Q: {question}"

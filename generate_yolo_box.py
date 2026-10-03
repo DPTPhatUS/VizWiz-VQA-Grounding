@@ -29,7 +29,7 @@ import sys
 from pathlib import Path
 
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 from tqdm import tqdm
 from ultralytics import YOLO
 
@@ -161,7 +161,7 @@ def process_split(
             if not p.exists():
                 n_skipped_missing += 1
                 continue
-            pil_imgs.append(Image.open(p).convert("RGB"))
+            pil_imgs.append(ImageOps.exif_transpose(Image.open(p)).convert("RGB"))
             valid_files.append(fn)
         if not pil_imgs:
             continue
