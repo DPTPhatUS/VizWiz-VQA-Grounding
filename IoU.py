@@ -2,7 +2,7 @@ from models.model import GroundingModel
 from models.checkpoint import load_model_weights
 from metrics import compute_iou
 from torchvision.transforms import ToTensor
-from PIL import Image
+from PIL import Image, ImageOps
 import torch, json, os
 import torch.nn.functional as F
 
@@ -35,7 +35,7 @@ for filename, meta in val_data.items():
     if not os.path.exists(image_path) or not os.path.exists(mask_path):
         continue
 
-    image = transform(Image.open(image_path).convert("RGB")).unsqueeze(0).cuda()
+    image = transform(ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")).unsqueeze(0).cuda()
     true_mask = transform(Image.open(mask_path).convert("L")).unsqueeze(0).cuda()
     text = f"Q: {meta['question']} A: {meta.get('most_common_answer', '')}"
 

@@ -14,7 +14,7 @@ import json
 import os
 
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 from torchvision import transforms as T
 from tqdm import tqdm
 
@@ -121,7 +121,7 @@ def main():
         if not os.path.exists(img_path):
             continue
 
-        image = transform(Image.open(img_path).convert("RGB")).unsqueeze(0).to(args.device)
+        image = transform(ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")).unsqueeze(0).to(args.device)
         with torch.no_grad():
             pred_boxes, pred_scores = detector(image)
         # pred_boxes : (1, topk, 4)  [cx, cy, w, h] normalized
