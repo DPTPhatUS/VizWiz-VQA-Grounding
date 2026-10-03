@@ -63,6 +63,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    if args.resume_checkpoint is not None and not os.path.isfile(args.resume_checkpoint):
+        parser.error(f"Resume checkpoint is not a file: {args.resume_checkpoint}")
+
     # --- Distributed init ---
     rank, world_size, local_rank, is_dist = setup_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
@@ -91,6 +94,7 @@ def main():
         image_root=os.path.join(args.data_root, "val"),
         mask_root=os.path.join(args.data_root, "binary_masks_png", "val"),
         image_size=image_size,
+        is_test=True,  # validation must not use random training augmentation
     )
 
     # --- Samplers & Loaders ---
@@ -144,7 +148,7 @@ def main():
     # --- Resume checkpoint ---
     start_epoch = 0
 
-    if args.resume_checkpoint and os.path.exists(args.resume_checkpoint):
+    if args.resume_checkpoint is not None:
         checkpoint = torch.load(args.resume_checkpoint, map_location="cpu")
         # Always load into the *unwrapped* model so state-dict keys match
         # regardless of DDP / SyncBN wrapping.

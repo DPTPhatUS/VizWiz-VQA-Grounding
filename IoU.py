@@ -40,6 +40,8 @@ for filename, meta in val_data.items():
 
     with torch.no_grad():
         pred_mask = model(image, text)
+        pred_mask = F.interpolate(pred_mask, size=true_mask.shape[-2:], mode="bilinear", align_corners=False)
+        pred_mask = (torch.sigmoid(pred_mask) > 0.5).float()
 
     iou = compute_iou(pred_mask, true_mask)
     ious.append(iou)    
