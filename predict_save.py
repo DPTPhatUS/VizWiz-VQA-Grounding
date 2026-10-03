@@ -1,5 +1,5 @@
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 import os
@@ -23,7 +23,7 @@ transform = T.Compose([
     T.ToTensor()
 ])
 
-image = Image.open(image_path).convert("RGB")
+image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
 input_tensor = transform(image).unsqueeze(0).to(device)
 text_input = [f"Q: {question}"]
 

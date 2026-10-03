@@ -1,5 +1,5 @@
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 import matplotlib.pyplot as plt
 import torchvision.transforms as T
 import os
@@ -22,7 +22,7 @@ transform = T.Compose([
     T.ToTensor()
 ])
 
-image = transform(Image.open(image_path).convert("RGB")).unsqueeze(0).to(device)
+image = transform(ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")).unsqueeze(0).to(device)
 
 # predict
 with torch.no_grad():
@@ -32,11 +32,11 @@ with torch.no_grad():
 # visualize and save
 plt.figure(figsize=(10, 5))
 plt.subplot(1, 2, 1)
-plt.imshow(Image.open(image_path))
+plt.imshow(ImageOps.exif_transpose(Image.open(image_path)))
 plt.title("Original Image")
 
 plt.subplot(1, 2, 2)
-plt.imshow(Image.open(image_path))
+plt.imshow(ImageOps.exif_transpose(Image.open(image_path)))
 plt.imshow(mask, alpha=0.5, cmap="jet", interpolation='bilinear')
 plt.title("Predicted Mask")
 
