@@ -96,12 +96,13 @@ def main():
             pred = model(images, texts)
             pred = F.interpolate(pred, size=masks.shape[-2:], mode="bilinear")
 
-            iou_per_sample = compute_iou_per_sample(pred, masks.to(device))
+            # Score and save the same mask using a probability threshold of 0.5.
+            pred_bin = (torch.sigmoid(pred) > 0.5).float()
+            iou_per_sample = compute_iou_per_sample(pred_bin, masks.to(device))
             for fname, iou_val in zip(filenames, iou_per_sample.tolist()):
                 per_sample_iou[fname] = round(iou_val, 6)
 
             if args.output_dir:
-                pred_bin = (torch.sigmoid(pred) > 0.5).float()
                 for i, fname in enumerate(filenames):
                     mask_path = os.path.join(args.output_dir, fname.replace(".jpg", ".png"))
                     from torchvision.transforms.functional import to_pil_image
