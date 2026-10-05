@@ -1,16 +1,16 @@
-import torch.nn.functional as F
+import torch
 import torch.nn as nn
-from transformers import CLIPModel
-import torch.nn as nn
+from transformers import CLIPVisionConfig, CLIPVisionModel
 
 class ImageEncoder(nn.Module):
     def __init__(self, model_name="openai/clip-vit-large-patch14-336", pretrained=True):
-        super(ImageEncoder, self).__init__()
+        super().__init__()
         if pretrained:
-            clip_model = CLIPModel.from_pretrained(model_name)
+            self.vision_encoder = CLIPVisionModel.from_pretrained(model_name)
         else:
-            clip_model = CLIPModel.from_config(model_name)
-        self.vision_encoder = clip_model.vision_model
+            config = CLIPVisionConfig.from_pretrained(model_name)
+            self.vision_encoder = CLIPVisionModel(config)
+          
         self.out_channels = self.vision_encoder.config.hidden_size
 
     def forward(self, x):
@@ -24,8 +24,9 @@ class ImageEncoder(nn.Module):
         bottleneck = outputs.last_hidden_state
 
         def reshape_feat(feat):
-            feat = feat[:, 1:, :].transpose(1, 2)  # (B, D, seq_len)
-            patch_size = int((feat.shape[-1]) ** 0.5)
-            return feat.view(feat.shape[0], feat.shape[1], patch_size, patch_size)
+            B, _, D = feat.shape
+            feat = feat[:, 1:, :]
+            grid_size = int(feat.shape[1] ** 0.5)
+            return feat.view(B, grid_size, grid_size, D).permute(0, 3, 1, 2).contiguous()
 
         return tuple(map(reshape_feat, [enc_feat1, enc_feat2, enc_feat3])) + (reshape_feat(bottleneck),)
