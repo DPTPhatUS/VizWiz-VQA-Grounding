@@ -26,7 +26,7 @@ class GroundingModel(nn.Module):
         text_tokens = self.text_proj(text_tokens)          # align to (B, L, D)
 
         attn_output, _ = self.cross_attn(query=img_tokens, key=text_tokens, value=text_tokens)
-        fused = attn_output.permute(0, 2, 1).view(B, D, H, W)
+        fused = attn_output.view(B, H, W, D).permute(0, 3, 1, 2).contiguous()
 
         output = self.decoder(fused, enc_feat3, enc_feat2, enc_feat1)
         return output
