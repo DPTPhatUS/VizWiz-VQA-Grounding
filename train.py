@@ -8,18 +8,17 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.utils.data import DistributedSampler, Subset
+from torch.utils.data import DistributedSampler
 from dataset import VizWizGroundingDataset, make_loader
 from utils import to_device
 from models.model import build_model, EXPERIMENT
-from models.checkpoint import (load_checkpoint, read_checkpoint, save_checkpoint,
+from models.checkpoint import (load_checkpoint, read_checkpoint,
                                initialize_weights)
-from metrics import evaluate
 from losses import SupervisedObjective
 
 
 def add_experiment_arguments(parser):
-    pass
+    parser.add_argument("--init-checkpoint", help="Initialize from saved weights with a fresh optimizer")
 
 
 def validate_experiment_args(args):
@@ -33,9 +32,8 @@ def build_objective(args, model, device):
 IMAGE_SIZE = 336
 
 
-def build_datasets(args):
-    return (VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE),
-            VizWizGroundingDataset(args.data_root, "val", IMAGE_SIZE))
+def build_dataset(args):
+    return VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE)
 
 
 def seed_everything(seed):
@@ -59,18 +57,16 @@ def training_parser():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--save-every", type=int, default=10, help="Numbered checkpoint interval; 0 keeps only last/best")
-    parser.add_argument("--validate-every", type=int, default=1)
-    parser.add_argument("--resume-checkpoint")
+    parser.add_argument("--resume-checkpoint", help="Resume a legacy full checkpoint; raw weights use --init-checkpoint")
     add_experiment_arguments(parser)
     return parser
 
 
 def check_arguments(args):
-    if min(args.num_epochs, args.batch_size, args.validate_every) <= 0:
-        raise ValueError("Epochs, batch size and validation interval must be positive")
-    if args.num_workers < 0 or args.lr <= 0 or args.save_every < 0:
-        raise ValueError("Workers/save interval cannot be negative; learning rate must be positive")
+    if min(args.num_epochs, args.batch_size) <= 0:
+        raise ValueError("Epochs and batch size must be positive")
+    if args.num_workers < 0 or args.lr <= 0:
+        raise ValueError("Workers cannot be negative; learning rate must be positive")
     if args.resume_checkpoint and getattr(args, "init_checkpoint", None):
         raise ValueError("Use either resume or weight initialization, not both")
     for name in ("resume_checkpoint", "init_checkpoint", "teacher_checkpoint", "pairs"):
@@ -109,13 +105,11 @@ def _train(args, rank, world, distributed, device):
     out = Path(args.output_dir)
     if rank == 0:
         out.mkdir(parents=True, exist_ok=True)
-    if not args.resume_checkpoint and (out/"last.pt").exists():
-        raise ValueError("Output already contains a run; use --resume-checkpoint or a fresh directory")
-    if args.resume_checkpoint and (out / "last.pt").exists() and Path(args.resume_checkpoint).resolve() != (out / "last.pt").resolve():
-        raise ValueError("Output already contains a run; resume its last.pt or choose a fresh output directory")
+    if any(out.glob("*.pt")):
+        raise ValueError("Output already contains model files; choose a fresh output directory")
     if distributed:
         dist.barrier()
-    train_set, val_set = build_datasets(args)
+    train_set = build_dataset(args)
     model = build_model(args).to(device)
     if getattr(args, "init_checkpoint", None):
         initialize_weights(args.init_checkpoint,model)
@@ -125,13 +119,13 @@ def _train(args, rank, world, distributed, device):
         raise ValueError("No trainable parameters")
     optimizer = torch.optim.Adam(parameters, lr=args.lr)
     scaler = torch.amp.GradScaler("cuda",enabled=device.type=="cuda")
-    start, best = 0, -1.
+    start = 0
     if args.resume_checkpoint:
         checkpoint = load_checkpoint(args.resume_checkpoint,model)
         if checkpoint["run_config"].get("stage") != getattr(args, "stage", None):
             raise ValueError("Resume requires the same training stage; use --init-checkpoint to change stage")
         if "optimizer_state_dict" not in checkpoint:
-            raise ValueError("Resume requires optimizer state")
+            raise ValueError("Raw model weights have no optimizer state; use --init-checkpoint for a new run")
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         for group in optimizer.param_groups:
             group["lr"] = args.lr
@@ -139,10 +133,7 @@ def _train(args, rank, world, distributed, device):
         # starts a fresh scaler; a disabled CPU scaler safely ignores CUDA state.
         if checkpoint.get("scaler_state_dict"):
             scaler.load_state_dict(checkpoint["scaler_state_dict"])
-        start,best = checkpoint["epoch"],checkpoint["best_iou"]
-        # A new output directory selects its best checkpoint from the continued epochs.
-        if not (out / "best.pt").exists():
-            best = -1.
+        start = checkpoint["epoch"]
         if start >= args.num_epochs:
             raise ValueError("num-epochs must exceed the resumed epoch")
     if distributed:
@@ -152,9 +143,8 @@ def _train(args, rank, world, distributed, device):
     sampler = DistributedSampler(train_set,num_replicas=world,rank=rank,seed=args.seed) if distributed else None
     generator = torch.Generator()
     train_loader = make_loader(train_set,args,args.batch_size//world,sampler,sampler is None,generator)
-    # No padded validation examples and no DDP forward collectives for unequal shard lengths.
-    val_subset = Subset(val_set,list(range(rank,len(val_set),world)))
-    val_loader = make_loader(val_subset,args,args.batch_size//world)
+    run_config["experiment_config"] = unwrap(model).experiment_config
+    run_config["tiny"] = getattr(unwrap(model), "coarse", unwrap(model)).experiment_config.get("tiny", False)
     if rank == 0:
         (out/"config.json").write_text(json.dumps(run_config,indent=2))
         print(json.dumps({"parameters":sum(p.numel() for p in unwrap(model).parameters()),
@@ -192,33 +182,16 @@ def _train(args, rank, world, distributed, device):
             if distributed:
                 dist.all_reduce(value)
             record[name] = (value/totals[1]).item()
-        improved = False
-        if (epoch+1)%args.validate_every == 0 or epoch+1 == args.num_epochs:
-            if distributed:
-                # Includes e.g. BatchNorm running statistics in wide teacher controls.
-                for buffer in unwrap(model).buffers():
-                    dist.broadcast(buffer,src=0)
-            scores = evaluate(unwrap(model),val_loader,device,"original")
-            statistics = torch.tensor([sum(scores.values()),len(scores)],device=device,dtype=torch.float64)
-            if distributed:
-                dist.all_reduce(statistics)
-            score = (statistics[0]/statistics[1]).item()
-            record["val_mean_iou"] = score
-            improved = score > best
-            best = max(best,score)
         if rank == 0:
             print(json.dumps(record),flush=True)
             with (out/"history.jsonl").open("a") as handle:
                 handle.write(json.dumps(record)+"\n")
-            options = (unwrap(model),optimizer,scaler,epoch+1,best,run_config)
-            save_checkpoint(out/"last.pt",*options)
-            if improved:
-                save_checkpoint(out/"best.pt",*options)
-            if args.save_every and (epoch+1)%args.save_every == 0:
-                save_checkpoint(out/f"checkpoint_epoch{epoch+1}.pt",*options)
-        if distributed:
-            dist.barrier()
-
+    if rank == 0:
+        final_path = out / f"model_final_epoch{args.num_epochs}.pt"
+        torch.save(unwrap(model).state_dict(), final_path, _use_new_zipfile_serialization=False)
+        print(f"Final model saved: {final_path}", flush=True)
+    if distributed:
+        dist.barrier()
 
 main = train_main
 
