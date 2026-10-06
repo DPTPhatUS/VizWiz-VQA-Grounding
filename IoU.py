@@ -1,55 +1,5 @@
-import argparse
-from models.model import GroundingModel
-from models.checkpoint import load_model_weights
-from metrics import compute_iou
-from torchvision.transforms import ToTensor
-from PIL import Image, ImageOps
-import torch, json, os
-import torch.nn.functional as F
+"""Compatibility entry point for the canonical question-only evaluator."""
+from eval import main
 
-from torchvision import transforms as T
-
-val_json = "data/vizwiz/val_grounding.json"
-image_dir = "data/vizwiz/val"
-mask_dir = "data/vizwiz/binary_masks_png/val"
-
-# 1. load model
-parser = argparse.ArgumentParser()
-parser.add_argument("--conditioning", choices=["joint", "separate"], default="joint")
-args = parser.parse_args()
-model = GroundingModel(conditioning=args.conditioning)
-load_model_weights(model, torch.load("outputs/cross_model_final_epoch100.pt"))
-model.eval().cuda()
-
-# 2. load val json
-with open(val_json, "r") as f:
-    val_data = json.load(f)
-
-# 3. compute IoU
-ious = []
-
-transform = T.Compose([
-    T.Resize((336, 336)),
-    T.ToTensor()
-])
-
-for filename, meta in val_data.items():
-    image_path = os.path.join(image_dir, filename)
-    mask_path = os.path.join(mask_dir, filename.replace(".jpg", ".png"))
-    if not os.path.exists(image_path) or not os.path.exists(mask_path):
-        continue
-
-    image = transform(ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")).unsqueeze(0).cuda()
-    true_mask = transform(Image.open(mask_path).convert("L")).unsqueeze(0).cuda()
-    text = f"Q: {meta['question']} A: {meta.get('most_common_answer', '')}"
-
-    with torch.no_grad():
-        pred_mask = model(image, text)
-        pred_mask = F.interpolate(pred_mask, size=true_mask.shape[-2:], mode="bilinear", align_corners=False)
-        pred_mask = (torch.sigmoid(pred_mask) > 0.5).float()
-
-    iou = compute_iou(pred_mask, true_mask)
-    ious.append(iou)    
-
-# 4. output mean IoU
-print(f"Mean IoU over {len(ious)} samples: {sum(ious)/len(ious):.4f}")
+if __name__ == '__main__':
+    main()

@@ -36,3 +36,12 @@ def balanced_weights(values, target):
         result = result + masked / mass.clamp_min(1e-8)
     mass = result.flatten(1).sum(1).view(-1,1,1,1)
     return result / mass.clamp_min(1e-8)
+
+
+class SupervisedObjective:
+    def __init__(self, dice_weight):
+        self.dice_weight = dice_weight
+    def __call__(self, model, batch):
+        output = model(batch)
+        loss = segmentation_loss(output["logits"], batch["mask"], self.dice_weight)
+        return loss, {"segmentation": loss.detach()}
