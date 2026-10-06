@@ -78,13 +78,15 @@ class ObjectDetector(nn.Module):
         B, _, H, W = image.shape
         device = self._resolve_device(image)
 
-        # Build a list of HxWx3 uint8 numpy arrays — YOLO's predict() will
+        # Build HxWx3 uint8 BGR arrays (Ultralytics' numpy input convention).
+        # Input tensors are RGB, so reverse the channels before predict().
+        # YOLO's predict() will
         # batch them in a single CUDNN/cuBLAS call instead of being invoked
         # once per image from a Python loop.
         imgs_np = [
             (image[i].detach().permute(1, 2, 0).cpu().numpy() * 255.0)
             .clip(0, 255)
-            .astype("uint8")
+            .astype("uint8")[..., ::-1].copy()
             for i in range(B)
         ]
 
