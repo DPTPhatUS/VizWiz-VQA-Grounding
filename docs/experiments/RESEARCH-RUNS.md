@@ -31,3 +31,7 @@ OMP_NUM_THREADS=1 python -m unittest discover -s tests -v
 ```
 
 `--tiny --image-size 28 --num-workers 0` uses a small offline test model, not CLIP. It exists for integration tests and must never be reported as a trained research architecture.
+
+Strict continuation requires the checkpoint to reside in the same `--output-dir`; use weight initialization for a new run/directory. Provenance hashes both JSON annotations and their binary mask contents (including paired masks). CPU checkpoints can resume on CUDA with a fresh AMP scaler; CUDA execution itself is unverified here.
+
+Strict resume accepts `last.pt` only, avoiding stale best-checkpoint selection when rewinding within a run. Start a new initialized run to reuse older/best weights.

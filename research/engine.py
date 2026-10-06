@@ -60,8 +60,19 @@ def provenance(args):
         path = Path(args.data_root) / f"{split}_grounding.json"
         if path.exists():
             annotations[split] = file_hash(path)
+            masks = hashlib.sha256()
+            for filename in sorted(json.loads(path.read_text())):
+                mask_path = Path(args.data_root) / "binary_masks_png" / split / Path(filename).with_suffix(".png")
+                masks.update(json.dumps([filename, file_hash(mask_path)]).encode())
+            annotations[f"{split}_masks"] = masks.hexdigest()
     if getattr(args, "pairs", None):
         annotations["pairs"] = file_hash(args.pairs)
+        manifest = Path(args.pairs)
+        masks = hashlib.sha256()
+        for pair in json.loads(manifest.read_text()):
+            for key in ("mask1", "mask2"):
+                masks.update(json.dumps([pair[key], file_hash(manifest.parent / pair[key])]).encode())
+        annotations["pair_masks"] = masks.hexdigest()
     return {"revision": revision, "dirty": dirty, "torch": torch.__version__,
             "annotation_sha256": annotations}
 
@@ -110,6 +121,10 @@ def check_arguments(args):
         path = getattr(args,name,None)
         if path and not Path(path).is_file():
             raise ValueError(f"{name} does not exist: {path}")
+    if args.resume_checkpoint and Path(args.resume_checkpoint).resolve().parent != Path(args.output_dir).resolve():
+        raise ValueError("Resume requires the same output directory as its checkpoint; use --init-checkpoint for a new run")
+    if args.resume_checkpoint and Path(args.resume_checkpoint).name != "last.pt":
+        raise ValueError("Strict continuation requires last.pt; use --init-checkpoint for older or best weights")
     variant.validate_args(args)
 
 
@@ -216,7 +231,10 @@ def _train(args, rank, world, distributed, device):
         if "optimizer_state_dict" not in checkpoint:
             raise ValueError("Resume requires optimizer state")
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        # CPU checkpoints contain an empty disabled-scaler state. A CUDA continuation
+        # starts a fresh scaler; a disabled CPU scaler safely ignores CUDA state.
+        if checkpoint.get("scaler_state_dict"):
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
         start,best = checkpoint["epoch"],checkpoint["best_iou"]
         restore_rng(checkpoint["rng_states"][rank])
         if start >= args.num_epochs:
