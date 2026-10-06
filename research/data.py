@@ -89,14 +89,15 @@ class GroundingDataset(Dataset):
             result.update(pair_available=pair is not None, pair_same=False,
                           paired_text=question_text, paired_mask=torch.zeros_like(result["mask"]))
             if pair:
-                pair_masks = []
+                pair_masks, original_pair_masks = [], []
                 for key in ("mask1", "mask2"):
                     with Image.open(pair[key]) as source:
                         pm = source.convert("L")
                     if pm.size != image.size:
                         raise ValueError(f"Pair mask dimensions differ for {name}")
+                    original_pair_masks.append(to_tensor(pm) > .5)
                     pair_masks.append(self.mask_tensor(pm, self.image_size))
-                if pair["relation"] == "same" and not torch.equal(*pair_masks):
+                if pair["relation"] == "same" and not torch.equal(*original_pair_masks):
                     raise ValueError("Verified same-region pairs must have identical masks")
                 result.update(text=f"Q: {pair['question1']}", question_text=f"Q: {pair['question1']}",
                               mask=pair_masks[0], paired_text=f"Q: {pair['question2']}",
