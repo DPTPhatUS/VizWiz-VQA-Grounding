@@ -55,7 +55,6 @@ def main():
     parser.add_argument("--num-epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=0.00001)
-    parser.add_argument("--image-size", type=int, default=336)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--resume-checkpoint", type=str, default=None)
     parser.add_argument("--validate-every", type=int, default=0)
@@ -78,7 +77,7 @@ def main():
     if rank == 0:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    image_size = (args.image_size, args.image_size)
+    image_size = (336, 336)
 
     # Per-GPU batch size  (keeps effective batch size == args.batch_size)
     per_gpu_bs = args.batch_size // world_size
@@ -110,7 +109,7 @@ def main():
         sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
-        prefetch_factor=2,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
 
     # Validation: run on EVERY rank with DistributedSampler so the union
@@ -126,7 +125,7 @@ def main():
         sampler=val_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
-        prefetch_factor=2,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
 
     # --- Model ---
@@ -264,7 +263,7 @@ def main():
                 log_file.flush()
 
         # ---- Checkpoint (rank 0 only) ----
-        if rank == 0 and (epoch + 1) % args.save_every == 0:
+        if rank == 0 and args.save_every > 0 and (epoch + 1) % args.save_every == 0:
             ckpt_path = os.path.join(args.output_dir, f"checkpoint_epoch{epoch+1}.pt")
             underlying_model = model.module if is_dist else model
             ckpt = {
