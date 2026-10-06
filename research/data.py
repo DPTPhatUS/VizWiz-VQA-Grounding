@@ -81,6 +81,7 @@ class GroundingDataset(Dataset):
         if self.split != "train":
             result["original_mask"] = (to_tensor(mask) > .5).float()
         if self.detail_size:
+            result["detail_mask"] = self.mask_tensor(mask, self.detail_size)
             # Independent resize from the original image: never enlarge the CLIP input.
             result["detail_image"] = to_tensor(image.resize(
                 (self.detail_size, self.detail_size), Image.Resampling.BICUBIC))
