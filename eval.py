@@ -3,7 +3,6 @@
 Usage:
     uv run eval.py --checkpoint outputs/checkpoint_epoch20.pt --dataset val
     uv run eval.py --checkpoint outputs/checkpoint_epoch20.pt --dataset test
-    uv run eval.py --dataset val                  # uses base model (random weights, no checkpoint)
 """
 
 import argparse
@@ -23,18 +22,20 @@ from metrics import compute_iou_per_sample
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--dataset", type=str, default="val", choices=["val", "test"])
     parser.add_argument("--data-root", type=str, default="data/vizwiz")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--image-size", type=int, default=336)
     parser.add_argument("--output-dir", type=str, default=None)
     args = parser.parse_args()
 
+    if not os.path.isfile(args.checkpoint):
+        parser.error(f"Checkpoint is not a file: {args.checkpoint}")
+
     device = torch.device(args.device)
-    image_size = (args.image_size, args.image_size)
+    image_size = (336, 336)
 
     # --- Dataset paths ---
     if args.dataset == "val":
@@ -65,17 +66,14 @@ def main():
     # --- Model ---
     model = GroundingModel().to(device)
 
-    if args.checkpoint is not None:
-        checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint = torch.load(args.checkpoint, map_location="cpu")
 
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            load_model_weights(model, checkpoint)
-            print(f"Loaded checkpoint (epoch {checkpoint.get('epoch', '?')})")
-        else:
-            load_model_weights(model, checkpoint)
-            print("Loaded raw state dict")
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        load_model_weights(model, checkpoint)
+        print(f"Loaded checkpoint (epoch {checkpoint.get('epoch', '?')})")
     else:
-        print("No checkpoint provided — using base model (random weights)")
+        load_model_weights(model, checkpoint)
+        print("Loaded raw state dict")
     model.eval()
 
     # --- Inference ---
@@ -113,7 +111,7 @@ def main():
         results_file = os.path.join(args.output_dir, f"results_{args.dataset}_{timestamp}.json")
         iou_values = list(per_sample_iou.values())
         summary = {
-            "checkpoint": args.checkpoint or "none (base model)",
+            "checkpoint": args.checkpoint,
             "dataset": args.dataset,
             "num_samples": len(per_sample_iou),
             "mean_iou": round(sum(iou_values) / len(iou_values), 6),
