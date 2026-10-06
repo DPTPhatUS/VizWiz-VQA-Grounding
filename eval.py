@@ -17,8 +17,8 @@ def configure_evaluation(model, args):
 
 
 def eval_main(argv=None):
-    parser = argparse.ArgumentParser(description="Question-only evaluation using checkpoint architecture")
-    parser.add_argument("--checkpoint",required=True)
+    parser = argparse.ArgumentParser(description="Question-only evaluation using saved model architecture")
+    parser.add_argument("--checkpoint",required=True,help="Final model weights (keep config.json beside the file) or legacy checkpoint")
     parser.add_argument("--data-root",default="data/vizwiz")
     parser.add_argument("--dataset",choices=["val","test"],default="val")
     parser.add_argument("--batch-size",type=int,default=4)
