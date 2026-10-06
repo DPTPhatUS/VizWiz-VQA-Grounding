@@ -17,4 +17,6 @@ class GroundingModel(nn.Module):
 
 def build_model(args):
     # Evaluation never opens the training-time teacher checkpoint.
-    return GroundingModel(args.tiny)
+    if getattr(args, "teacher_training", False):
+        return BaseGroundingModel("joint", getattr(args, "tiny", False))
+    return GroundingModel(getattr(args, "tiny", False))

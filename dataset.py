@@ -12,8 +12,7 @@ from torchvision.transforms.functional import to_tensor
 
 
 class VizWizGroundingDataset(Dataset):
-    def __init__(self, root, split, image_size=336, detail_size=None,
-                 text_mode="question", answer_dropout=0.5, pairs=None):
+    def __init__(self, root, split, image_size=336, *, text_mode="question", answer_dropout=0.5):
         self.root, self.split = Path(root), split
         if text_mode not in {"question", "answer", "dropout"}:
             raise ValueError("Unknown text mode")
@@ -21,33 +20,12 @@ class VizWizGroundingDataset(Dataset):
             raise ValueError("Research validation/test must be question-only")
         if not 0 <= answer_dropout <= 1:
             raise ValueError("answer_dropout must be in [0,1]")
-        self.image_size, self.detail_size = image_size, detail_size
+        self.image_size = image_size
         self.text_mode, self.answer_dropout = text_mode, answer_dropout
         self.records = json.loads((self.root / f"{split}_grounding.json").read_text())
         self.names = list(self.records)
         if not self.names:
             raise ValueError("Dataset is empty")
-        self.pairs = {}
-        if pairs:
-            if split != "train":
-                raise ValueError("Paired annotations are training-only")
-            manifest = Path(pairs)
-            for pair in json.loads(manifest.read_text()):
-                required = {"filename", "question1", "question2", "mask1", "mask2", "relation"}
-                if not required <= pair.keys() or pair["relation"] not in {"change", "same"}:
-                    raise ValueError("Pairs require filename, question1/2, mask1/2, relation=change|same")
-                if pair["filename"] not in self.records:
-                    raise ValueError("Pair image must belong to this training split")
-                if not all(isinstance(pair[k], str) and pair[k].strip() for k in ("question1", "question2")):
-                    raise ValueError("Pair questions cannot be empty")
-                pair = dict(pair)
-                for key in ("mask1", "mask2"):
-                    pair[key] = str((manifest.parent / pair[key]).resolve())
-                    if not Path(pair[key]).is_file():
-                        raise ValueError(f"Pair mask does not exist: {pair[key]}")
-                self.pairs.setdefault(pair["filename"], []).append(pair)
-            if not self.pairs:
-                raise ValueError("Pair manifest contains no valid pairs")
 
     def __len__(self):
         return len(self.names)
@@ -82,28 +60,6 @@ class VizWizGroundingDataset(Dataset):
         }
         if self.split != "train":
             result["original_mask"] = (to_tensor(mask) > .5).float()
-        if self.detail_size:
-            # Independent resize from the original image: never enlarge the CLIP input.
-            result["detail_image"] = to_tensor(image.resize(
-                (self.detail_size, self.detail_size), Image.Resampling.BICUBIC))
-        if self.pairs:
-            pair = random.choice(self.pairs[name]) if name in self.pairs else None
-            result.update(pair_available=pair is not None, pair_same=False,
-                          paired_text=question_text, paired_mask=torch.zeros_like(result["mask"]))
-            if pair:
-                pair_masks = []
-                for key in ("mask1", "mask2"):
-                    with Image.open(pair[key]) as source:
-                        pm = source.convert("L")
-                    if pm.size != image.size:
-                        raise ValueError(f"Pair mask dimensions differ for {name}")
-                    pair_masks.append(self.mask_tensor(pm, self.image_size))
-                if pair["relation"] == "same" and not torch.equal(*pair_masks):
-                    raise ValueError("Verified same-region pairs must have identical masks")
-                result.update(text=f"Q: {pair['question1']}", question_text=f"Q: {pair['question1']}",
-                              mask=pair_masks[0], paired_text=f"Q: {pair['question2']}",
-                              paired_mask=pair_masks[1], pair_same=pair["relation"] == "same",
-                              answer_available=False, answer_text=f"Q: {pair['question1']}")
         return result
 
 

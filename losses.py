@@ -97,3 +97,12 @@ class DistillationObjective:
             kd = (weights * divergence).flatten(1).sum(1).mean()
         return supervised + self.weight * kd, {"segmentation": supervised.detach(),
                 "distillation": kd.detach(), "active_fraction": active}
+
+
+class SupervisedObjective:
+    def __init__(self, dice_weight=0.):
+        self.dice_weight = dice_weight
+    def __call__(self, model, batch):
+        output = model(batch)
+        loss = segmentation_loss(output["logits"], batch["mask"], self.dice_weight)
+        return loss, {"segmentation": loss.detach()}

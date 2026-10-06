@@ -52,7 +52,7 @@ class GroundingTextEncoder(nn.Module):
 class BaseGroundingModel(nn.Module):
     def __init__(self, architecture="compact", tiny=False):
         super().__init__()
-        if architecture not in {"compact", "joint", "residual", "baseline"}:
+        if architecture not in {"compact", "joint"}:
             raise ValueError("Unknown architecture")
         if tiny and architecture != "compact":
             raise ValueError("Tiny offline model supports compact architecture only")
@@ -63,7 +63,7 @@ class BaseGroundingModel(nn.Module):
         self.architecture = architecture
         self.text_proj = nn.Linear(self.text_dim, self.visual_dim)
         self.cross_attn = nn.MultiheadAttention(self.visual_dim, 2 if tiny else 8, batch_first=True)
-        self.residual_scale = nn.Parameter(torch.tensor(.01)) if architecture != "baseline" else None
+        self.residual_scale = nn.Parameter(torch.tensor(.01))
         if architecture == "compact":
             self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128)
         else:
@@ -84,7 +84,7 @@ class BaseGroundingModel(nn.Module):
         projected = self.text_proj(text.tokens)
         attended, _ = self.cross_attn(query, projected, projected,
             key_padding_mask=~text.attention_mask, need_weights=False)
-        fused = attended if self.residual_scale is None else query + self.residual_scale * attended
+        fused = query + self.residual_scale * attended
         fused = fused.transpose(1,2).reshape_as(vision)
         if self.architecture == "compact":
             logits = self.decoder(fused, s3, s2, s1, text)
