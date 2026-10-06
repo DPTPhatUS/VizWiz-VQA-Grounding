@@ -1,20 +1,42 @@
-"""Training-only privileged answers; student inference is exactly compact CEUD."""
 import math
 import torch
-from torch import nn
 from torch.nn import functional as F
-from research.model import ResearchGrounder
-from research.losses import balanced_weights, resize_logits, segmentation_loss
 
 
-class AnswerStudent(nn.Module):
-    def __init__(self, tiny=False):
-        super().__init__()
-        self.coarse = ResearchGrounder("compact", tiny)
-        self.experiment_config = dict(self.coarse.experiment_config, experiment="answer-value-distillation")
+def resize_logits(logits, target):
+    return F.interpolate(logits, size=target.shape[-2:], mode="bilinear", align_corners=False)
 
-    def forward(self, batch):
-        return self.coarse(dict(batch, text=batch.get("question_text", batch["text"])))
+
+def segmentation_loss(logits, target, dice_weight=0.0):
+    logits = resize_logits(logits, target).float()
+    target = target.float()
+    bce = F.binary_cross_entropy_with_logits(logits, target)
+    probability = logits.sigmoid()
+    axes = tuple(range(1, target.ndim))
+    dice = 1 - (2*(probability*target).sum(axes)+1) / (
+        probability.sum(axes)+target.sum(axes)+1)
+    return bce + dice_weight*dice.mean()
+
+
+def per_image_iou(logits, target):
+    prediction = resize_logits(logits, target) > 0
+    truth = target > .5
+    axes = tuple(range(1,target.ndim))
+    intersection = (prediction & truth).sum(axes).float()
+    union = (prediction | truth).sum(axes).float()
+    return torch.where(union > 0, intersection / union.clamp_min(1), torch.ones_like(union))
+
+
+def balanced_weights(values, target):
+    """Each nonempty foreground/background region gets equal mass per sample."""
+    values = values.detach().float().clamp_min(0)
+    result = torch.zeros_like(values)
+    for region in (target > .5, target <= .5):
+        masked = values * region
+        mass = masked.flatten(1).sum(1).view(-1,1,1,1)
+        result = result + masked / mass.clamp_min(1e-8)
+    mass = result.flatten(1).sum(1).view(-1,1,1,1)
+    return result / mass.clamp_min(1e-8)
 
 
 def distillation_weights(answer_logits, question_logits, target, mode):

@@ -1,1 +1,0 @@
-"""Controlled grounding research experiments."""
