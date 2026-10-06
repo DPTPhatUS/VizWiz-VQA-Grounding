@@ -15,6 +15,7 @@ def load_model_weights(model, checkpoint):
 
 """Versioned research checkpoints; only load checkpoints from trusted sources."""
 import os
+import json
 import random
 from pathlib import Path
 import torch
@@ -50,11 +51,20 @@ def save_checkpoint(path, model, optimizer, scaler, epoch, best_iou, run_config,
 
 
 def read_checkpoint(path):
-    # Python RNG tuples are deliberately included; never use untrusted checkpoint files.
+    """Read previous checkpoints or final raw weights with their adjacent config.json."""
     value = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(value, dict) or value.get("format_version") != 1:
-        raise ValueError("Expected a versioned research checkpoint; legacy weights need explicit migration")
-    return value
+    if isinstance(value, dict) and value.get("format_version") == 1:
+        return value
+    if not isinstance(value, dict) or not value or not all(isinstance(v, torch.Tensor) for v in value.values()):
+        raise ValueError("Expected raw model weights or a supported legacy checkpoint")
+    config_path = Path(path).parent / "config.json"
+    if not config_path.is_file():
+        raise ValueError("Raw model weights require the training config.json in the same directory")
+    run = json.loads(config_path.read_text())
+    if "experiment_config" not in run:
+        raise ValueError("config.json is missing the saved model architecture")
+    return {"model_state_dict": value, "experiment_config": run["experiment_config"],
+            "run_config": run}
 
 
 def load_checkpoint(path, model):

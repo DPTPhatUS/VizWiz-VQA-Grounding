@@ -18,15 +18,11 @@ The data directory contains `<split>_grounding.json`, image folders `train/`, `v
 set -e
 cd /kaggle/working/VizWiz-VQA-Grounding
 DATA_ROOT=/kaggle/input/YOUR_DATASET/vizwiz
-python train.py --data-root "$DATA_ROOT" --num-epochs 100 --batch-size 1 --num-workers 2 --seed 42 --save-every 0 --output-dir /kaggle/working/outputs-extent
-python eval.py --data-root "$DATA_ROOT" --checkpoint /kaggle/working/outputs-extent/best.pt --dataset test --batch-size 1 --num-workers 2 --output-dir /kaggle/working/results-extent
+python train.py --data-root "$DATA_ROOT" --num-epochs 100 --batch-size 1 --num-workers 2 --seed 42 --output-dir /kaggle/working/outputs-extent
+python eval.py --data-root "$DATA_ROOT" --checkpoint /kaggle/working/outputs-extent/model_final_epoch100.pt --dataset test --batch-size 1 --num-workers 2 --output-dir /kaggle/working/results-extent
 ```
 
-Training selects CUDA when available. `--init-checkpoint /path/to/compact/best.pt` optionally initializes the coarse model from a compatible corrected compact checkpoint. It starts a fresh optimizer. Matching extent checkpoints can also initialize a run.
-
-Validation runs every epoch by default and selects `best.pt` using original-resolution mean per-image IoU. `last.pt` contains model, optimizer, scaler and completed epoch. `--save-every 0` disables numbered checkpoints. Evaluation exports original-size PNG masks and `metrics.json`.
-
-To continue, use `--resume-checkpoint /path/to/last.pt` with a larger final `--num-epochs`. A new output directory is allowed and selects its best checkpoint from the continued epochs. Copy saved files to writable Kaggle storage when resuming there. Resume validates model compatibility and restores optimizer state; it does not enforce immutable dataset paths or annotation hashes.
+Training selects CUDA when available. `--init-checkpoint /path/to/compact/model_final_epoch100.pt` optionally initializes the coarse model from a compatible corrected compact checkpoint. It starts a fresh optimizer. Matching extent checkpoints can also initialize a run.
 
 ## Optional paired questions
 
@@ -52,10 +48,18 @@ With a manifest, signed mask-difference and same-region consistency losses each 
 ## Single-image prediction
 
 ```bash
-python predict_save.py --checkpoint /path/to/best.pt --image /path/to/image.jpg --question "What does it say?" --output mask.png
-python visualize_predictions.py --checkpoint /path/to/best.pt --image /path/to/image.jpg --question "What does it say?" --output overlay.png
+python predict_save.py --checkpoint /path/to/model_final_epoch100.pt --image /path/to/image.jpg --question "What does it say?" --output mask.png
+python visualize_predictions.py --checkpoint /path/to/model_final_epoch100.pt --image /path/to/image.jpg --question "What does it say?" --output overlay.png
 ```
 
 `IoU.py` delegates to the same evaluator. `models/model.py` contains the extent model, `models/backbone.py` its compact backbone, `dataset.py` the aligned data loader, and `losses.py` the objective. Detector/YOLO and alternate box-generation paths are removed. `docs/` and `tests/` remain ignored local development files.
 
-Resume applies `--lr` after restoring optimizer state. An existing output directory may only resume its own `last.pt`; use a fresh directory for a checkpoint copied from Kaggle input or an earlier epoch.
+## Training output and separate evaluation
+
+Training reads only the training split: no validation dataset is loaded and no validation runs, including after the final epoch. This also applies to teacher training and both refinement stages.
+
+At completion, training saves exactly one raw `state_dict`: `model_final_epoch<N>.pt`, matching the baseline format. It contains model tensors only, with no optimizer, scaler, epoch wrapper, or RNG state. There are no automatic `last.pt`, `best.pt`, or periodic checkpoint saves; `--validate-every` and `--save-every` have been removed.
+
+Keep the existing small `config.json` beside the weight file when copying outputs to Kaggle or another directory. The evaluation, prediction, teacher, and refinement loaders use it to identify the architecture and stage. `history.jsonl` contains training losses only. Run `eval.py` separately with `--dataset val` or `--dataset test`; the commands above show the final weight filename for their epoch count.
+
+To train further from these weights, use `--init-checkpoint /path/to/model_final_epoch<N>.pt` and a fresh output directory. This starts a new optimizer and epoch counter; `--num-epochs` is the number of additional epochs. Distillation still requires its teacher. `--resume-checkpoint` remains available only for older full checkpoints with optimizer state; their `--num-epochs` is the final total epoch count. New training does not produce full checkpoints.
