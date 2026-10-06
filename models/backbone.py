@@ -1,4 +1,4 @@
-"""Corrected protocol models; historical model.py remains unchanged."""
+"""Shared CLIP grounding backbone used by this branch and its frozen references."""
 from types import SimpleNamespace
 import torch
 from torch import nn
@@ -19,7 +19,7 @@ class TinyVision(nn.Module):
         return feature, feature, feature, feature
 
 
-class ResearchText(nn.Module):
+class GroundingTextEncoder(nn.Module):
     def __init__(self, tiny=False):
         super().__init__()
         self.tiny = tiny
@@ -49,7 +49,7 @@ class ResearchText(nn.Module):
         return SimpleNamespace(tokens=tokens, attention_mask=attention, valid_mask=valid)
 
 
-class ResearchGrounder(nn.Module):
+class BaseGroundingModel(nn.Module):
     def __init__(self, architecture="compact", tiny=False):
         super().__init__()
         if architecture not in {"compact", "joint", "residual", "baseline"}:
@@ -57,7 +57,7 @@ class ResearchGrounder(nn.Module):
         if tiny and architecture != "compact":
             raise ValueError("Tiny offline model supports compact architecture only")
         self.image_encoder = TinyVision() if tiny else ImageEncoder()
-        self.text_encoder = ResearchText(tiny)
+        self.text_encoder = GroundingTextEncoder(tiny)
         self.visual_dim = self.image_encoder.out_channels
         self.text_dim = self.text_encoder.output_dim
         self.architecture = architecture

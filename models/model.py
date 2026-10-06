@@ -1,40 +1,53 @@
+"""Branch architecture and checkpoint-driven model construction."""
+import math
 import torch
-import torch.nn as nn
-from models import ImageEncoder, TextEncoder, UNetDecoder
-from models.experiment import CompactDecoder
+from torch import nn
+from torch.nn import functional as F
+from models.backbone import BaseGroundingModel
+from losses import resize_logits
+
+EXPERIMENT = 'evidence-extent'
+
 
 class GroundingModel(nn.Module):
-    def __init__(self, n_heads=8, conditioning="joint"):
-        if conditioning not in {"joint", "separate"}:
-            raise ValueError("conditioning must be joint or separate")
+    def __init__(self, tiny=False, width=None):
         super().__init__()
-        self.image_encoder = ImageEncoder()
-        self.text_encoder = TextEncoder()
+        width = (16 if tiny else 64) if width is None else width
+        if width <= 0 or width % (2 if tiny else 4):
+            raise ValueError('Evidence width must be positive and divisible by the attention head count')
+        self.coarse = BaseGroundingModel('compact', tiny)
+        self.query_tokens = nn.Parameter(torch.randn(2, width) * .02)
+        self.text_projection = nn.Linear(self.coarse.text_dim, width)
+        self.visual_projection = nn.Conv2d(self.coarse.visual_dim, width, 1)
+        self.question_attention = nn.MultiheadAttention(width, 2 if tiny else 4, batch_first=True)
+        self.visual_attention = nn.MultiheadAttention(width, 2 if tiny else 4, batch_first=True)
+        self.question_norm = nn.LayerNorm(width)
+        self.visual_norm = nn.LayerNorm(width)
+        self.token_bias = nn.Linear(width, 1)
+        self.experiment_config = dict(self.coarse.experiment_config, experiment='evidence-extent',
+                                      token_width=width, envelope='bounding-rectangle-v1')
 
-        # fixed based on image hidden dim
-        self.hidden_dim = self.image_encoder.out_channels  # typically 768
+    def forward(self, batch):
+        # Explicit question_text takes precedence over any privileged training view.
+        questions = batch.get('question_text', batch.get('text'))
+        output = self.coarse({'image': batch['image'], 'text': questions})
+        visual = self.visual_projection(output['visual'])
+        visual_tokens = visual.flatten(2).transpose(1, 2)
+        text = self.text_projection(output['text_tokens'])
+        tokens = self.query_tokens.unsqueeze(0).expand(visual.shape[0], -1, -1)
+        attended, _ = self.question_attention(tokens, text, text,
+            key_padding_mask=~output['text_mask'], need_weights=False)
+        tokens = self.question_norm(tokens + attended)
+        attended, _ = self.visual_attention(tokens, visual_tokens, visual_tokens, need_weights=False)
+        tokens = self.visual_norm(tokens + attended)
+        maps = torch.einsum('bkc,bchw->bkhw', tokens, visual) / math.sqrt(visual.shape[1])
+        maps = maps + self.token_bias(tokens).unsqueeze(-1)
+        location, extent = maps[:, :1], maps[:, 1:]
+        logits = output['logits'] + resize_logits(location + extent, output['logits'])
+        return {'logits': logits, 'location_logits': location, 'extent_residual': extent}
 
-        # project text dim to match hidden dim
-        self.text_proj = nn.Linear(self.text_encoder.output_dim, self.hidden_dim)
 
-        self.cross_attn = nn.MultiheadAttention(embed_dim=self.hidden_dim, num_heads=n_heads, batch_first=True)
-        self.decoder = CompactDecoder(in_channels=self.hidden_dim, text_dim=self.text_encoder.output_dim,
-                                      separate=conditioning == "separate")
-        self.residual_scale = nn.Parameter(torch.tensor(0.01))
-        self.experiment_config = {"architecture": "compact-decoder", "conditioning": conditioning}
-
-    def forward(self, image, text):
-        enc_feat1, enc_feat2, enc_feat3, bottleneck = self.image_encoder(image)
-        B, D, H, W = bottleneck.shape
-        img_tokens = bottleneck.flatten(2).permute(0, 2, 1)  # (B, N, D)
-
-        text_features = self.text_encoder(text, return_features=True)
-        text_tokens = text_features.tokens
-        text_tokens = self.text_proj(text_tokens)          # align to (B, L, D)
-
-        attn_output, _ = self.cross_attn(query=img_tokens, key=text_tokens, value=text_tokens)
-        fused_tokens = img_tokens + self.residual_scale * attn_output
-        fused = fused_tokens.permute(0, 2, 1).view(B, D, H, W)
-
-        output = self.decoder(fused, enc_feat3, enc_feat2, enc_feat1, text_features)
-        return output
+def build_model(args):
+    if args.architecture != 'compact':
+        raise ValueError('Evidence extent requires the compact architecture')
+    return GroundingModel(args.tiny, args.evidence_width)
