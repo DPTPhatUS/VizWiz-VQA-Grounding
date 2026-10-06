@@ -1,69 +1,56 @@
-# Architecture experiment: compact-decoder
+# VizWiz VQA Grounding — exp/gain-guided-refinement
 
-This branch implements the `compact-decoder` experiment. See [experiment design, run commands, and verification](docs/experiments/README.md).
+This branch extends the CEUD grounding project, which was presented as a CVPR 2025 workshop spotlight. The model predicts visual evidence masks from an image and question.
 
-# 🏆Workshop Spotlight at CVPR 2025
-Our work has been selected as a spotlight paper at a workshop in CVPR 2025! ( https://cvpr.thecvf.com/ )
-We are honored that our research was recognized and featured among the notable contributions. 
+Use **train.py** and **eval.py** directly. The experiment is integrated into the existing pipeline:
 
-# Tasks: VizWiz-VQA-Grounding
- This project was developed for the [VizWiz-VQA-Grounding Challenge](https://vizwiz.org/tasks-and-datasets/visual-qa/) 2025. The goal is to return grounded visual evidence for answers to visual questions posed by people with visual impairments. 
+- `models/model.py`: this branch's architecture and model factory.
+- `models/backbone.py`: shared CLIP grounding backbone, including frozen teacher/coarse references.
+- `models/experiment.py`: compact decoder and skip conditioning.
+- `dataset.py`: aligned images, masks and text views; branch-specific detail/pair data where needed.
+- `losses.py`: segmentation and experiment objectives.
+- `models/checkpoint.py`: checkpoint initialization and strict continuation.
+- `metrics.py`: original-resolution question-only evaluation.
 
+There is one training/evaluation pipeline. The former parallel package and alternate entry points have been removed. Existing corrected experiment checkpoint keys/configurations are preserved; historical pre-correction checkpoint formats are still rejected.
 
-## 🎶Task Objective
-Given an image-question pair, the task is to predict the region in the image that supports the most common answer. This is known as **answer grounding**, and predictions are evaluated based on **mean Intersection over Union (IoU)** with human-annotated binary masks.
+## Kaggle commands
 
+Enable a GPU and Internet for pretrained CLIP downloads. Keep Kaggle's installed Torch/Torchvision environment and install the other imported dependencies if needed:
 
-## 📂Project Structure
-```project/
-├── README.md
-├── models/
-    ├── init.py
-    ├── image_encoder.py
-    ├── text_encoder.py
-    ├── concat.py
-    ├── mask_decoder.py
-    └── model.py 
-├── data/
-    ├── binary_masks_png/
-    │   ├── train/
-    │   └── val/
-    ├── test/
-    ├── train/
-    ├── val/
-    ├── test_grounding.json
-    ├── train_grounding.json
-    └── val_grounding.json
-├── train.py
-├── dataset.py
-├── utils.py
-├── visualize_predictions.py
-├── IoU.py
-├── metrics.py
-└── config.yml
+```bash
+pip install transformers ultralytics matplotlib tqdm pillow
 ```
-## ⚙️ Installation
-    apt update
-    apt install -y git
-    git
-    git config --global user.name "<yourname>"
-    git config --global user.email "<youremail>"
-    git clone https://github.com/yjh9929/VizWiz-VQA-Grounding.git
-    pip install torch torchvision transformers pyyaml
-    pip install tqdm
-    pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-## 🚀 Running the Code
-    CUDA_VISIBLE_DEVICES=0 python train.py
+Run the following in a Kaggle `%%bash` cell after cloning this branch. Replace dataset/checkpoint placeholders. The dataset root must contain `train_grounding.json`, `val_grounding.json`, `test_grounding.json`, image directories `train/`, `val/`, `test/`, and `binary_masks_png/<split>/`.
 
-## 🧠 Model Design
+```bash
+set -e
+cd /kaggle/working/VizWiz-VQA-Grounding
+DATA_ROOT=/kaggle/input/YOUR_DATASET/vizwiz
+COMPACT_CKPT=/kaggle/input/YOUR_COMPACT_CHECKPOINT/best.pt
+# Stage 1: frozen coarse model, train crop refiner.
+python train.py --data-root "$DATA_ROOT" --stage refiner --init-checkpoint "$COMPACT_CKPT" --detail-size 672 --crop-size 336 --policy fixed --budget 2 --num-epochs 30 --batch-size 1 --num-workers 2 --seed 42 --device cuda --save-every 1000000 --output-dir /kaggle/working/outputs-refiner
+# Stage 2: freeze coarse model and refiner, train gain router.
+python train.py --data-root "$DATA_ROOT" --stage router --init-checkpoint /kaggle/working/outputs-refiner/best.pt --detail-size 672 --crop-size 336 --policy gain --budget 2 --num-epochs 30 --batch-size 1 --num-workers 2 --seed 42 --device cuda --save-every 1000000 --output-dir /kaggle/working/outputs-router
+python eval.py --data-root "$DATA_ROOT" --checkpoint /kaggle/working/outputs-router/best.pt --dataset test --policy gain --budget 2 --batch-size 1 --num-workers 2 --device cuda --output-dir /kaggle/working/results-router
+```
 
-## 📊 Evaluation
-    python visualize_predictions.py
-    python IoU.py
+Validation is question-only and runs each epoch. `best.pt` is selected by original-resolution mean IoU; `last.pt` supports continuation. The large save interval avoids retaining many periodic checkpoints. Evaluation writes PNG masks and `metrics.json`. Use `--dataset val` for validation exports.
 
-## 🔗 References
+For continuation, repeat the same training settings, replace `--init-checkpoint` with `--resume-checkpoint /path/to/output/last.pt`, and keep the same output directory. `--num-epochs` is the final epoch count. When moving a run between Kaggle sessions, copy its saved run directory into writable storage before resuming; keep the original training configuration and data paths compatible. Teacher-dependent continuation also requires the same teacher file.
 
-## 📝 License
-<a href="http://creativecommons.org/licenses/by/4.0/" rel="license"><img src="https://i.creativecommons.org/l/by/4.0/88x31.png" alt="Creative Commons License"></a>  
-This work is licensed under a Creative Commons Attribution 4.0 International License.
+Use `--help` on either script to see the branch options. `--tiny` is only an offline integration-test model, not a research architecture. GPU speed and real-data improvements have not been validated here.
+
+`docs/` and `tests/` are deliberately ignored and kept local. This README is the tracked run guide for clones.
+
+## Predict or visualize one image
+
+These scripts use the same checkpoint architecture and input preprocessing as evaluation, including detail images on the refinement branch. No ground-truth mask is needed. Replace the checkpoint path with this branch's trained output.
+
+```bash
+python predict_save.py --checkpoint /path/to/best.pt --image /path/to/image.jpg --question "What does it say?" --output /kaggle/working/mask.png --device cuda
+python visualize_predictions.py --checkpoint /path/to/best.pt --image /path/to/image.jpg --question "What does it say?" --output /kaggle/working/overlay.png --device cuda
+```
+
+`IoU.py` accepts the same arguments as `eval.py` and delegates to that evaluator.

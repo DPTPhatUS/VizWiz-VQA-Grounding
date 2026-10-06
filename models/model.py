@@ -1,40 +1,192 @@
+"""Branch architecture and checkpoint-driven model construction."""
+import hashlib
 import torch
-import torch.nn as nn
-from models import ImageEncoder, TextEncoder, UNetDecoder
-from models.experiment import CompactDecoder
+from torch import nn
+from torch.nn import functional as F
+from models.backbone import BaseGroundingModel
+from losses import segmentation_loss, per_image_iou
+
+EXPERIMENT = 'gain-guided-refinement'
+
+
+def candidate_windows(height, width):
+    """Integer half-open boxes; each regular scale tiles the entire canvas."""
+    if min(height, width) < 3:
+        raise ValueError('Detail canvas must be at least 3 pixels in each dimension')
+    return [(y*height//grid,x*width//grid,(y+1)*height//grid,(x+1)*width//grid)
+            for grid in (2,3) for y in range(grid) for x in range(grid)]
+
+
+def crop(tensor, box):
+    y0,x0,y1,x1 = box
+    return tensor[...,y0:y1,x0:x1]
+
+
+def blend_residuals(coarse, residuals, boxes):
+    """Mean overlapping corrections; untouched pixels retain coarse logits."""
+    total, count = torch.zeros_like(coarse), torch.zeros_like(coarse)
+    h,w = coarse.shape[-2:]
+    for residual,(y0,x0,y1,x1) in zip(residuals,boxes):
+        resized = F.interpolate(residual,size=(y1-y0,x1-x0),mode='bilinear',align_corners=False)
+        total = total + F.pad(resized,(x0,w-x1,y0,h-y1))
+        count = count + F.pad(torch.ones_like(resized),(x0,w-x1,y0,h-y1))
+    return coarse + total/count.clamp_min(1)
+
+
+@torch.no_grad()
+def actual_gains(coarse, candidates, truth):
+    baseline = per_image_iou(coarse,truth)
+    return torch.stack([per_image_iou(candidate,truth)-baseline for candidate in candidates],dim=1)
+
+
+def box_iou(a,b):
+    ay,ax,by,bx=a; cy,cx,dy,dx=b
+    overlap=max(0,min(by,dy)-max(ay,cy))*max(0,min(bx,dx)-max(ax,cx))
+    return overlap/((by-ay)*(bx-ax)+(dy-cy)*(dx-cx)-overlap)
+
+
+def select_windows(scores,boxes,budget,skip_nonpositive=False,diversity_iou=.3):
+    selected=[]
+    for row in scores.detach().float().cpu():
+        chosen=[]
+        for index in torch.argsort(row,descending=True,stable=True).tolist():
+            if skip_nonpositive and row[index] <= 0:
+                continue
+            if all(box_iou(boxes[index],boxes[j]) <= diversity_iou for j in chosen):
+                chosen.append(index)
+            if len(chosen) == budget:
+                break
+        selected.append(chosen)
+    return selected
+
+
+class CropRefiner(nn.Module):
+    def __init__(self,context_dim,width):
+        super().__init__()
+        self.context = nn.Linear(context_dim,width)
+        self.layers = nn.Sequential(nn.Conv2d(width+4,width,3,padding=1),nn.GELU(),
+                                    nn.Conv2d(width,width,3,padding=1),nn.GELU(),
+                                    nn.Conv2d(width,1,1))
+
+    def forward(self,rgb,coarse,context):
+        context=self.context(context)[...,None,None].expand(-1,-1,*rgb.shape[-2:])
+        return self.layers(torch.cat([rgb,coarse,context],dim=1))
+
 
 class GroundingModel(nn.Module):
-    def __init__(self, n_heads=8, conditioning="joint"):
-        if conditioning not in {"joint", "separate"}:
-            raise ValueError("conditioning must be joint or separate")
+    def __init__(self,coarse,stage='refiner',crop_size=336,policy='gain',budget=2,
+                 dice_weight=0.,diversity_iou=.3,skip_nonpositive=True,routing_seed=42):
         super().__init__()
-        self.image_encoder = ImageEncoder()
-        self.text_encoder = TextEncoder()
+        if stage not in ('refiner','router') or policy not in ('gain','uncertainty','random','fixed','relevance'):
+            raise ValueError('Unknown refinement stage or policy')
+        if crop_size <= 0 or budget not in (1,2,4) or not 0 <= diversity_iou <= 1:
+            raise ValueError('Invalid crop size, budget, or diversity threshold')
+        self.routing_seed=routing_seed
+        self.coarse=coarse.requires_grad_(False)
+        self.stage,self.crop_size,self.policy,self.budget=stage,crop_size,policy,budget
+        self.dice_weight,self.diversity_iou,self.skip_nonpositive=dice_weight,diversity_iou,skip_nonpositive
+        width=16 if coarse.experiment_config['tiny'] else 64
+        context_dim=coarse.visual_dim+coarse.text_dim
+        self.refiner=CropRefiner(context_dim,width)
+        self.router=nn.Sequential(nn.Linear(context_dim+7,width),nn.GELU(),nn.Linear(width,1))
+        self.refiner.requires_grad_(stage=='refiner')
+        self.router.requires_grad_(stage=='router')
+        self.experiment_config={'experiment':'gain-guided-refinement','coarse':coarse.experiment_config.copy(),
+                                'crop_size':crop_size,'grids':[2,3],'width':width,'protocol':'residual-mean-gain-v1'}
+        self.train()
 
-        # fixed based on image hidden dim
-        self.hidden_dim = self.image_encoder.out_channels  # typically 768
+    def train(self,mode=True):
+        super().train(mode)
+        self.coarse.eval()
+        self.refiner.train(mode and self.stage=='refiner')
+        self.router.train(mode and self.stage=='router')
+        return self
 
-        # project text dim to match hidden dim
-        self.text_proj = nn.Linear(self.text_encoder.output_dim, self.hidden_dim)
+    def features(self,batch):
+        with torch.no_grad():
+            # Never consume answer-bearing text, including during training.
+            output=self.coarse({'image':batch['image'],'text':batch['question_text']})
+            h,w=batch['detail_image'].shape[-2:]
+            boxes=candidate_windows(h,w)
+            logits=F.interpolate(output['logits'],size=(h,w),mode='bilinear',align_corners=False)
+            contexts,descriptors,relevance=[],[],[]
+            probability=logits.sigmoid()
+            for box in boxes:
+                y0,x0,y1,x1=box
+                # Pool on the native coarse feature map; do not materialize a huge upsampled CLIP map.
+                vh,vw=output['visual'].shape[-2:]
+                visual=crop(output['visual'],(y0*vh//h,x0*vw//w,
+                            max(y0*vh//h+1,(y1*vh+h-1)//h),max(x0*vw//w+1,(x1*vw+w-1)//w))).mean((-2,-1))
+                text=output['pooled_text']
+                context=torch.cat([visual,text],dim=1)
+                p=crop(probability,box)
+                statistics=torch.stack([p.mean((1,2,3)),(4*p*(1-p)).mean((1,2,3)),
+                                         (p>.5).float().mean((1,2,3))],dim=1)
+                coordinates=logits.new_tensor([y0/h,x0/w,y1/h,x1/w]).expand(len(logits),-1)
+                contexts.append(context)
+                descriptors.append(torch.cat([context,statistics,coordinates],dim=1))
+                relevance.append(F.cosine_similarity(visual,self.coarse.text_proj(text),dim=1))
+        return logits,boxes,torch.stack(contexts,1),torch.stack(descriptors,1),torch.stack(relevance,1)
 
-        self.cross_attn = nn.MultiheadAttention(embed_dim=self.hidden_dim, num_heads=n_heads, batch_first=True)
-        self.decoder = CompactDecoder(in_channels=self.hidden_dim, text_dim=self.text_encoder.output_dim,
-                                      separate=conditioning == "separate")
-        self.residual_scale = nn.Parameter(torch.tensor(0.01))
-        self.experiment_config = {"architecture": "compact-decoder", "conditioning": conditioning}
+    def residual(self,batch,coarse,box,context):
+        rgb=crop(batch['detail_image'],box)
+        rgb=F.interpolate(rgb,size=(self.crop_size,self.crop_size),mode='bilinear',align_corners=False)
+        rgb=(rgb-self.coarse.image_mean)/self.coarse.image_std
+        logits=F.interpolate(crop(coarse,box),size=rgb.shape[-2:],mode='bilinear',align_corners=False)
+        return self.refiner(rgb,logits,context)
 
-    def forward(self, image, text):
-        enc_feat1, enc_feat2, enc_feat3, bottleneck = self.image_encoder(image)
-        B, D, H, W = bottleneck.shape
-        img_tokens = bottleneck.flatten(2).permute(0, 2, 1)  # (B, N, D)
+    def forward(self,batch,compute_loss=False):
+        coarse,boxes,contexts,descriptors,relevance=self.features(batch)
+        if compute_loss and self.stage=='refiner':
+            losses=[]; predictions=[]
+            for i in range(len(coarse)):
+                j=torch.randint(len(boxes),()).item()
+                local={'detail_image':batch['detail_image'][i:i+1]}
+                residual=self.residual(local,coarse[i:i+1],boxes[j],contexts[i:i+1,j])
+                prediction=blend_residuals(coarse[i:i+1],[residual],[boxes[j]])
+                losses.append(segmentation_loss(crop(prediction,boxes[j]),
+                              crop(batch['detail_mask'][i:i+1],boxes[j]),self.dice_weight))
+                predictions.append(prediction)
+            return {'logits':torch.cat(predictions),'loss':torch.stack(losses).mean()}
+        scores=self.router(descriptors).squeeze(-1)
+        if compute_loss:
+            with torch.no_grad():
+                # Stream candidates to avoid retaining 13 detail-resolution predictions.
+                baseline=per_image_iou(coarse,batch['detail_mask'])
+                gains=[]
+                for j,box in enumerate(boxes):
+                    residual=self.residual(batch,coarse,box,contexts[:,j])
+                    prediction=blend_residuals(coarse,[residual],[box])
+                    gains.append(per_image_iou(prediction,batch['detail_mask'])-baseline)
+                targets=torch.stack(gains,dim=1)
+            return {'logits':coarse,'loss':F.mse_loss(scores.float(),targets),
+                    'gain_targets':targets,'gain_scores':scores}
+        if self.policy=='uncertainty':
+            scores=descriptors[...,-6]
+        elif self.policy=='relevance':
+            scores=relevance
+        elif self.policy=='fixed':
+            scores=-torch.arange(len(boxes),device=coarse.device,dtype=coarse.dtype).expand(len(coarse),-1)
+        elif self.policy=='random':
+            # Stable image-specific generator: evaluation invariant to batching and DDP sharding.
+            keys=([str(name).encode() for name in batch['filename']] if 'filename' in batch else
+                  [image.detach().float().cpu().numpy().tobytes() for image in batch['image']])
+            seeds=[int.from_bytes(hashlib.sha256(str(self.routing_seed).encode()+key).digest()[:8],'little')
+                   for key in keys]
+            scores=torch.stack([torch.rand(len(boxes),generator=torch.Generator().manual_seed(seed)) for seed in seeds])
+        chosen=select_windows(scores,boxes,self.budget,
+                              self.skip_nonpositive and self.policy=='gain',self.diversity_iou)
+        predictions=[]
+        for i,indices in enumerate(chosen):
+            local={'detail_image':batch['detail_image'][i:i+1]}
+            residuals=[self.residual(local,coarse[i:i+1],boxes[j],contexts[i:i+1,j]) for j in indices]
+            predictions.append(blend_residuals(coarse[i:i+1],residuals,[boxes[j] for j in indices]))
+        return {'logits':torch.cat(predictions),'gain_scores':scores,
+                'crop_counts':torch.tensor([len(x) for x in chosen],device=coarse.device)}
 
-        text_features = self.text_encoder(text, return_features=True)
-        text_tokens = text_features.tokens
-        text_tokens = self.text_proj(text_tokens)          # align to (B, L, D)
 
-        attn_output, _ = self.cross_attn(query=img_tokens, key=text_tokens, value=text_tokens)
-        fused_tokens = img_tokens + self.residual_scale * attn_output
-        fused = fused_tokens.permute(0, 2, 1).view(B, D, H, W)
-
-        output = self.decoder(fused, enc_feat3, enc_feat2, enc_feat1, text_features)
-        return output
+def build_model(args):
+    return GroundingModel(BaseGroundingModel(args.architecture,args.tiny),stage=args.stage,
+                             crop_size=args.crop_size,policy=args.policy,budget=args.budget,
+                             dice_weight=args.dice_weight,diversity_iou=args.diversity_iou,
+                             skip_nonpositive=args.skip_nonpositive,routing_seed=args.seed)

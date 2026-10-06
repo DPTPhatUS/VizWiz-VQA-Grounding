@@ -36,3 +36,9 @@ def balanced_weights(values, target):
         result = result + masked / mass.clamp_min(1e-8)
     mass = result.flatten(1).sum(1).view(-1,1,1,1)
     return result / mass.clamp_min(1e-8)
+
+
+class RefinementObjective:
+    def __call__(self,model,batch):
+        output=model(batch,compute_loss=True)
+        return output['loss'],{'stage_loss':output['loss'].detach()}
