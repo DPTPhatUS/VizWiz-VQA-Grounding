@@ -5,8 +5,7 @@ from torch import nn
 from torch.nn import functional as F
 from models.image_encoder import ImageEncoder
 from models.text_encoder import TextEncoder
-from models.mask_decoder import UNetDecoder
-from models.experiment import CompactDecoder, SkipConditioner, masked_mean
+from models.experiment import CompactDecoder, masked_mean
 
 
 class TinyVision(nn.Module):
@@ -52,10 +51,8 @@ class GroundingTextEncoder(nn.Module):
 class BaseGroundingModel(nn.Module):
     def __init__(self, architecture="compact", tiny=False):
         super().__init__()
-        if architecture not in {"compact", "joint", "residual", "baseline"}:
-            raise ValueError("Unknown architecture")
-        if tiny and architecture != "compact":
-            raise ValueError("Tiny offline model supports compact architecture only")
+        if architecture != "compact":
+            raise ValueError("Unsupported architecture: this branch implements the compact control only")
         self.image_encoder = TinyVision() if tiny else ImageEncoder()
         self.text_encoder = GroundingTextEncoder(tiny)
         self.visual_dim = self.image_encoder.out_channels
@@ -63,12 +60,8 @@ class BaseGroundingModel(nn.Module):
         self.architecture = architecture
         self.text_proj = nn.Linear(self.text_dim, self.visual_dim)
         self.cross_attn = nn.MultiheadAttention(self.visual_dim, 2 if tiny else 8, batch_first=True)
-        self.residual_scale = nn.Parameter(torch.tensor(.01)) if architecture != "baseline" else None
-        if architecture == "compact":
-            self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128)
-        else:
-            self.decoder = UNetDecoder(self.visual_dim)
-        self.skip_conditioner = SkipConditioner(self.text_dim, self.visual_dim) if architecture == "joint" else None
+        self.residual_scale = nn.Parameter(torch.tensor(.01))
+        self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128)
         self.register_buffer("image_mean", torch.tensor([.48145466, .4578275, .40821073]).view(1,3,1,1))
         self.register_buffer("image_std", torch.tensor([.26862954, .26130258, .27577711]).view(1,3,1,1))
         self.experiment_config = {"experiment": "controls", "architecture": architecture, "tiny": tiny,
@@ -84,15 +77,9 @@ class BaseGroundingModel(nn.Module):
         projected = self.text_proj(text.tokens)
         attended, _ = self.cross_attn(query, projected, projected,
             key_padding_mask=~text.attention_mask, need_weights=False)
-        fused = attended if self.residual_scale is None else query + self.residual_scale * attended
+        fused = query + self.residual_scale * attended
         fused = fused.transpose(1,2).reshape_as(vision)
-        if self.architecture == "compact":
-            logits = self.decoder(fused, s3, s2, s1, text)
-        else:
-            skips = [s3,s2,s1]
-            if self.skip_conditioner is not None:
-                skips = self.skip_conditioner(skips, text)
-            logits = self.decoder(fused, *skips)
+        logits = self.decoder(fused, s3, s2, s1, text)
         return {"logits": logits, "visual": fused, "text_tokens": text.tokens,
                 "text_mask": text.attention_mask, "pooled_text": masked_mean(text.tokens, text.valid_mask)}
 

@@ -5,9 +5,9 @@ EXPERIMENT = 'controls'
 
 
 class GroundingModel(BaseGroundingModel):
-    """Selectable baseline, residual, joint-skip, or compact control."""
+    """Compact question-only control."""
     pass
 
 
 def build_model(args):
-    return GroundingModel(args.architecture, args.tiny)
+    return GroundingModel(tiny=getattr(args, "tiny", False))
