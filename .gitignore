@@ -10,3 +10,5 @@ models/__pycache__/
 !.omo/rules/
 !.omo/rules/**
 yolo*.pt
+docs/
+tests/
