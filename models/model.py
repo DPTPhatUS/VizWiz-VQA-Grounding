@@ -2,7 +2,6 @@
 import math
 import torch
 from torch import nn
-from torch.nn import functional as F
 from models.backbone import BaseGroundingModel
 from losses import resize_logits
 
@@ -15,7 +14,7 @@ class GroundingModel(nn.Module):
         width = (16 if tiny else 64) if width is None else width
         if width <= 0 or width % (2 if tiny else 4):
             raise ValueError('Evidence width must be positive and divisible by the attention head count')
-        self.coarse = BaseGroundingModel('compact', tiny)
+        self.coarse = BaseGroundingModel(tiny=tiny)
         self.query_tokens = nn.Parameter(torch.randn(2, width) * .02)
         self.text_projection = nn.Linear(self.coarse.text_dim, width)
         self.visual_projection = nn.Conv2d(self.coarse.visual_dim, width, 1)
@@ -47,7 +46,5 @@ class GroundingModel(nn.Module):
         return {'logits': logits, 'location_logits': location, 'extent_residual': extent}
 
 
-def build_model(args):
-    if args.architecture != 'compact':
-        raise ValueError('Evidence extent requires the compact architecture')
-    return GroundingModel(args.tiny, args.evidence_width)
+def build_model(args=None):
+    return GroundingModel(tiny=getattr(args, 'tiny', False))

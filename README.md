@@ -1,53 +1,61 @@
-# VizWiz VQA Grounding — exp/evidence-extent
+# VizWiz VQA Grounding — evidence extent
 
-This branch extends the CEUD grounding project, which was presented as a CVPR 2025 workshop spotlight. The model predicts visual evidence masks from an image and question.
+This branch predicts evidence masks from an image and question. It extends the compact CLIP grounding model with two learned tokens for evidence location and extent. Location supervision uses the mask's bounding rectangle; final-mask and area losses learn the extent, including empty masks.
 
-Use **train.py** and **eval.py** directly. The experiment is integrated into the existing pipeline:
+Use `train.py` and `eval.py`. This branch fixes the image size at 336, token width at 64, support loss weight at 0.2, and area loss weight at 0.1. Training and evaluation use questions only. There are no architecture, text-mode, test-model, or loss-weight switches. The model adds 148,545 parameters to the compact backbone; real-data accuracy and GPU throughput remain unmeasured.
 
-- `models/model.py`: this branch's architecture and model factory.
-- `models/backbone.py`: shared CLIP grounding backbone, including frozen teacher/coarse references.
-- `models/experiment.py`: compact decoder and skip conditioning.
-- `dataset.py`: aligned images, masks and text views; branch-specific detail/pair data where needed.
-- `losses.py`: segmentation and experiment objectives.
-- `models/checkpoint.py`: checkpoint initialization and strict continuation.
-- `metrics.py`: original-resolution question-only evaluation.
+## Kaggle
 
-There is one training/evaluation pipeline. The former parallel package and alternate entry points have been removed. Existing corrected experiment checkpoint keys/configurations are preserved; historical pre-correction checkpoint formats are still rejected.
-
-## Kaggle commands
-
-Enable a GPU and Internet for pretrained CLIP downloads. Keep Kaggle's installed Torch/Torchvision environment and install the other imported dependencies if needed:
+Enable a GPU and Internet for pretrained CLIP downloads. Keep Kaggle's Torch/Torchvision installation and install missing dependencies:
 
 ```bash
-pip install transformers ultralytics matplotlib tqdm pillow
+pip install transformers matplotlib pillow
 ```
 
-Run the following in a Kaggle `%%bash` cell after cloning this branch. Replace dataset/checkpoint placeholders. The dataset root must contain `train_grounding.json`, `val_grounding.json`, `test_grounding.json`, image directories `train/`, `val/`, `test/`, and `binary_masks_png/<split>/`.
+The data directory contains `<split>_grounding.json`, image folders `train/`, `val/`, `test/`, and `binary_masks_png/<split>/`. In a Kaggle `%%bash` cell:
 
 ```bash
 set -e
 cd /kaggle/working/VizWiz-VQA-Grounding
 DATA_ROOT=/kaggle/input/YOUR_DATASET/vizwiz
-COMPACT_CKPT=/kaggle/input/YOUR_COMPACT_CHECKPOINT/best.pt
-python train.py --data-root "$DATA_ROOT" --init-checkpoint "$COMPACT_CKPT" --evidence-width 64 --support-weight 0.2 --area-weight 0.1 --num-epochs 100 --batch-size 1 --num-workers 2 --seed 42 --device cuda --save-every 1000000 --output-dir /kaggle/working/outputs-extent
-python eval.py --data-root "$DATA_ROOT" --checkpoint /kaggle/working/outputs-extent/best.pt --dataset test --batch-size 1 --num-workers 2 --device cuda --output-dir /kaggle/working/results-extent
+python train.py --data-root "$DATA_ROOT" --num-epochs 100 --batch-size 1 --num-workers 2 --seed 42 --save-every 0 --output-dir /kaggle/working/outputs-extent
+python eval.py --data-root "$DATA_ROOT" --checkpoint /kaggle/working/outputs-extent/best.pt --dataset test --batch-size 1 --num-workers 2 --output-dir /kaggle/working/results-extent
 ```
 
-Validation is question-only and runs each epoch. `best.pt` is selected by original-resolution mean IoU; `last.pt` supports continuation. The large save interval avoids retaining many periodic checkpoints. Evaluation writes PNG masks and `metrics.json`. Use `--dataset val` for validation exports.
+Training selects CUDA when available. `--init-checkpoint /path/to/compact/best.pt` optionally initializes the coarse model from a compatible corrected compact checkpoint. It starts a fresh optimizer. Matching extent checkpoints can also initialize a run.
 
-For continuation, repeat the same training settings, replace `--init-checkpoint` with `--resume-checkpoint /path/to/output/last.pt`, and keep the same output directory. `--num-epochs` is the final epoch count. When moving a run between Kaggle sessions, copy its saved run directory into writable storage before resuming; keep the original training configuration and data paths compatible. Teacher-dependent continuation also requires the same teacher file.
+Validation runs every epoch by default and selects `best.pt` using original-resolution mean per-image IoU. `last.pt` contains model, optimizer, scaler and completed epoch. `--save-every 0` disables numbered checkpoints. Evaluation exports original-size PNG masks and `metrics.json`.
 
-Use `--help` on either script to see the branch options. `--tiny` is only an offline integration-test model, not a research architecture. GPU speed and real-data improvements have not been validated here.
+To continue, use `--resume-checkpoint /path/to/last.pt` with a larger final `--num-epochs`. A new output directory is allowed and selects its best checkpoint from the continued epochs. Copy saved files to writable Kaggle storage when resuming there. Resume validates model compatibility and restores optimizer state; it does not enforce immutable dataset paths or annotation hashes.
 
-`docs/` and `tests/` are deliberately ignored and kept local. This README is the tracked run guide for clones.
+## Optional paired questions
 
-## Predict or visualize one image
+`--pairs /path/to/pairs.json` enables extra supervision from verified same-image question pairs. Each question must have its own real mask. Mask paths resolve relative to the manifest:
 
-These scripts use the same checkpoint architecture and input preprocessing as evaluation, including detail images on the refinement branch. No ground-truth mask is needed. Replace the checkpoint path with this branch's trained output.
+```json
+[
+  {
+    "filename": "VizWiz_train_00000000.jpg",
+    "question1": "Where is the label?",
+    "question2": "Where is the whole container?",
+    "mask1": "verified/label.png",
+    "mask2": "verified/container.png",
+    "relation": "change"
+  }
+]
+```
+
+This illustrates the schema, not supplied annotations. `relation` is `change` or `same`; verified `same` pairs must have identical original-resolution binary masks. Questions must be nonempty, both masks must match the image dimensions, and the image must belong to the training split. Masks are never generated from rewritten questions. Unpaired images keep ordinary supervision.
+
+With a manifest, signed mask-difference and same-region consistency losses each have weight 0.1. All contributions are normalized by original-image count so batches with different pair counts retain consistent weighting. Pairs increase training compute and memory. Evaluation and single-image inference need neither answers nor pair files.
+
+## Single-image prediction
 
 ```bash
-python predict_save.py --checkpoint /path/to/best.pt --image /path/to/image.jpg --question "What does it say?" --output /kaggle/working/mask.png --device cuda
-python visualize_predictions.py --checkpoint /path/to/best.pt --image /path/to/image.jpg --question "What does it say?" --output /kaggle/working/overlay.png --device cuda
+python predict_save.py --checkpoint /path/to/best.pt --image /path/to/image.jpg --question "What does it say?" --output mask.png
+python visualize_predictions.py --checkpoint /path/to/best.pt --image /path/to/image.jpg --question "What does it say?" --output overlay.png
 ```
 
-`IoU.py` accepts the same arguments as `eval.py` and delegates to that evaluator.
+`IoU.py` delegates to the same evaluator. `models/model.py` contains the extent model, `models/backbone.py` its compact backbone, `dataset.py` the aligned data loader, and `losses.py` the objective. Detector/YOLO and alternate box-generation paths are removed. `docs/` and `tests/` remain ignored local development files.
+
+Resume applies `--lr` after restoring optimizer state. An existing output directory may only resume its own `last.pt`; use a fresh directory for a checkpoint copied from Kaggle input or an earlier epoch.

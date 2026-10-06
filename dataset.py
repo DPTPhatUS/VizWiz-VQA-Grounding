@@ -1,4 +1,4 @@
-"""Aligned raw RGB inputs and explicitly separated question/answer views."""
+"""Aligned question-only images and masks, with optional verified question pairs."""
 import json
 import random
 from pathlib import Path
@@ -7,22 +7,13 @@ import torch
 from PIL import Image, ImageOps
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from utils import to_device
 from torchvision.transforms.functional import to_tensor
 
 
 class VizWizGroundingDataset(Dataset):
-    def __init__(self, root, split, image_size=336, detail_size=None,
-                 text_mode="question", answer_dropout=0.5, pairs=None):
+    def __init__(self, root, split, image_size=336, pairs=None):
         self.root, self.split = Path(root), split
-        if text_mode not in {"question", "answer", "dropout"}:
-            raise ValueError("Unknown text mode")
-        if split != "train" and text_mode != "question":
-            raise ValueError("Research validation/test must be question-only")
-        if not 0 <= answer_dropout <= 1:
-            raise ValueError("answer_dropout must be in [0,1]")
-        self.image_size, self.detail_size = image_size, detail_size
-        self.text_mode, self.answer_dropout = text_mode, answer_dropout
+        self.image_size = image_size
         self.records = json.loads((self.root / f"{split}_grounding.json").read_text())
         self.names = list(self.records)
         if not self.names:
@@ -66,26 +57,15 @@ class VizWizGroundingDataset(Dataset):
         if image.size != mask.size:
             raise ValueError(f"Image/mask dimensions differ for {name}")
         question = str(meta["question"])
-        answer = str(meta.get("most_common_answer") or "")
         question_text = f"Q: {question}"
-        answer_text = f"{question_text} A: {answer}" if answer else question_text
-        use_answer = self.text_mode == "answer" or (
-            self.text_mode == "dropout" and random.random() >= self.answer_dropout
-        )
         result = {
             "image": to_tensor(image.resize((self.image_size, self.image_size), Image.Resampling.BICUBIC)),
             "mask": self.mask_tensor(mask, self.image_size),
-            "text": answer_text if use_answer else question_text,
-            "question_text": question_text, "answer_text": answer_text,
-            "answer_available": bool(answer), "filename": name,
+            "text": question_text, "question_text": question_text, "filename": name,
             "original_size": (image.height, image.width),
         }
         if self.split != "train":
             result["original_mask"] = (to_tensor(mask) > .5).float()
-        if self.detail_size:
-            # Independent resize from the original image: never enlarge the CLIP input.
-            result["detail_image"] = to_tensor(image.resize(
-                (self.detail_size, self.detail_size), Image.Resampling.BICUBIC))
         if self.pairs:
             pair = random.choice(self.pairs[name]) if name in self.pairs else None
             result.update(pair_available=pair is not None, pair_same=False,
@@ -103,8 +83,7 @@ class VizWizGroundingDataset(Dataset):
                     raise ValueError("Verified same-region pairs must have identical masks")
                 result.update(text=f"Q: {pair['question1']}", question_text=f"Q: {pair['question1']}",
                               mask=pair_masks[0], paired_text=f"Q: {pair['question2']}",
-                              paired_mask=pair_masks[1], pair_same=pair["relation"] == "same",
-                              answer_available=False, answer_text=f"Q: {pair['question1']}")
+                              paired_mask=pair_masks[1], pair_same=pair["relation"] == "same")
         return result
 
 

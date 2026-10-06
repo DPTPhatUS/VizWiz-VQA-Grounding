@@ -24,16 +24,15 @@ def prediction_parser(description=__doc__):
 def predict_image(checkpoint,image_path,question,device):
     saved=read_checkpoint(checkpoint)
     config=SimpleNamespace(**saved['run_config'])
+    config.tiny=saved['experiment_config'].get('tiny',False)
     model=build_model(config)
     load_checkpoint(checkpoint,model)
     model.to(device).eval()
     with Image.open(image_path) as source:
         image=ImageOps.exif_transpose(source).convert('RGB')
     question_text=f'Q: {question}'
-    batch={'image':to_tensor(image.resize((config.image_size,config.image_size),Image.Resampling.BICUBIC)).unsqueeze(0).to(device),
+    batch={'image':to_tensor(image.resize((336,336),Image.Resampling.BICUBIC)).unsqueeze(0).to(device),
            'text':[question_text],'question_text':[question_text],'filename':[Path(image_path).name]}
-    if getattr(config,'needs_detail',False):
-        batch['detail_image']=to_tensor(image.resize((config.detail_size,config.detail_size),Image.Resampling.BICUBIC)).unsqueeze(0).to(device)
     logits=model(batch)['logits'].float()
     mask=F.interpolate(logits,size=(image.height,image.width),mode='bilinear',align_corners=False)[0,0]>0
     return image,Image.fromarray(mask.cpu().numpy().astype('uint8')*255)

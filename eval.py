@@ -19,22 +19,21 @@ def eval_main(argv=None):
     parser.add_argument("--num-workers",type=int,default=4)
     parser.add_argument("--device",default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir",required=True)
-    parser.add_argument("--metric-resolution",choices=["original","local"],default="original")
     args = parser.parse_args(argv)
     if args.batch_size <= 0 or args.num_workers < 0:
         raise ValueError("Invalid batch size or worker count")
     saved = read_checkpoint(args.checkpoint)
     config = SimpleNamespace(**saved["run_config"])
+    config.tiny = saved["experiment_config"].get("tiny", False)
     model = build_model(config)
     load_checkpoint(args.checkpoint,model)
     device = torch.device(args.device); model.to(device)
-    dataset = VizWizGroundingDataset(args.data_root,args.dataset,config.image_size,
-        config.detail_size if getattr(config,"needs_detail",False) else None)
+    dataset = VizWizGroundingDataset(args.data_root,args.dataset)
     loader = make_loader(dataset,args,args.batch_size)
     out = Path(args.output_dir); out.mkdir(parents=True,exist_ok=True)
-    scores = evaluate(model,loader,device,args.metric_resolution,out)
+    scores = evaluate(model,loader,device,"original",out)
     summary = {"num_samples":len(scores),"mean_iou":sum(scores.values())/len(scores),
-               "dataset":args.dataset,"metric_resolution":args.metric_resolution,
+               "dataset":args.dataset,"metric_resolution":"original",
                "text_mode":"question","checkpoint":str(args.checkpoint),
                "experiment_config":model.experiment_config}
     (out/"metrics.json").write_text(json.dumps({"summary":summary,"per_sample":scores},indent=2))
