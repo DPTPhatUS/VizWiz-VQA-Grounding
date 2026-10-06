@@ -12,7 +12,7 @@ from torch.utils.data import DistributedSampler
 from dataset import VizWizGroundingDataset, make_loader
 from utils import to_device
 from models.model import build_model, EXPERIMENT
-from models.checkpoint import (load_checkpoint, read_checkpoint,
+from models.checkpoint import (load_checkpoint, save_checkpoint, read_checkpoint,
                                initialize_weights)
 from losses import SupervisedObjective
 
@@ -57,7 +57,9 @@ def training_parser():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--resume-checkpoint", help="Resume a legacy full checkpoint; raw weights use --init-checkpoint")
+    parser.add_argument("--save-every", type=int, default=10,
+                        help="Save a resumable checkpoint every N epochs; 0 disables periodic saves")
+    parser.add_argument("--resume-checkpoint", help="Resume a full checkpoint; raw weights use --init-checkpoint")
     add_experiment_arguments(parser)
     return parser
 
@@ -65,6 +67,8 @@ def training_parser():
 def check_arguments(args):
     if min(args.num_epochs, args.batch_size) <= 0:
         raise ValueError("Epochs and batch size must be positive")
+    if args.save_every < 0:
+        raise ValueError("save-every cannot be negative")
     if args.num_workers < 0 or args.lr <= 0:
         raise ValueError("Workers cannot be negative; learning rate must be positive")
     if args.resume_checkpoint and getattr(args, "init_checkpoint", None):
@@ -186,6 +190,11 @@ def _train(args, rank, world, distributed, device):
             print(json.dumps(record),flush=True)
             with (out/"history.jsonl").open("a") as handle:
                 handle.write(json.dumps(record)+"\n")
+            if args.save_every and (epoch + 1) % args.save_every == 0:
+                checkpoint_path = out / f"checkpoint_epoch{epoch + 1}.pt"
+                save_checkpoint(checkpoint_path, unwrap(model), optimizer, scaler,
+                                epoch + 1, None, run_config)
+                print(f"Checkpoint saved: {checkpoint_path}", flush=True)
     if rank == 0:
         final_path = out / f"model_final_epoch{args.num_epochs}.pt"
         torch.save(unwrap(model).state_dict(), final_path, _use_new_zipfile_serialization=False)
