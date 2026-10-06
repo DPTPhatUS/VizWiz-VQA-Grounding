@@ -1,11 +1,8 @@
 """Train this branch's grounding experiment on CPU, CUDA, or torchrun DDP."""
 import argparse
-import hashlib
 import json
-import math
 import os
 import random
-import subprocess
 from pathlib import Path
 import numpy as np
 import torch
@@ -15,48 +12,48 @@ from torch.utils.data import DistributedSampler, Subset
 from dataset import VizWizGroundingDataset, make_loader
 from utils import to_device
 from models.model import build_model, EXPERIMENT
-from models.backbone import BaseGroundingModel
 from models.checkpoint import (load_checkpoint, read_checkpoint, save_checkpoint,
-                               initialize_weights, rng_state, restore_rng)
+                               initialize_weights)
 from metrics import evaluate
 from losses import RefinementObjective
 
 
-POLICIES = ('gain', 'uncertainty', 'random', 'fixed', 'relevance')
-
-
 def add_experiment_arguments(parser):
-    parser.add_argument('--stage',choices=('refiner','router'),default='refiner')
-    parser.add_argument('--crop-size',type=int,default=336)
-    parser.add_argument('--policy',choices=POLICIES,default=None)
-    parser.add_argument('--budget',type=int,choices=(1,2,4),default=2)
-    parser.add_argument('--diversity-iou',type=float,default=.3)
-    parser.add_argument('--skip-nonpositive',action=argparse.BooleanOptionalAction,default=True)
+    parser.add_argument("--stage", choices=("refiner", "router"), default="refiner")
+    parser.add_argument("--init-checkpoint", help="Compact controls checkpoint for refiner; refiner checkpoint for router")
 
 
 def validate_experiment_args(args):
-    args.needs_detail=True
-    args.policy=args.policy or ('fixed' if args.stage=='refiner' else 'gain')
-    if args.architecture!='compact' or args.text_mode!='question':
-        raise ValueError('Refinement requires compact architecture and question-only text')
-    if args.crop_size <= 0 or args.detail_size < args.image_size or not 0 <= args.diversity_iou <= 1:
-        raise ValueError('Require positive crop size, detail size >= image size, and diversity IoU in [0,1]')
-    if args.policy=='gain' and args.stage=='refiner':
-        raise ValueError('Gain policy requires a trained router; use fixed during refiner training')
+    args.needs_detail = True
+    args.detail_size = DETAIL_SIZE
+    args.crop_size = CROP_SIZE
     if not (args.init_checkpoint or args.resume_checkpoint):
-        raise ValueError('Frozen coarse reference requires --init-checkpoint or --resume-checkpoint')
+        raise ValueError("A frozen reference requires --init-checkpoint or --resume-checkpoint")
     if args.init_checkpoint:
-        checkpoint=read_checkpoint(args.init_checkpoint)
-        config=checkpoint['experiment_config']
-        if args.stage=='router' and (config.get('experiment')!=EXPERIMENT or
-                                    checkpoint['run_config'].get('stage') not in ('refiner','router')):
-            raise ValueError('Router initialization requires a trained refinement checkpoint')
-        if config.get('experiment')=='controls' and checkpoint['run_config'].get('text_mode')!='question':
-            raise ValueError('Frozen coarse initialization requires a question-only controls checkpoint')
+        saved = read_checkpoint(args.init_checkpoint)
+        config = saved["experiment_config"]
+        run = saved["run_config"]
+        if args.stage == "refiner":
+            if config.get("experiment") != "controls" or config.get("architecture") != "compact":
+                raise ValueError("Refiner initialization requires a compact controls checkpoint")
+            if run.get("text_mode", "question") != "question":
+                raise ValueError("Refiner initialization requires question-only controls")
+        elif config.get("experiment") != EXPERIMENT or run.get("stage") != "refiner":
+            raise ValueError("Router initialization requires a refiner-stage checkpoint")
 
 
-def build_objective(args,model,device):
+def build_objective(args, model, device):
     return RefinementObjective()
+
+
+IMAGE_SIZE = 336
+DETAIL_SIZE = 672
+CROP_SIZE = 336
+
+
+def build_datasets(args):
+    return (VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE, DETAIL_SIZE),
+            VizWizGroundingDataset(args.data_root, "val", IMAGE_SIZE, DETAIL_SIZE))
 
 
 def seed_everything(seed):
@@ -71,42 +68,6 @@ def unwrap(model):
     return model.module if hasattr(model, "module") else model
 
 
-def file_hash(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024*1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def provenance(args):
-    try:
-        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-        dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], text=True).strip())
-    except (OSError, subprocess.CalledProcessError):
-        revision, dirty = "unknown", True
-    annotations = {}
-    for split in ("train", "val"):
-        path = Path(args.data_root) / f"{split}_grounding.json"
-        if path.exists():
-            annotations[split] = file_hash(path)
-            masks = hashlib.sha256()
-            for filename in sorted(json.loads(path.read_text())):
-                mask_path = Path(args.data_root) / "binary_masks_png" / split / Path(filename).with_suffix(".png")
-                masks.update(json.dumps([filename, file_hash(mask_path)]).encode())
-            annotations[f"{split}_masks"] = masks.hexdigest()
-    if getattr(args, "pairs", None):
-        annotations["pairs"] = file_hash(args.pairs)
-        manifest = Path(args.pairs)
-        masks = hashlib.sha256()
-        for pair in json.loads(manifest.read_text()):
-            for key in ("mask1", "mask2"):
-                masks.update(json.dumps([pair[key], file_hash(manifest.parent / pair[key])]).encode())
-        annotations["pair_masks"] = masks.hexdigest()
-    return {"revision": revision, "dirty": dirty, "torch": torch.__version__,
-            "annotation_sha256": annotations}
-
-
 def training_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", default="data/vizwiz")
@@ -115,51 +76,31 @@ def training_parser():
     parser.add_argument("--batch-size", type=int, default=4, help="Global batch size across all ranks")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--encoder-lr", type=float, default=None)
-    parser.add_argument("--weight-decay", type=float, default=0.)
-    parser.add_argument("--dice-weight", type=float, default=0.)
-    parser.add_argument("--image-size", type=int, default=336)
-    parser.add_argument("--detail-size", type=int, default=672)
-    parser.add_argument("--architecture", choices=["compact","joint","residual","baseline"], default="compact")
-    parser.add_argument("--text-mode", choices=["question","answer","dropout"], default="question")
-    parser.add_argument("--answer-dropout", type=float, default=.5)
-    parser.add_argument("--freeze-encoders", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--save-every", type=int, default=10)
+    parser.add_argument("--save-every", type=int, default=10, help="Numbered checkpoint interval; 0 keeps only last/best")
     parser.add_argument("--validate-every", type=int, default=1)
-    parser.add_argument("--metric-resolution", choices=["original","local"], default="original")
     parser.add_argument("--resume-checkpoint")
-    parser.add_argument("--init-checkpoint", help="Weights only; start a new optimizer and epoch counter")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--tiny", action="store_true", help="Offline synthetic test model, not a research result")
     add_experiment_arguments(parser)
     return parser
 
 
 def check_arguments(args):
-    if min(args.num_epochs,args.batch_size,args.save_every,args.validate_every,args.image_size) <= 0:
-        raise ValueError("Epochs, batch size, save/validation intervals and image size must be positive")
-    if args.num_workers < 0 or args.lr <= 0 or (args.encoder_lr is not None and args.encoder_lr <= 0):
-        raise ValueError("Invalid workers or learning rate")
-    if args.dice_weight < 0 or args.weight_decay < 0:
-        raise ValueError("Loss weights and weight decay cannot be negative")
-    if not args.tiny and args.image_size != 336:
-        raise ValueError("CLIP-L/14-336 requires --image-size 336")
-    if args.resume_checkpoint and args.init_checkpoint:
+    if min(args.num_epochs, args.batch_size, args.validate_every) <= 0:
+        raise ValueError("Epochs, batch size and validation interval must be positive")
+    if args.num_workers < 0 or args.lr <= 0 or args.save_every < 0:
+        raise ValueError("Workers/save interval cannot be negative; learning rate must be positive")
+    if args.resume_checkpoint and getattr(args, "init_checkpoint", None):
         raise ValueError("Use either resume or weight initialization, not both")
-    for name in ("resume_checkpoint","init_checkpoint","teacher_checkpoint","pairs"):
-        path = getattr(args,name,None)
+    for name in ("resume_checkpoint", "init_checkpoint", "teacher_checkpoint", "pairs"):
+        path = getattr(args, name, None)
         if path and not Path(path).is_file():
             raise ValueError(f"{name} does not exist: {path}")
-    if args.resume_checkpoint and Path(args.resume_checkpoint).resolve().parent != Path(args.output_dir).resolve():
-        raise ValueError("Resume requires the same output directory as its checkpoint; use --init-checkpoint for a new run")
-    if args.resume_checkpoint and Path(args.resume_checkpoint).name != "last.pt":
-        raise ValueError("Strict continuation requires last.pt; use --init-checkpoint for older or best weights")
     validate_experiment_args(args)
 
 
 def train_main(argv=None):
     args = training_parser().parse_args(argv)
+    args.device = "cuda" if torch.cuda.is_available() else "cpu"
     check_arguments(args)
     rank, world, local = (int(os.environ.get(k,default)) for k,default in (
         ("RANK",0),("WORLD_SIZE",1),("LOCAL_RANK",0)))
@@ -182,55 +123,45 @@ def train_main(argv=None):
 def _train(args, rank, world, distributed, device):
     seed_everything(args.seed)
     run_config = vars(args).copy()
-    run_config["world_size"] = world
+    run_config.update(world_size=world, image_size=IMAGE_SIZE, text_mode="question")
     out = Path(args.output_dir)
     if rank == 0:
         out.mkdir(parents=True, exist_ok=True)
-        if not args.resume_checkpoint and (out/"last.pt").exists():
-            raise ValueError("Output already contains a run; use --resume-checkpoint or a fresh directory")
+    if not args.resume_checkpoint and (out/"last.pt").exists():
+        raise ValueError("Output already contains a run; use --resume-checkpoint or a fresh directory")
+    if args.resume_checkpoint and (out / "last.pt").exists() and Path(args.resume_checkpoint).resolve() != (out / "last.pt").resolve():
+        raise ValueError("Output already contains a run; resume its last.pt or choose a fresh output directory")
     if distributed:
         dist.barrier()
-    train_set = VizWizGroundingDataset(args.data_root,"train",args.image_size,
-        args.detail_size if getattr(args,"needs_detail",False) else None,
-        args.text_mode,args.answer_dropout,pairs=getattr(args,"pairs",None))
-    val_set = VizWizGroundingDataset(args.data_root,"val",args.image_size,
-        args.detail_size if getattr(args,"needs_detail",False) else None)
+    train_set, val_set = build_datasets(args)
     model = build_model(args).to(device)
-    if args.init_checkpoint:
+    run_config["tiny"] = model.coarse.experiment_config["tiny"]
+    if getattr(args, "init_checkpoint", None):
         initialize_weights(args.init_checkpoint,model)
-    coarse = getattr(model,"coarse",model)
-    if args.freeze_encoders:
-        for module in (coarse.image_encoder,coarse.text_encoder):
-            module.requires_grad_(False)
     objective = build_objective(args,model,device)
     parameters = [p for p in model.parameters() if p.requires_grad]
     if not parameters:
         raise ValueError("No trainable parameters")
-    encoders = {id(p) for module in (coarse.image_encoder,coarse.text_encoder) for p in module.parameters()}
-    groups = [{"params":[p for p in parameters if id(p) in encoders],"lr":args.encoder_lr or args.lr},
-              {"params":[p for p in parameters if id(p) not in encoders],"lr":args.lr}]
-    optimizer = torch.optim.AdamW([g for g in groups if g["params"]], weight_decay=args.weight_decay)
+    optimizer = torch.optim.Adam(parameters, lr=args.lr)
     scaler = torch.amp.GradScaler("cuda",enabled=device.type=="cuda")
-    info = provenance(args)
     start, best = 0, -1.
     if args.resume_checkpoint:
         checkpoint = load_checkpoint(args.resume_checkpoint,model)
-        ignored = {"resume_checkpoint","init_checkpoint","num_epochs","output_dir","device","num_workers"}
-        old = {k:v for k,v in checkpoint["run_config"].items() if k not in ignored}
-        new = {k:v for k,v in run_config.items() if k not in ignored}
-        if old != new:
-            raise ValueError("Resume training configuration differs; use --init-checkpoint for a new run")
-        if checkpoint.get("provenance",{}).get("annotation_sha256") != info["annotation_sha256"]:
-            raise ValueError("Resume annotation hashes differ")
+        if checkpoint["run_config"].get("stage") != getattr(args, "stage", None):
+            raise ValueError("Resume requires the same training stage; use --init-checkpoint to change stage")
         if "optimizer_state_dict" not in checkpoint:
             raise ValueError("Resume requires optimizer state")
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        for group in optimizer.param_groups:
+            group["lr"] = args.lr
         # CPU checkpoints contain an empty disabled-scaler state. A CUDA continuation
         # starts a fresh scaler; a disabled CPU scaler safely ignores CUDA state.
         if checkpoint.get("scaler_state_dict"):
             scaler.load_state_dict(checkpoint["scaler_state_dict"])
         start,best = checkpoint["epoch"],checkpoint["best_iou"]
-        restore_rng(checkpoint["rng_states"][rank])
+        # A new output directory selects its best checkpoint from the continued epochs.
+        if not (out / "best.pt").exists():
+            best = -1.
         if start >= args.num_epochs:
             raise ValueError("num-epochs must exceed the resumed epoch")
     if distributed:
@@ -249,14 +180,12 @@ def _train(args, rank, world, distributed, device):
                           "trainable":sum(p.numel() for p in parameters),"device":str(device),
                           "experiment":unwrap(model).experiment_config}),flush=True)
     for epoch in range(start,args.num_epochs):
-        # Epoch-keyed RNG permits reproducible continuation, including loader/answer dropout.
+        # Epoch-keyed RNG permits reproducible continuation, including randomized training crops.
         seed_everything(args.seed+epoch*world+rank)
         generator.manual_seed(args.seed+epoch*world+rank)
         if sampler:
             sampler.set_epoch(epoch)
         model.train()
-        if args.freeze_encoders:
-            coarse.image_encoder.eval(); coarse.text_encoder.eval()
         totals = torch.zeros(2,device=device,dtype=torch.float64)
         component_sums = {}
         for batch in train_loader:
@@ -285,10 +214,10 @@ def _train(args, rank, world, distributed, device):
         improved = False
         if (epoch+1)%args.validate_every == 0 or epoch+1 == args.num_epochs:
             if distributed:
-                # Includes e.g. BatchNorm running statistics in wide teacher controls.
+                # Keep frozen model buffers identical across validation shards.
                 for buffer in unwrap(model).buffers():
                     dist.broadcast(buffer,src=0)
-            scores = evaluate(unwrap(model),val_loader,device,args.metric_resolution)
+            scores = evaluate(unwrap(model),val_loader,device,"original")
             statistics = torch.tensor([sum(scores.values()),len(scores)],device=device,dtype=torch.float64)
             if distributed:
                 dist.all_reduce(statistics)
@@ -296,18 +225,15 @@ def _train(args, rank, world, distributed, device):
             record["val_mean_iou"] = score
             improved = score > best
             best = max(best,score)
-        states = [None]*world if distributed else [rng_state()]
-        if distributed:
-            dist.all_gather_object(states,rng_state())
         if rank == 0:
             print(json.dumps(record),flush=True)
             with (out/"history.jsonl").open("a") as handle:
                 handle.write(json.dumps(record)+"\n")
-            options = (unwrap(model),optimizer,scaler,epoch+1,best,run_config,states,info)
+            options = (unwrap(model),optimizer,scaler,epoch+1,best,run_config)
             save_checkpoint(out/"last.pt",*options)
             if improved:
                 save_checkpoint(out/"best.pt",*options)
-            if (epoch+1)%args.save_every == 0:
+            if args.save_every and (epoch+1)%args.save_every == 0:
                 save_checkpoint(out/f"checkpoint_epoch{epoch+1}.pt",*options)
         if distributed:
             dist.barrier()

@@ -1,56 +1,24 @@
-# VizWiz VQA Grounding — exp/gain-guided-refinement
+# Gain-guided refinement
 
-This branch extends the CEUD grounding project, which was presented as a CVPR 2025 workshop spotlight. The model predicts visual evidence masks from an image and question.
+This branch trains a compact grounding model with a high-resolution crop refiner and an expected-IoU-gain router. Inputs and evaluation use only the question. The coarse model stays frozen; the refiner is also frozen while training the router.
 
-Use **train.py** and **eval.py** directly. The experiment is integrated into the existing pipeline:
-
-- `models/model.py`: this branch's architecture and model factory.
-- `models/backbone.py`: shared CLIP grounding backbone, including frozen teacher/coarse references.
-- `models/experiment.py`: compact decoder and skip conditioning.
-- `dataset.py`: aligned images, masks and text views; branch-specific detail/pair data where needed.
-- `losses.py`: segmentation and experiment objectives.
-- `models/checkpoint.py`: checkpoint initialization and strict continuation.
-- `metrics.py`: original-resolution question-only evaluation.
-
-There is one training/evaluation pipeline. The former parallel package and alternate entry points have been removed. Existing corrected experiment checkpoint keys/configurations are preserved; historical pre-correction checkpoint formats are still rejected.
-
-## Kaggle commands
-
-Enable a GPU and Internet for pretrained CLIP downloads. Keep Kaggle's installed Torch/Torchvision environment and install the other imported dependencies if needed:
+Install the project dependencies, or keep your notebook's Torch/Torchvision installation and install `transformers pillow numpy`. Run from this branch with a VizWiz root containing `<split>_grounding.json`, `<split>/` images, and `binary_masks_png/<split>/` masks.
 
 ```bash
-pip install transformers ultralytics matplotlib tqdm pillow
+python train.py --data-root /path/to/vizwiz --stage refiner --init-checkpoint /path/to/compact-controls/best.pt --output-dir outputs-refiner --num-epochs 30 --batch-size 1 --save-every 0
+python train.py --data-root /path/to/vizwiz --stage router --init-checkpoint outputs-refiner/best.pt --output-dir outputs-router --num-epochs 30 --batch-size 1 --save-every 0
+python eval.py --data-root /path/to/vizwiz --checkpoint outputs-router/best.pt --dataset test --output-dir results-router --budget 2
 ```
 
-Run the following in a Kaggle `%%bash` cell after cloning this branch. Replace dataset/checkpoint placeholders. The dataset root must contain `train_grounding.json`, `val_grounding.json`, `test_grounding.json`, image directories `train/`, `val/`, `test/`, and `binary_masks_png/<split>/`.
+The refiner starts from a question-only compact controls checkpoint. The router starts from the refiner stage. Images use a 336-pixel coarse input and a 672-pixel detail canvas; crops use 336 pixels. Refiner evaluation uses fixed coverage, and router evaluation selects positive predicted gains. `--budget` chooses up to 1, 2, or 4 crops. Validation and exported masks use original image dimensions.
+
+Training selects CUDA automatically when available and supports `torchrun`. `last.pt` stores continuation state and `best.pt` tracks validation mean IoU. `--save-every 0` retains only those two files. To continue, repeat the stage and data settings, replace `--init-checkpoint` with `--resume-checkpoint outputs-router/last.pt`, and increase the final `--num-epochs` value.
 
 ```bash
-set -e
-cd /kaggle/working/VizWiz-VQA-Grounding
-DATA_ROOT=/kaggle/input/YOUR_DATASET/vizwiz
-COMPACT_CKPT=/kaggle/input/YOUR_COMPACT_CHECKPOINT/best.pt
-# Stage 1: frozen coarse model, train crop refiner.
-python train.py --data-root "$DATA_ROOT" --stage refiner --init-checkpoint "$COMPACT_CKPT" --detail-size 672 --crop-size 336 --policy fixed --budget 2 --num-epochs 30 --batch-size 1 --num-workers 2 --seed 42 --device cuda --save-every 1000000 --output-dir /kaggle/working/outputs-refiner
-# Stage 2: freeze coarse model and refiner, train gain router.
-python train.py --data-root "$DATA_ROOT" --stage router --init-checkpoint /kaggle/working/outputs-refiner/best.pt --detail-size 672 --crop-size 336 --policy gain --budget 2 --num-epochs 30 --batch-size 1 --num-workers 2 --seed 42 --device cuda --save-every 1000000 --output-dir /kaggle/working/outputs-router
-python eval.py --data-root "$DATA_ROOT" --checkpoint /kaggle/working/outputs-router/best.pt --dataset test --policy gain --budget 2 --batch-size 1 --num-workers 2 --device cuda --output-dir /kaggle/working/results-router
+python predict_save.py --checkpoint outputs-router/best.pt --image example.jpg --question "Where is the label?" --output mask.png
+python visualize_predictions.py --checkpoint outputs-router/best.pt --image example.jpg --question "Where is the label?" --output overlay.png
 ```
 
-Validation is question-only and runs each epoch. `best.pt` is selected by original-resolution mean IoU; `last.pt` supports continuation. The large save interval avoids retaining many periodic checkpoints. Evaluation writes PNG masks and `metrics.json`. Use `--dataset val` for validation exports.
+Use `train.py --help` and `eval.py --help` for operational options. Real-data accuracy and GPU throughput require training; tiny models are used only by local offline tests.
 
-For continuation, repeat the same training settings, replace `--init-checkpoint` with `--resume-checkpoint /path/to/output/last.pt`, and keep the same output directory. `--num-epochs` is the final epoch count. When moving a run between Kaggle sessions, copy its saved run directory into writable storage before resuming; keep the original training configuration and data paths compatible. Teacher-dependent continuation also requires the same teacher file.
-
-Use `--help` on either script to see the branch options. `--tiny` is only an offline integration-test model, not a research architecture. GPU speed and real-data improvements have not been validated here.
-
-`docs/` and `tests/` are deliberately ignored and kept local. This README is the tracked run guide for clones.
-
-## Predict or visualize one image
-
-These scripts use the same checkpoint architecture and input preprocessing as evaluation, including detail images on the refinement branch. No ground-truth mask is needed. Replace the checkpoint path with this branch's trained output.
-
-```bash
-python predict_save.py --checkpoint /path/to/best.pt --image /path/to/image.jpg --question "What does it say?" --output /kaggle/working/mask.png --device cuda
-python visualize_predictions.py --checkpoint /path/to/best.pt --image /path/to/image.jpg --question "What does it say?" --output /kaggle/working/overlay.png --device cuda
-```
-
-`IoU.py` accepts the same arguments as `eval.py` and delegates to that evaluator.
+Resume applies `--lr` after restoring optimizer state. An existing output directory may only resume its own `last.pt`; use a fresh directory for a checkpoint copied from Kaggle input or an earlier epoch.

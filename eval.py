@@ -10,26 +10,10 @@ from models.checkpoint import read_checkpoint, load_checkpoint
 from metrics import evaluate
 
 
-POLICIES = ('gain', 'uncertainty', 'random', 'fixed', 'relevance')
-
-
-def add_eval_arguments(parser):
-    parser.add_argument('--policy',choices=POLICIES)
-    parser.add_argument('--budget',type=int,choices=(1,2,4))
-    parser.add_argument('--diversity-iou',type=float)
-    parser.add_argument('--skip-nonpositive',action=argparse.BooleanOptionalAction,default=None)
-
-
-def configure_evaluation(model,args):
-    for name in ('policy','budget','diversity_iou','skip_nonpositive'):
-        value=getattr(args,name)
-        if value is not None:
-            setattr(model,name,value)
-    if not 0 <= model.diversity_iou <= 1:
-        raise ValueError('Diversity IoU must be in [0,1]')
-    if model.policy=='gain' and model.stage!='router':
-        raise ValueError('Gain evaluation requires a trained router-stage checkpoint')
-    return {name:getattr(model,name) for name in ('policy','budget','diversity_iou','skip_nonpositive','routing_seed')}
+def configure_evaluation(model, args):
+    if args.budget is not None:
+        model.budget = args.budget
+    return {"policy": model.policy, "budget": model.budget}
 
 
 def eval_main(argv=None):
@@ -41,8 +25,7 @@ def eval_main(argv=None):
     parser.add_argument("--num-workers",type=int,default=4)
     parser.add_argument("--device",default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir",required=True)
-    parser.add_argument("--metric-resolution",choices=["original","local"],default="original")
-    add_eval_arguments(parser)
+    parser.add_argument("--budget", type=int, choices=(1, 2, 4), default=None)
     args = parser.parse_args(argv)
     if args.batch_size <= 0 or args.num_workers < 0:
         raise ValueError("Invalid batch size or worker count")
@@ -52,13 +35,13 @@ def eval_main(argv=None):
     load_checkpoint(args.checkpoint,model)
     inference = configure_evaluation(model,args)
     device = torch.device(args.device); model.to(device)
-    dataset = VizWizGroundingDataset(args.data_root,args.dataset,config.image_size,
-        config.detail_size if getattr(config,"needs_detail",False) else None)
+    dataset = VizWizGroundingDataset(args.data_root,args.dataset,getattr(config, "image_size", 336),
+        getattr(config, "detail_size", 672))
     loader = make_loader(dataset,args,args.batch_size)
     out = Path(args.output_dir); out.mkdir(parents=True,exist_ok=True)
-    scores = evaluate(model,loader,device,args.metric_resolution,out)
+    scores = evaluate(model,loader,device,"original",out)
     summary = {"num_samples":len(scores),"mean_iou":sum(scores.values())/len(scores),
-               "dataset":args.dataset,"metric_resolution":args.metric_resolution,
+               "dataset":args.dataset,"metric_resolution":"original",
                "text_mode":"question","checkpoint":str(args.checkpoint),
                "experiment_config":model.experiment_config,"inference":inference}
     (out/"metrics.json").write_text(json.dumps({"summary":summary,"per_sample":scores},indent=2))

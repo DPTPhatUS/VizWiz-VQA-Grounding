@@ -1,5 +1,4 @@
 """Branch architecture and checkpoint-driven model construction."""
-import hashlib
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -74,17 +73,17 @@ class CropRefiner(nn.Module):
 
 
 class GroundingModel(nn.Module):
-    def __init__(self,coarse,stage='refiner',crop_size=336,policy='gain',budget=2,
-                 dice_weight=0.,diversity_iou=.3,skip_nonpositive=True,routing_seed=42):
+    def __init__(self,coarse,stage='refiner',crop_size=336,budget=2):
         super().__init__()
-        if stage not in ('refiner','router') or policy not in ('gain','uncertainty','random','fixed','relevance'):
-            raise ValueError('Unknown refinement stage or policy')
-        if crop_size <= 0 or budget not in (1,2,4) or not 0 <= diversity_iou <= 1:
-            raise ValueError('Invalid crop size, budget, or diversity threshold')
-        self.routing_seed=routing_seed
+        if stage not in ('refiner','router'):
+            raise ValueError('Unknown refinement stage')
+        if crop_size <= 0 or budget not in (1,2,4):
+            raise ValueError('Invalid crop size or budget')
+        self.routing_seed=42
         self.coarse=coarse.requires_grad_(False)
-        self.stage,self.crop_size,self.policy,self.budget=stage,crop_size,policy,budget
-        self.dice_weight,self.diversity_iou,self.skip_nonpositive=dice_weight,diversity_iou,skip_nonpositive
+        self.stage,self.crop_size,self.budget=stage,crop_size,budget
+        self.policy='fixed' if stage=='refiner' else 'gain'
+        self.dice_weight,self.diversity_iou,self.skip_nonpositive=0.,.3,True
         width=16 if coarse.experiment_config['tiny'] else 64
         context_dim=coarse.visual_dim+coarse.text_dim
         self.refiner=CropRefiner(context_dim,width)
@@ -109,7 +108,7 @@ class GroundingModel(nn.Module):
             h,w=batch['detail_image'].shape[-2:]
             boxes=candidate_windows(h,w)
             logits=F.interpolate(output['logits'],size=(h,w),mode='bilinear',align_corners=False)
-            contexts,descriptors,relevance=[],[],[]
+            contexts,descriptors=[],[]
             probability=logits.sigmoid()
             for box in boxes:
                 y0,x0,y1,x1=box
@@ -125,8 +124,7 @@ class GroundingModel(nn.Module):
                 coordinates=logits.new_tensor([y0/h,x0/w,y1/h,x1/w]).expand(len(logits),-1)
                 contexts.append(context)
                 descriptors.append(torch.cat([context,statistics,coordinates],dim=1))
-                relevance.append(F.cosine_similarity(visual,self.coarse.text_proj(text),dim=1))
-        return logits,boxes,torch.stack(contexts,1),torch.stack(descriptors,1),torch.stack(relevance,1)
+        return logits,boxes,torch.stack(contexts,1),torch.stack(descriptors,1)
 
     def residual(self,batch,coarse,box,context):
         rgb=crop(batch['detail_image'],box)
@@ -136,7 +134,7 @@ class GroundingModel(nn.Module):
         return self.refiner(rgb,logits,context)
 
     def forward(self,batch,compute_loss=False):
-        coarse,boxes,contexts,descriptors,relevance=self.features(batch)
+        coarse,boxes,contexts,descriptors=self.features(batch)
         if compute_loss and self.stage=='refiner':
             losses=[]; predictions=[]
             for i in range(len(coarse)):
@@ -161,19 +159,8 @@ class GroundingModel(nn.Module):
                 targets=torch.stack(gains,dim=1)
             return {'logits':coarse,'loss':F.mse_loss(scores.float(),targets),
                     'gain_targets':targets,'gain_scores':scores}
-        if self.policy=='uncertainty':
-            scores=descriptors[...,-6]
-        elif self.policy=='relevance':
-            scores=relevance
-        elif self.policy=='fixed':
+        if self.stage=='refiner':
             scores=-torch.arange(len(boxes),device=coarse.device,dtype=coarse.dtype).expand(len(coarse),-1)
-        elif self.policy=='random':
-            # Stable image-specific generator: evaluation invariant to batching and DDP sharding.
-            keys=([str(name).encode() for name in batch['filename']] if 'filename' in batch else
-                  [image.detach().float().cpu().numpy().tobytes() for image in batch['image']])
-            seeds=[int.from_bytes(hashlib.sha256(str(self.routing_seed).encode()+key).digest()[:8],'little')
-                   for key in keys]
-            scores=torch.stack([torch.rand(len(boxes),generator=torch.Generator().manual_seed(seed)) for seed in seeds])
         chosen=select_windows(scores,boxes,self.budget,
                               self.skip_nonpositive and self.policy=='gain',self.diversity_iou)
         predictions=[]
@@ -186,7 +173,7 @@ class GroundingModel(nn.Module):
 
 
 def build_model(args):
-    return GroundingModel(BaseGroundingModel(args.architecture,args.tiny),stage=args.stage,
-                             crop_size=args.crop_size,policy=args.policy,budget=args.budget,
-                             dice_weight=args.dice_weight,diversity_iou=args.diversity_iou,
-                             skip_nonpositive=args.skip_nonpositive,routing_seed=args.seed)
+    tiny = getattr(args, 'tiny', False)
+    return GroundingModel(BaseGroundingModel(tiny=tiny), stage=args.stage,
+                          crop_size=getattr(args, 'crop_size', 336) if tiny else 336,
+                          budget=getattr(args, 'budget', 2))
