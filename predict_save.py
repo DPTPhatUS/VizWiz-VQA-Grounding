@@ -17,9 +17,8 @@ image_size = (336, 336)
 device = torch.device("cpu")
 # ===== Model load =====
 parser = argparse.ArgumentParser()
-parser.add_argument("--conditioning", choices=["joint", "separate"], default="joint")
 args = parser.parse_args()
-model = GroundingModel(conditioning=args.conditioning).to(device)
+model = GroundingModel().to(device)
 load_model_weights(model, torch.load(checkpoint_path, map_location=device))
 model.eval()
 

@@ -11,9 +11,8 @@ from models.checkpoint import load_model_weights
 # load model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 parser = argparse.ArgumentParser()
-parser.add_argument("--conditioning", choices=["joint", "separate"], default="joint")
 args = parser.parse_args()
-model = GroundingModel(conditioning=args.conditioning).to(device)
+model = GroundingModel().to(device)
 load_model_weights(model, torch.load("outputs/cross_model_final_epoch100.pt", map_location=device))
 model.eval()
 

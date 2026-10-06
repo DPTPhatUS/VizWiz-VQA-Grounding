@@ -4,9 +4,7 @@ from models import ImageEncoder, TextEncoder, UNetDecoder
 from models.experiment import CompactDecoder
 
 class GroundingModel(nn.Module):
-    def __init__(self, n_heads=8, conditioning="joint"):
-        if conditioning not in {"joint", "separate"}:
-            raise ValueError("conditioning must be joint or separate")
+    def __init__(self, n_heads=8):
         super().__init__()
         self.image_encoder = ImageEncoder()
         self.text_encoder = TextEncoder()
@@ -19,9 +17,9 @@ class GroundingModel(nn.Module):
 
         self.cross_attn = nn.MultiheadAttention(embed_dim=self.hidden_dim, num_heads=n_heads, batch_first=True)
         self.decoder = CompactDecoder(in_channels=self.hidden_dim, text_dim=self.text_encoder.output_dim,
-                                      separate=conditioning == "separate")
+                                      separate=False)
         self.residual_scale = nn.Parameter(torch.tensor(0.01))
-        self.experiment_config = {"architecture": "compact-decoder", "conditioning": conditioning}
+        self.experiment_config = {"architecture": "compact-decoder", "conditioning": "joint"}
 
     def forward(self, image, text):
         enc_feat1, enc_feat2, enc_feat3, bottleneck = self.image_encoder(image)

@@ -15,9 +15,8 @@ mask_dir = "data/vizwiz/binary_masks_png/val"
 
 # 1. load model
 parser = argparse.ArgumentParser()
-parser.add_argument("--conditioning", choices=["joint", "separate"], default="joint")
 args = parser.parse_args()
-model = GroundingModel(conditioning=args.conditioning)
+model = GroundingModel()
 load_model_weights(model, torch.load("outputs/cross_model_final_epoch100.pt"))
 model.eval().cuda()
 
