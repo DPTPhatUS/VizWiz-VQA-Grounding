@@ -6,3 +6,7 @@ Ruling: preserve legacy scripts and add research entry points, so historical che
 Pre-flight: all variants consume the common model(batch) and objective(model,batch) contracts; variant-specific architecture configuration is persisted separately from training configuration.
 
 Task 1 complete: 15 inherited tests and 5 new tests pass, including synthetic CLI training, resume, and original-resolution evaluation. CPU only; CUDA unavailable. Both new test modules were observed failing before implementation.
+
+Task 2 implemented: compact question-only student, answer-dropout teacher validation, balanced incremental/confidence/error/ordinary KD, none ablation, teacher hash provenance, and teacher-free inference. Four objective tests plus two integration/contract tests added. No legacy experiment modified.
+
+Final review: independent review completed; no remaining blocking architecture findings. Shared resume fixes enforce same-directory last.pt continuation, hash actual mask contents, and handle disabled AMP scaler state. Full CPU suite: 28 passed, one inherited control-only CLI test intentionally skipped in favor of variant integration tests. Two-process shared-control CPU DDP with an empty validation shard also passed. Real-data/CUDA accuracy and latency remain unmeasured. User requested separate branches, so preserve branches/worktrees without merging or pushing.
