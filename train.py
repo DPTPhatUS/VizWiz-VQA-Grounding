@@ -11,7 +11,7 @@ from torch import nn
 from torch.utils.data import DistributedSampler
 from dataset import VizWizGroundingDataset, make_loader
 from utils import to_device, read_checkpoint, load_model_weights, initialize_weights
-from models.model import GroundingModel, EXPERIMENT
+from models.model import GroundingModel
 from losses import SupervisedObjective
 
 
@@ -108,8 +108,6 @@ def _train(args, rank, world, distributed, device):
     if args.resume_checkpoint:
         checkpoint = read_checkpoint(args.resume_checkpoint)
         load_model_weights(model, checkpoint)
-        if checkpoint["run_config"].get("stage") != getattr(args, "stage", None):
-            raise ValueError("Resume requires the same training stage; use --init-checkpoint to change stage")
         if "optimizer_state_dict" not in checkpoint:
             raise ValueError("Raw model weights have no optimizer state; use --init-checkpoint for a new run")
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
