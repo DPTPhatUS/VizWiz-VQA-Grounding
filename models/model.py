@@ -1,9 +1,48 @@
-"""Branch architecture and checkpoint-driven model construction."""
+"""Question-conditioned grounding models."""
 import torch
 from torch import nn
+from models.image_encoder import ImageEncoder, TinyVision
+from models.text_encoder import TextEncoder, masked_mean
+from models.mask_decoder import CompactDecoder
+
 from torch.nn import functional as F
-from models.backbone import BaseGroundingModel
 from losses import segmentation_loss, per_image_iou
+
+class CompactGroundingModel(nn.Module):
+    def __init__(self, tiny=False):
+        super().__init__()
+        self.image_encoder = TinyVision() if tiny else ImageEncoder()
+        self.text_encoder = TextEncoder(tiny)
+        self.visual_dim = self.image_encoder.out_channels
+        self.text_dim = self.text_encoder.output_dim
+        self.text_proj = nn.Linear(self.text_dim, self.visual_dim)
+        self.cross_attn = nn.MultiheadAttention(self.visual_dim, 2 if tiny else 8, batch_first=True)
+        self.residual_scale = nn.Parameter(torch.tensor(.01))
+        self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128)
+        self.register_buffer("image_mean", torch.tensor([.48145466, .4578275, .40821073]).view(1,3,1,1))
+        self.register_buffer("image_std", torch.tensor([.26862954, .26130258, .27577711]).view(1,3,1,1))
+        self.experiment_config = {"experiment": "controls", "architecture": "compact", "tiny": tiny,
+                                  "protocol": "normalized-masked-question-v1"}
+
+    def encode_image(self, image):
+        return self.image_encoder((image - self.image_mean) / self.image_std)
+
+    def decode(self, features, texts):
+        s1, s2, s3, vision = features
+        text = self.text_encoder(texts)
+        query = vision.flatten(2).transpose(1, 2)
+        projected = self.text_proj(text.tokens)
+        attended, _ = self.cross_attn(query, projected, projected,
+            key_padding_mask=~text.attention_mask, need_weights=False)
+        fused = query + self.residual_scale * attended
+        fused = fused.transpose(1,2).reshape_as(vision)
+        logits = self.decoder(fused, s3, s2, s1, text)
+        return {"logits": logits, "visual": fused, "text_tokens": text.tokens,
+                "text_mask": text.attention_mask, "pooled_text": masked_mean(text.tokens, text.valid_mask)}
+
+    def forward(self, batch):
+        return self.decode(self.encode_image(batch["image"]), batch["text"])
+
 
 EXPERIMENT = 'gain-guided-refinement'
 
@@ -73,12 +112,13 @@ class CropRefiner(nn.Module):
 
 
 class GroundingModel(nn.Module):
-    def __init__(self,coarse,stage='refiner',crop_size=336,budget=2):
+    def __init__(self,coarse=None,stage='refiner',crop_size=336,budget=2,tiny=False):
         super().__init__()
         if stage not in ('refiner','router'):
             raise ValueError('Unknown refinement stage')
         if crop_size <= 0 or budget not in (1,2,4):
             raise ValueError('Invalid crop size or budget')
+        coarse = CompactGroundingModel(tiny=tiny) if coarse is None else coarse
         self.routing_seed=42
         self.coarse=coarse.requires_grad_(False)
         self.stage,self.crop_size,self.budget=stage,crop_size,budget
@@ -170,10 +210,3 @@ class GroundingModel(nn.Module):
             predictions.append(blend_residuals(coarse[i:i+1],residuals,[boxes[j] for j in indices]))
         return {'logits':torch.cat(predictions),'gain_scores':scores,
                 'crop_counts':torch.tensor([len(x) for x in chosen],device=coarse.device)}
-
-
-def build_model(args):
-    tiny = getattr(args, 'tiny', False)
-    return GroundingModel(BaseGroundingModel(tiny=tiny), stage=args.stage,
-                          crop_size=getattr(args, 'crop_size', 336) if tiny else 336,
-                          budget=getattr(args, 'budget', 2))

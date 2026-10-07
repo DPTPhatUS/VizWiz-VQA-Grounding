@@ -25,6 +25,20 @@ Training reads only the training split: no validation dataset is loaded and no v
 
 At completion, training saves exactly one raw `state_dict`: `model_final_epoch<N>.pt`, matching the baseline format. It contains model tensors only, with no optimizer, scaler, epoch wrapper, or RNG state. There are no automatic `last.pt` or `best.pt` saves, and `--validate-every` is removed. `--save-every` defaults to **10** and saves resumable `checkpoint_epoch10.pt`, `checkpoint_epoch20.pt`, etc., containing model, optimizer, scaler, and completed epoch. Use `--save-every 0` to disable these periodic checkpoints while still saving the final raw model.
 
-Keep the existing small `config.json` beside the weight file when copying outputs to Kaggle or another directory. The evaluation, prediction, teacher, and refinement loaders use it to identify the architecture and stage. `history.jsonl` contains training losses only. Run `eval.py` separately with `--dataset val` or `--dataset test`; the commands above show the final weight filename for their epoch count.
+Raw weights load directly without `config.json`. If present, the saved configuration is read to retain the original run settings; checkpoints already include those settings. `history.jsonl` contains training losses only. Run `eval.py` separately with `--dataset val` or `--dataset test`; the commands above show the final weight filename for their epoch count.
 
 To train further from these weights, use `--init-checkpoint /path/to/model_final_epoch<N>.pt` and a fresh output directory. This starts a new optimizer and epoch counter; `--num-epochs` is the number of additional epochs. Distillation still requires its teacher. To resume a periodic checkpoint, use `--resume-checkpoint /path/to/checkpoint_epoch10.pt` and a fresh output directory; optimizer/scaler state and completed epoch are restored, and `--num-epochs` is the final total epoch count. Older supported full checkpoints remain loadable.
+
+
+## Code layout
+
+- `models/model.py`: this branch's grounding model and any teacher/coarse model it needs.
+- `models/image_encoder.py` and `models/text_encoder.py`: CLIP feature extraction.
+- `models/mask_decoder.py`: the decoder used by this experiment.
+- `train.py`: construct the model and dataset, run training, save checkpoints and final weights.
+- `eval.py`: construct the model, load weights, evaluate and export masks.
+- `utils.py`: batch transfer and a few plain weight-loading helpers.
+
+The separate backbone, experiment, and checkpoint modules and model factory are removed. Training still uses no validation, saves resumable checkpoints every 10 epochs by default, and writes final raw weights.
+
+For standalone refiner weights without their saved configuration, use `--stage refiner` with `eval.py`, `predict_save.py`, or `visualize_predictions.py`. Router inference is the default when no saved stage is available.

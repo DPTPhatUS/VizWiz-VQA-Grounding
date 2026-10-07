@@ -2,23 +2,16 @@
 import argparse
 import json
 from pathlib import Path
-from types import SimpleNamespace
 import torch
 from dataset import VizWizGroundingDataset, make_loader
-from models.model import build_model
-from models.checkpoint import read_checkpoint, load_checkpoint
+from models.model import GroundingModel
+from utils import read_checkpoint, load_model_weights
 from metrics import evaluate
-
-
-def configure_evaluation(model, args):
-    if args.budget is not None:
-        model.budget = args.budget
-    return {"policy": model.policy, "budget": model.budget}
 
 
 def eval_main(argv=None):
     parser = argparse.ArgumentParser(description="Question-only evaluation using saved model architecture")
-    parser.add_argument("--checkpoint",required=True,help="Final model weights (keep config.json beside the file) or legacy checkpoint")
+    parser.add_argument("--checkpoint",required=True,help="Raw model weights or a training checkpoint")
     parser.add_argument("--data-root",default="data/vizwiz")
     parser.add_argument("--dataset",choices=["val","test"],default="val")
     parser.add_argument("--batch-size",type=int,default=4)
@@ -26,20 +19,23 @@ def eval_main(argv=None):
     parser.add_argument("--device",default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir",required=True)
     parser.add_argument("--budget", type=int, choices=(1, 2, 4), default=None)
+    parser.add_argument("--stage", choices=("refiner", "router"), help="For standalone raw weights; defaults to router")
     args = parser.parse_args(argv)
     if args.batch_size <= 0 or args.num_workers < 0:
         raise ValueError("Invalid batch size or worker count")
     saved = read_checkpoint(args.checkpoint)
-    config = SimpleNamespace(**saved["run_config"])
-    model = build_model(config)
-    load_checkpoint(args.checkpoint,model)
-    inference = configure_evaluation(model,args)
+    config = saved["run_config"]
+    model = GroundingModel(stage=args.stage or config.get("stage", "router"),
+                           budget=args.budget or 2, tiny=config.get("tiny", False),
+                           crop_size=config.get("crop_size", 336))
+    load_model_weights(model, saved)
+    inference = {"policy": model.policy, "budget": model.budget}
     device = torch.device(args.device); model.to(device)
-    dataset = VizWizGroundingDataset(args.data_root,args.dataset,getattr(config, "image_size", 336),
-        getattr(config, "detail_size", 672))
+    dataset = VizWizGroundingDataset(args.data_root,args.dataset,config.get("image_size", 336),
+        config.get("detail_size", 672))
     loader = make_loader(dataset,args,args.batch_size)
     out = Path(args.output_dir); out.mkdir(parents=True,exist_ok=True)
-    scores = evaluate(model,loader,device,"original",out)
+    scores = evaluate(model,loader,device,out)
     summary = {"num_samples":len(scores),"mean_iou":sum(scores.values())/len(scores),
                "dataset":args.dataset,"metric_resolution":"original",
                "text_mode":"question","checkpoint":str(args.checkpoint),
