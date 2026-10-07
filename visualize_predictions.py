@@ -6,7 +6,7 @@ from predict_save import prediction_parser, predict_image
 
 def main(argv=None):
     args=prediction_parser(__doc__).parse_args(argv)
-    image,mask=predict_image(args.checkpoint,args.image,args.question,args.device)
+    image,mask=predict_image(args.checkpoint,args.image,args.question,args.device,teacher=args.teacher)
     tinted=Image.blend(image,Image.new('RGB',image.size,(255,60,30)),.5)
     overlay=Image.composite(tinted,image,mask)
     output=Path(args.output)

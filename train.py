@@ -10,44 +10,26 @@ import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DistributedSampler
 from dataset import VizWizGroundingDataset, make_loader
-from utils import to_device
-from models.model import build_model, EXPERIMENT
-from models.checkpoint import (load_checkpoint, save_checkpoint, read_checkpoint,
-                               initialize_weights)
+from utils import to_device, read_checkpoint, load_model_weights, initialize_weights
+from models.model import GroundingModel, EXPERIMENT
 from losses import SupervisedObjective, DistillationObjective
-from models.backbone import BaseGroundingModel
+from models.model import CompactGroundingModel, TeacherModel
 
 
-def add_experiment_arguments(parser):
-    parser.add_argument("--init-checkpoint", help="Optional compact control weights; starts a new run")
-    if not parser.teacher_training:
-        parser.add_argument("--teacher-checkpoint", required=True, help="Answer-dropout teacher from train_teacher.py")
-
-
-def validate_experiment_args(args):
-    pass
-
-
-def build_objective(args, model, device):
-    if args.teacher_training:
-        return SupervisedObjective()
-    saved = read_checkpoint(args.teacher_checkpoint)
-    config, run = saved["experiment_config"], saved["run_config"]
-    if config.get("experiment") != "controls" or run.get("text_mode") != "dropout" or not 0 < run.get("answer_dropout", 0) < 1:
+def load_teacher(path, device):
+    saved = read_checkpoint(path)
+    config, run = saved.get("experiment_config") or {}, saved["run_config"]
+    if (config and config.get("experiment") != "controls") or (run and (run.get("text_mode") != "dropout" or not 0 < run.get("answer_dropout", 0) < 1)):
         raise ValueError("Teacher must be a corrected model trained with answer dropout")
-    if run.get("image_size") != IMAGE_SIZE:
+    if run.get("image_size", IMAGE_SIZE) != IMAGE_SIZE:
         raise ValueError("Teacher/student image sizes must match")
-    teacher = BaseGroundingModel(config["architecture"], config.get("tiny", False)).to(device)
-    load_checkpoint(args.teacher_checkpoint, teacher)
-    return DistillationObjective(teacher, "incremental", 1., 0.)
+    teacher_type = CompactGroundingModel if config.get("architecture") == "compact" else TeacherModel
+    teacher = teacher_type(tiny=config.get("tiny", False)).to(device)
+    load_model_weights(teacher, saved)
+    return teacher
 
 
 IMAGE_SIZE = 336
-
-
-def build_dataset(args):
-    return VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE,
-                text_mode="dropout" if args.teacher_training else "question")
 
 
 def seed_everything(seed):
@@ -64,7 +46,6 @@ def unwrap(model):
 
 def training_parser(teacher_training=False):
     parser = argparse.ArgumentParser(description="Train answer-dropout teacher" if teacher_training else __doc__)
-    parser.teacher_training = teacher_training
     parser.add_argument("--data-root", default="data/vizwiz")
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--num-epochs", type=int, default=100)
@@ -75,7 +56,9 @@ def training_parser(teacher_training=False):
     parser.add_argument("--save-every", type=int, default=10,
                         help="Save a resumable checkpoint every N epochs; 0 disables periodic saves")
     parser.add_argument("--resume-checkpoint", help="Resume a full checkpoint; raw weights use --init-checkpoint")
-    add_experiment_arguments(parser)
+    parser.add_argument("--init-checkpoint", help="Optional compact control weights; starts a new run")
+    if not teacher_training:
+        parser.add_argument("--teacher-checkpoint", required=True, help="Answer-dropout teacher from train_teacher.py")
     return parser
 
 
@@ -88,11 +71,10 @@ def check_arguments(args):
         raise ValueError("Workers cannot be negative; learning rate must be positive")
     if args.resume_checkpoint and getattr(args, "init_checkpoint", None):
         raise ValueError("Use either resume or weight initialization, not both")
-    for name in ("resume_checkpoint", "init_checkpoint", "teacher_checkpoint", "pairs"):
+    for name in ('resume_checkpoint', 'init_checkpoint', 'teacher_checkpoint'):
         path = getattr(args, name, None)
         if path and not Path(path).is_file():
             raise ValueError(f"{name} does not exist: {path}")
-    validate_experiment_args(args)
 
 
 def train_main(argv=None, teacher_training=False):
@@ -130,11 +112,13 @@ def _train(args, rank, world, distributed, device):
         raise ValueError("Output already contains model files; choose a fresh output directory")
     if distributed:
         dist.barrier()
-    train_set = build_dataset(args)
-    model = build_model(args).to(device)
+    train_set = VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE,
+                text_mode="dropout" if args.teacher_training else "question")
+    model = (TeacherModel() if args.teacher_training else GroundingModel()).to(device)
     if getattr(args, "init_checkpoint", None):
         initialize_weights(args.init_checkpoint,model)
-    objective = build_objective(args,model,device)
+    objective = (SupervisedObjective() if args.teacher_training else
+                 DistillationObjective(load_teacher(args.teacher_checkpoint, device), "incremental", 1., 0.))
     parameters = [p for p in model.parameters() if p.requires_grad]
     if not parameters:
         raise ValueError("No trainable parameters")
@@ -142,7 +126,8 @@ def _train(args, rank, world, distributed, device):
     scaler = torch.amp.GradScaler("cuda",enabled=device.type=="cuda")
     start = 0
     if args.resume_checkpoint:
-        checkpoint = load_checkpoint(args.resume_checkpoint,model)
+        checkpoint = read_checkpoint(args.resume_checkpoint)
+        load_model_weights(model, checkpoint)
         if checkpoint["run_config"].get("stage") != getattr(args, "stage", None):
             raise ValueError("Resume requires the same training stage; use --init-checkpoint to change stage")
         if "optimizer_state_dict" not in checkpoint:
@@ -209,8 +194,12 @@ def _train(args, rank, world, distributed, device):
                 handle.write(json.dumps(record)+"\n")
             if args.save_every and (epoch + 1) % args.save_every == 0:
                 checkpoint_path = out / f"checkpoint_epoch{epoch + 1}.pt"
-                save_checkpoint(checkpoint_path, unwrap(model), optimizer, scaler,
-                                epoch + 1, None, run_config)
+                torch.save({"epoch": epoch + 1,
+                            "model_state_dict": unwrap(model).state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scaler_state_dict": scaler.state_dict(),
+                            "experiment_config": unwrap(model).experiment_config,
+                            "run_config": run_config}, checkpoint_path)
                 print(f"Checkpoint saved: {checkpoint_path}", flush=True)
     if rank == 0:
         final_path = out / f"model_final_epoch{args.num_epochs}.pt"

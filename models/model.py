@@ -1,6 +1,70 @@
-"""Branch architecture and checkpoint-driven model construction."""
+"""Question-conditioned grounding models."""
+import torch
 from torch import nn
-from models.backbone import BaseGroundingModel
+from models.image_encoder import ImageEncoder, TinyVision
+from models.text_encoder import TextEncoder, masked_mean
+from models.mask_decoder import CompactDecoder, SkipConditioner, UNetDecoder
+
+class CompactGroundingModel(nn.Module):
+    architecture = "compact"
+
+    def __init__(self, tiny=False):
+        super().__init__()
+        self.image_encoder = TinyVision() if tiny else ImageEncoder()
+        self.text_encoder = TextEncoder(tiny)
+        self.visual_dim = self.image_encoder.out_channels
+        self.text_dim = self.text_encoder.output_dim
+        self.text_proj = nn.Linear(self.text_dim, self.visual_dim)
+        self.cross_attn = nn.MultiheadAttention(self.visual_dim, 2 if tiny else 8, batch_first=True)
+        self.residual_scale = nn.Parameter(torch.tensor(.01))
+        self._init_decoder(tiny)
+        self.register_buffer("image_mean", torch.tensor([.48145466, .4578275, .40821073]).view(1,3,1,1))
+        self.register_buffer("image_std", torch.tensor([.26862954, .26130258, .27577711]).view(1,3,1,1))
+        self.experiment_config = {"experiment": "controls", "architecture": self.architecture, "tiny": tiny,
+                                  "protocol": "normalized-masked-question-v1"}
+
+    def _init_decoder(self, tiny):
+        self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128)
+
+    def _decode_mask(self, fused, s3, s2, s1, text):
+        return self.decoder(fused, s3, s2, s1, text)
+
+    def encode_image(self, image):
+        return self.image_encoder((image - self.image_mean) / self.image_std)
+
+    def decode(self, features, texts):
+        s1, s2, s3, vision = features
+        text = self.text_encoder(texts)
+        query = vision.flatten(2).transpose(1, 2)
+        projected = self.text_proj(text.tokens)
+        attended, _ = self.cross_attn(query, projected, projected,
+            key_padding_mask=~text.attention_mask, need_weights=False)
+        fused = query + self.residual_scale * attended
+        fused = fused.transpose(1,2).reshape_as(vision)
+        logits = self._decode_mask(fused, s3, s2, s1, text)
+        return {"logits": logits, "visual": fused, "text_tokens": text.tokens,
+                "text_mask": text.attention_mask, "pooled_text": masked_mean(text.tokens, text.valid_mask)}
+
+    def forward(self, batch):
+        return self.decode(self.encode_image(batch["image"]), batch["text"])
+
+
+class TeacherModel(CompactGroundingModel):
+    """Joint question/answer teacher with the original wide U-Net decoder."""
+    architecture = "joint"
+
+    def __init__(self, tiny=False):
+        if tiny:
+            raise ValueError("Tiny offline model supports compact architecture only")
+        super().__init__(tiny=False)
+
+    def _init_decoder(self, tiny):
+        self.decoder = UNetDecoder(self.visual_dim)
+        self.skip_conditioner = SkipConditioner(self.text_dim, self.visual_dim)
+
+    def _decode_mask(self, fused, s3, s2, s1, text):
+        return self.decoder(fused, *self.skip_conditioner([s3, s2, s1], text))
+
 
 EXPERIMENT = 'answer-value-distillation'
 
@@ -8,15 +72,8 @@ EXPERIMENT = 'answer-value-distillation'
 class GroundingModel(nn.Module):
     def __init__(self, tiny=False):
         super().__init__()
-        self.coarse = BaseGroundingModel("compact", tiny)
+        self.coarse = CompactGroundingModel(tiny=tiny)
         self.experiment_config = dict(self.coarse.experiment_config, experiment="answer-value-distillation")
 
     def forward(self, batch):
         return self.coarse(dict(batch, text=batch.get("question_text", batch["text"])))
-
-
-def build_model(args):
-    # Evaluation never opens the training-time teacher checkpoint.
-    if getattr(args, "teacher_training", False):
-        return BaseGroundingModel("joint", getattr(args, "tiny", False))
-    return GroundingModel(getattr(args, "tiny", False))
