@@ -10,30 +10,12 @@ import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DistributedSampler
 from dataset import VizWizGroundingDataset, make_loader
-from utils import to_device
-from models.model import build_model, EXPERIMENT
-from models.checkpoint import (load_checkpoint, save_checkpoint, read_checkpoint,
-                               initialize_weights)
+from utils import to_device, read_checkpoint, load_model_weights, initialize_weights
+from models.model import GroundingModel, EXPERIMENT
 from losses import SupervisedObjective
 
 
-def add_experiment_arguments(parser):
-    parser.add_argument("--init-checkpoint", help="Initialize from saved weights with a fresh optimizer")
-
-
-def validate_experiment_args(args):
-    pass
-
-
-def build_objective(args, model, device):
-    return SupervisedObjective()
-
-
 IMAGE_SIZE = 336
-
-
-def build_dataset(args):
-    return VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE)
 
 
 def seed_everything(seed):
@@ -60,7 +42,7 @@ def training_parser():
     parser.add_argument("--save-every", type=int, default=10,
                         help="Save a resumable checkpoint every N epochs; 0 disables periodic saves")
     parser.add_argument("--resume-checkpoint", help="Resume a full checkpoint; raw weights use --init-checkpoint")
-    add_experiment_arguments(parser)
+    parser.add_argument("--init-checkpoint", help="Initialize from saved weights with a fresh optimizer")
     return parser
 
 
@@ -73,11 +55,10 @@ def check_arguments(args):
         raise ValueError("Workers cannot be negative; learning rate must be positive")
     if args.resume_checkpoint and getattr(args, "init_checkpoint", None):
         raise ValueError("Use either resume or weight initialization, not both")
-    for name in ("resume_checkpoint", "init_checkpoint", "teacher_checkpoint", "pairs"):
+    for name in ('resume_checkpoint', 'init_checkpoint'):
         path = getattr(args, name, None)
         if path and not Path(path).is_file():
             raise ValueError(f"{name} does not exist: {path}")
-    validate_experiment_args(args)
 
 
 def train_main(argv=None):
@@ -113,11 +94,11 @@ def _train(args, rank, world, distributed, device):
         raise ValueError("Output already contains model files; choose a fresh output directory")
     if distributed:
         dist.barrier()
-    train_set = build_dataset(args)
-    model = build_model(args).to(device)
+    train_set = VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE)
+    model = GroundingModel().to(device)
     if getattr(args, "init_checkpoint", None):
         initialize_weights(args.init_checkpoint,model)
-    objective = build_objective(args,model,device)
+    objective = SupervisedObjective()
     parameters = [p for p in model.parameters() if p.requires_grad]
     if not parameters:
         raise ValueError("No trainable parameters")
@@ -125,7 +106,8 @@ def _train(args, rank, world, distributed, device):
     scaler = torch.amp.GradScaler("cuda",enabled=device.type=="cuda")
     start = 0
     if args.resume_checkpoint:
-        checkpoint = load_checkpoint(args.resume_checkpoint,model)
+        checkpoint = read_checkpoint(args.resume_checkpoint)
+        load_model_weights(model, checkpoint)
         if checkpoint["run_config"].get("stage") != getattr(args, "stage", None):
             raise ValueError("Resume requires the same training stage; use --init-checkpoint to change stage")
         if "optimizer_state_dict" not in checkpoint:
@@ -192,8 +174,12 @@ def _train(args, rank, world, distributed, device):
                 handle.write(json.dumps(record)+"\n")
             if args.save_every and (epoch + 1) % args.save_every == 0:
                 checkpoint_path = out / f"checkpoint_epoch{epoch + 1}.pt"
-                save_checkpoint(checkpoint_path, unwrap(model), optimizer, scaler,
-                                epoch + 1, None, run_config)
+                torch.save({"epoch": epoch + 1,
+                            "model_state_dict": unwrap(model).state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scaler_state_dict": scaler.state_dict(),
+                            "experiment_config": unwrap(model).experiment_config,
+                            "run_config": run_config}, checkpoint_path)
                 print(f"Checkpoint saved: {checkpoint_path}", flush=True)
     if rank == 0:
         final_path = out / f"model_final_epoch{args.num_epochs}.pt"
