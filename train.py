@@ -16,7 +16,6 @@ from losses import RefinementObjective
 
 
 def validate_experiment_args(args):
-    args.needs_detail = True
     args.detail_size = DETAIL_SIZE
     args.crop_size = CROP_SIZE
     if not (args.init_checkpoint or args.resume_checkpoint):
@@ -125,7 +124,6 @@ def _train(args, rank, world, distributed, device):
         dist.barrier()
     train_set = VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE, DETAIL_SIZE)
     model = GroundingModel(stage=args.stage, crop_size=CROP_SIZE).to(device)
-    run_config["tiny"] = model.coarse.experiment_config["tiny"]
     if getattr(args, "init_checkpoint", None):
         initialize_weights(args.init_checkpoint,model)
     objective = RefinementObjective()
