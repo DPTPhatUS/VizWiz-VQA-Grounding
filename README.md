@@ -23,6 +23,12 @@ Training also supports `--lr`, `--num-workers`, `--seed`, `--resume-checkpoint`,
 
 ## Project
 
-Developed for the [VizWiz VQA Grounding Challenge](https://vizwiz.org/tasks-and-datasets/visual-qa/) 2025. The work was selected as a workshop spotlight at CVPR 2025.
+Research fork of [yjh9929/VizWiz-VQA-Grounding](https://github.com/yjh9929/VizWiz-VQA-Grounding). The original baseline was developed for the [VizWiz VQA Grounding Challenge](https://vizwiz.org/tasks-and-datasets/visual-qa/) 2025 and selected as a workshop spotlight at CVPR 2025.
 
 Licensed under [Creative Commons Attribution 4.0 International](http://creativecommons.org/licenses/by/4.0/).
+
+## Repository scope
+
+This checkout contains research code for data preparation, training, evaluation, and prediction. The upstream static website and its decorative assets have been removed. The original presentation remains available in the upstream repository.
+
+The retained upstream figures are historical illustrations, not results from this fork's experiments: [architecture](images/model.png), [grounding examples](images/task.png), and [prediction examples 1](images/m1.png), [2](images/m2.png), [3](images/m3.png).
