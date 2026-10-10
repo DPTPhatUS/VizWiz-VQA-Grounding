@@ -14,9 +14,6 @@ class ImageEncoder(nn.Module):
             config = CLIPVisionConfig.from_pretrained(model_name)
             self.vision_encoder = CLIPVisionModel(config)
 
-        # post_layernorm only applies to pooled_output ([CLS]), which is discarded below.
-        # Freezing it prevents unused-parameter errors in DistributedDataParallel.
-        self.vision_encoder.vision_model.post_layernorm.requires_grad_(False)
         self.out_channels = self.vision_encoder.config.hidden_size
 
     def forward(self, x):
