@@ -149,7 +149,6 @@ def _train(args, rank, world, distributed, device):
     run_config["experiment_config"] = unwrap(model).experiment_config
     run_config["tiny"] = getattr(unwrap(model), "coarse", unwrap(model)).experiment_config.get("tiny", False)
     if rank == 0:
-        (out/"config.json").write_text(json.dumps(run_config,indent=2))
         print(json.dumps({"parameters":sum(p.numel() for p in unwrap(model).parameters()),
                           "trainable":sum(p.numel() for p in parameters),"device":str(device),
                           "experiment":unwrap(model).experiment_config}),flush=True)
