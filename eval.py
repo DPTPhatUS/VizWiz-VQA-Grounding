@@ -24,7 +24,12 @@ def eval_main(argv=None):
         raise ValueError("Invalid batch size or worker count")
     saved = read_checkpoint(args.checkpoint)
     config = saved["run_config"]
-    model_type = TeacherModel if args.teacher or config.get("teacher_training", False) else GroundingModel
+    is_teacher = (
+        args.teacher
+        or config.get("teacher_training", False)
+        or "skip_conditioner.reduction.weight" in saved["model_state_dict"]
+    )
+    model_type = TeacherModel if is_teacher else GroundingModel
     model = model_type(tiny=config.get("tiny", False))
     load_model_weights(model, saved)
     device = torch.device(args.device); model.to(device)

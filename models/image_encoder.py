@@ -19,9 +19,13 @@ class ImageEncoder(nn.Module):
         bottleneck = outputs.last_hidden_state
 
         def reshape_feat(feat):
-            feat = feat[:, 1:, :].transpose(1, 2)  # (B, D, seq_len)
-            patch_size = int((feat.shape[-1]) ** 0.5)
-            return feat.view(feat.shape[0], feat.shape[1], patch_size, patch_size)
+            B, _, D = feat.shape
+            feat = feat[:, 1:, :]
+            num_patches = feat.shape[1]
+            grid_size = int(num_patches**0.5)
+            if grid_size * grid_size != num_patches:
+                raise ValueError(f"Expected square patch grid, got {num_patches} patches")
+            return feat.view(B, grid_size, grid_size, D).permute(0, 3, 1, 2).contiguous()
 
         return tuple(map(reshape_feat, [enc_feat1, enc_feat2, enc_feat3])) + (reshape_feat(bottleneck),)
 

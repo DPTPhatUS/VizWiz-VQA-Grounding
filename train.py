@@ -85,15 +85,17 @@ def train_main(argv=None, teacher_training=False):
     check_arguments(args)
     rank, world, local = (int(os.environ.get(k,default)) for k,default in (
         ("RANK",0),("WORLD_SIZE",1),("LOCAL_RANK",0)))
-    if args.batch_size % world:
-        raise ValueError("Global batch size must be divisible by world size")
+    if args.batch_size < world or args.batch_size % world != 0:
+        raise ValueError("Global batch size must be a positive multiple of world size")
     distributed = world > 1
     device = torch.device(args.device)
     if distributed:
         if device.type == "cuda":
             device = torch.device("cuda", local)
             torch.cuda.set_device(device)
-        dist.init_process_group("nccl" if device.type == "cuda" else "gloo")
+            dist.init_process_group("nccl", device_id=device)
+        else:
+            dist.init_process_group("gloo")
     try:
         _train(args, rank, world, distributed, device)
     finally:
@@ -140,9 +142,14 @@ def _train(args, rank, world, distributed, device):
         if start >= args.num_epochs:
             raise ValueError("num-epochs must exceed the resumed epoch")
     if distributed:
-        model = nn.parallel.DistributedDataParallel(model,
-            device_ids=[device.index] if device.type=="cuda" else None,
-            find_unused_parameters=True)
+        if device.type == "cuda":
+            model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            output_device=device.index if device.type == "cuda" else None,
+            find_unused_parameters=True,
+        )
     sampler = DistributedSampler(train_set,num_replicas=world,rank=rank,seed=args.seed) if distributed else None
     generator = torch.Generator()
     train_loader = make_loader(train_set,args,args.batch_size//world,sampler,sampler is None,generator)

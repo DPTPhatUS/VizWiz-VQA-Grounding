@@ -31,7 +31,7 @@ class VizWizGroundingDataset(Dataset):
 
     @staticmethod
     def mask_tensor(mask, size):
-        return (to_tensor(mask.resize((size, size), Image.Resampling.BILINEAR)) > 0.5).float()
+        return (to_tensor(mask.resize((size, size), Image.Resampling.NEAREST)) > 0.5).float()
 
     def __getitem__(self, index):
         name = self.names[index]
@@ -42,8 +42,8 @@ class VizWizGroundingDataset(Dataset):
             mask = source.convert("L")
         if image.size != mask.size:
             raise ValueError(f"Image/mask dimensions differ for {name}")
-        question = str(meta["question"])
-        answer = str(meta.get("most_common_answer") or "")
+        question = str(meta.get("question", "")).strip()
+        answer = str(meta.get("most_common_answer") or "").strip()
         question_text = f"Q: {question}"
         answer_text = f"{question_text} A: {answer}" if answer else question_text
         use_answer = self.text_mode == "dropout" and random.random() >= self.answer_dropout
