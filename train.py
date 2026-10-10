@@ -127,13 +127,13 @@ def _train(args, rank, world, distributed, device):
     generator = torch.Generator()
     train_loader = make_loader(train_set,args,args.batch_size//world,sampler,sampler is None,generator)
     run_config["experiment_config"] = unwrap(model).experiment_config
-    run_config["tiny"] = getattr(unwrap(model), "coarse", unwrap(model)).experiment_config.get("tiny", False)
+    run_config["tiny"] = unwrap(model).experiment_config.get("tiny", False)
     if rank == 0:
         print(json.dumps({"parameters":sum(p.numel() for p in unwrap(model).parameters()),
                           "trainable":sum(p.numel() for p in parameters),"device":str(device),
                           "experiment":unwrap(model).experiment_config}),flush=True)
     for epoch in range(start,args.num_epochs):
-        # Epoch-keyed RNG permits reproducible continuation, including loader/answer dropout.
+        # Epoch-keyed RNG permits reproducible continuation, including loader shuffling.
         seed_everything(args.seed+epoch*world+rank)
         generator.manual_seed(args.seed+epoch*world+rank)
         if sampler:

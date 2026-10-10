@@ -25,8 +25,4 @@ def load_model_weights(model, saved):
 
 def initialize_weights(path, model):
     saved = read_checkpoint(path)
-    state = saved["model_state_dict"]
-    target = model
-    if hasattr(model, "coarse") and set(state) == set(model.coarse.state_dict()):
-        target = model.coarse
-    load_model_weights(target, saved)
+    load_model_weights(model, saved)

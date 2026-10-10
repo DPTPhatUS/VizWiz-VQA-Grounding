@@ -56,8 +56,6 @@ def collate_samples(samples):
             result[key] = values
         elif isinstance(values[0], torch.Tensor):
             result[key] = torch.stack(values)
-        elif isinstance(values[0], bool):
-            result[key] = torch.tensor(values, dtype=torch.bool)
         else:
             result[key] = values
     return result
