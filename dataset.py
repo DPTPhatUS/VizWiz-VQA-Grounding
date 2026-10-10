@@ -13,7 +13,7 @@ from torchvision.transforms.functional import to_tensor
 class VizWizGroundingDataset(Dataset):
     def __init__(self, root, split, image_size=336, *, text_mode="question", answer_dropout=0.5):
         self.root, self.split = Path(root), split
-        if text_mode not in {"question", "answer", "dropout"}:
+        if text_mode not in {"question", "dropout"}:
             raise ValueError("Unknown text mode")
         if split != "train" and text_mode != "question":
             raise ValueError("Research validation/test must be question-only")
@@ -46,9 +46,7 @@ class VizWizGroundingDataset(Dataset):
         answer = str(meta.get("most_common_answer") or "")
         question_text = f"Q: {question}"
         answer_text = f"{question_text} A: {answer}" if answer else question_text
-        use_answer = self.text_mode == "answer" or (
-            self.text_mode == "dropout" and random.random() >= self.answer_dropout
-        )
+        use_answer = self.text_mode == "dropout" and random.random() >= self.answer_dropout
         result = {
             "image": to_tensor(image.resize((self.image_size, self.image_size), Image.Resampling.BICUBIC)),
             "mask": self.mask_tensor(mask, self.image_size),

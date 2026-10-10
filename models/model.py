@@ -2,7 +2,7 @@
 import torch
 from torch import nn
 from models.image_encoder import ImageEncoder, TinyVision
-from models.text_encoder import TextEncoder, masked_mean
+from models.text_encoder import TextEncoder
 from models.mask_decoder import CompactDecoder, SkipConditioner, UNetDecoder
 
 class CompactGroundingModel(nn.Module):
@@ -42,8 +42,7 @@ class CompactGroundingModel(nn.Module):
         fused = query + self.residual_scale * attended
         fused = fused.transpose(1,2).reshape_as(vision)
         logits = self._decode_mask(fused, s3, s2, s1, text)
-        return {"logits": logits, "visual": fused, "text_tokens": text.tokens,
-                "text_mask": text.attention_mask, "pooled_text": masked_mean(text.tokens, text.valid_mask)}
+        return {"logits": logits}
 
     def forward(self, batch):
         return self.decode(self.encode_image(batch["image"]), batch["text"])

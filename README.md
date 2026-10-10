@@ -2,7 +2,7 @@
 
 This branch trains a compact question-only student using a frozen joint-skip teacher. The teacher is trained with 50% answer dropout. Student distillation uses positive answer-induced teacher improvement, with fixed weight 1; the teacher is unnecessary at inference.
 
-The experiment uses the existing `train.py`, `eval.py`, `dataset.py`, and `models/` layout. CLIP input is fixed at 336 pixels; architecture and loss settings are defined in code. No detector is involved. The offline detector experiment lives on `exp/yolo-detector`.
+The experiment uses the existing `train.py`, `eval.py`, `dataset.py`, and `models/` layout. CLIP input is fixed at 336 pixels; architecture and loss settings are defined in code.
 
 ## Kaggle
 
@@ -43,20 +43,20 @@ python visualize_predictions.py --checkpoint /path/to/model_final_epoch100.pt --
 
 ## Training output and separate evaluation
 
-Training reads only the training split: no validation dataset is loaded and no validation runs, including after the final epoch. This also applies to teacher training and both refinement stages.
+Training reads only the training split: no validation dataset is loaded and no validation runs, including after the final epoch. This applies to both teacher and student training.
 
 At completion, training saves exactly one raw `state_dict`: `model_final_epoch<N>.pt`, matching the baseline format. It contains model tensors only, with no optimizer, scaler, epoch wrapper, or RNG state. There are no automatic `last.pt` or `best.pt` saves, and `--validate-every` is removed. `--save-every` defaults to **10** and saves resumable `checkpoint_epoch10.pt`, `checkpoint_epoch20.pt`, etc., containing model, optimizer, scaler, and completed epoch. Use `--save-every 0` to disable these periodic checkpoints while still saving the final raw model.
 
 Raw weights use this branch's default model settings. Resumable checkpoints retain their own `run_config` and `experiment_config`; no standalone configuration file is written or read. `history.jsonl` contains training losses only. Run `eval.py` separately with `--dataset val` or `--dataset test`; the commands above show the final weight filename for their epoch count.
 
-To train further from these weights, use `--init-checkpoint /path/to/model_final_epoch<N>.pt`. This starts a new optimizer and epoch counter; `--num-epochs` is the number of additional epochs. Distillation still requires its teacher. To resume a periodic checkpoint, use `--resume-checkpoint /path/to/checkpoint_epoch10.pt` with its existing output directory or a fresh one; optimizer/scaler state and completed epoch are restored, and `--num-epochs` is the final total epoch count. Older supported full checkpoints remain loadable.
+To train further from these weights, use `--init-checkpoint /path/to/model_final_epoch<N>.pt`. This starts a new optimizer and epoch counter; `--num-epochs` is the number of additional epochs. Distillation still requires its teacher. To resume a periodic checkpoint, use `--resume-checkpoint /path/to/checkpoint_epoch10.pt` with its existing output directory or a fresh one; optimizer/scaler state and completed epoch are restored, and `--num-epochs` is the final total epoch count. Repeat the original batch size, seed, learning rate, and experiment-specific training arguments when continuing a run. Older supported full checkpoints remain loadable.
 
-Existing output directories are accepted for all training modes. Matching model filenames are overwritten; other model files remain. History is appended to `history.jsonl`, creating it if absent. To continue in a fresh Kaggle notebook, only the resumable checkpoint is needed to restore training state; no previous history or separate configuration file is required. Dataset files and any teacher required by the experiment must still be available.
+Existing output directories are accepted for all training modes. Matching model filenames are overwritten; other model files remain. History is appended to `history.jsonl`, creating it if absent. To continue in a fresh Kaggle notebook, only the resumable checkpoint is needed to restore training state; no previous history or separate configuration file is required. The training dataset must still be available. Student continuation also requires its teacher checkpoint; teacher continuation uses `train_teacher.py`.
 
 
 ## Code layout
 
-- `models/model.py`: this branch's grounding model and any teacher/coarse model it needs.
+- `models/model.py`: the compact question-only student and joint question/answer teacher.
 - `models/image_encoder.py` and `models/text_encoder.py`: CLIP feature extraction.
 - `models/mask_decoder.py`: the decoder used by this experiment.
 - `train.py`: construct the model and dataset, run training, save checkpoints and final weights.

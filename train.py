@@ -117,7 +117,7 @@ def _train(args, rank, world, distributed, device):
     if getattr(args, "init_checkpoint", None):
         initialize_weights(args.init_checkpoint,model)
     objective = (SupervisedObjective() if args.teacher_training else
-                 DistillationObjective(load_teacher(args.teacher_checkpoint, device), "incremental", 1., 0.))
+                 DistillationObjective(load_teacher(args.teacher_checkpoint, device)))
     parameters = [p for p in model.parameters() if p.requires_grad]
     if not parameters:
         raise ValueError("No trainable parameters")
