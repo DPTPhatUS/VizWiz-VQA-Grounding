@@ -7,7 +7,6 @@ import torch
 from PIL import Image, ImageOps
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from utils import to_device
 from torchvision.transforms.functional import to_tensor
 
 
