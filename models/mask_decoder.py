@@ -1,5 +1,4 @@
 """Text-conditioned compact mask decoding."""
-import torch
 from torch import nn
 from torch.nn import functional as F
 from models.text_encoder import masked_mean

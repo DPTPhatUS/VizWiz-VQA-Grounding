@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DistributedSampler
+from tqdm.auto import tqdm
 from dataset import VizWizGroundingDataset, make_loader
 from utils import to_device, read_checkpoint, load_model_weights, initialize_weights
 from models.model import GroundingModel
@@ -91,8 +92,6 @@ def _train(args, rank, world, distributed, device):
     out = Path(args.output_dir)
     if rank == 0:
         out.mkdir(parents=True, exist_ok=True)
-    if any(out.glob("*.pt")):
-        raise ValueError("Output already contains model files; choose a fresh output directory")
     if distributed:
         dist.barrier()
     train_set = VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE, pairs=args.pairs)
@@ -146,7 +145,8 @@ def _train(args, rank, world, distributed, device):
         model.train()
         totals = torch.zeros(2,device=device,dtype=torch.float64)
         component_sums = {}
-        for batch in train_loader:
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.num_epochs}",
+                          unit="batch", disable=rank != 0, dynamic_ncols=True):
             batch = to_device(batch,device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device.type,enabled=device.type=="cuda"):
@@ -180,7 +180,7 @@ def _train(args, rank, world, distributed, device):
                             "optimizer_state_dict": optimizer.state_dict(),
                             "scaler_state_dict": scaler.state_dict(),
                             "experiment_config": unwrap(model).experiment_config,
-                            "run_config": run_config}, checkpoint_path)
+                            "run_config": run_config}, checkpoint_path, _use_new_zipfile_serialization=False)
                 print(f"Checkpoint saved: {checkpoint_path}", flush=True)
     if rank == 0:
         final_path = out / f"model_final_epoch{args.num_epochs}.pt"
