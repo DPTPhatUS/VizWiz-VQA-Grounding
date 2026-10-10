@@ -1,6 +1,4 @@
 """Batch transfer and plain PyTorch weight loading."""
-import json
-from pathlib import Path
 import torch
 
 
@@ -13,10 +11,6 @@ def read_checkpoint(path):
     saved = torch.load(path, map_location="cpu", weights_only=False)
     if "model_state_dict" not in saved:
         saved = {"model_state_dict": saved}
-        config_path = Path(path).parent / "config.json"
-        if config_path.is_file():
-            saved["run_config"] = json.loads(config_path.read_text())
-            saved["experiment_config"] = saved["run_config"].get("experiment_config")
     saved.setdefault("run_config", {})
     return saved
 
