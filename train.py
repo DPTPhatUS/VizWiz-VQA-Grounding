@@ -1,5 +1,6 @@
 import argparse
 import os
+import random
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -27,17 +28,23 @@ def setup_distributed():
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ["LOCAL_RANK"])
-        dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
         torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
         return rank, world_size, local_rank, True
     else:
         return 0, 1, 0, False
 
 
 def set_deterministic(seed: int = 42):
+    random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def seed_worker(worker_id: int):
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
 
 
 def cleanup_distributed():
@@ -69,6 +76,11 @@ def main():
     rank, world_size, local_rank, is_dist = setup_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
+    if args.batch_size < world_size or args.batch_size % world_size != 0:
+        parser.error(
+            f"--batch-size ({args.batch_size}) must be a positive multiple of world_size ({world_size})"
+        )
+
     # Deterministic mode  (before any model creation)
     set_deterministic(args.seed)
 
@@ -97,8 +109,11 @@ def main():
     )
 
     # --- Samplers & Loaders ---
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(args.seed + rank)
+
     train_sampler = (
-        DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True)
+        DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
         if is_dist else None
     )
     train_loader = DataLoader(
@@ -107,8 +122,10 @@ def main():
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=(device.type == "cuda"),
         prefetch_factor=2 if args.num_workers > 0 else None,
+        worker_init_fn=seed_worker,
+        generator=loader_generator,
     )
 
     # Validation: run on EVERY rank with DistributedSampler so the union
@@ -123,8 +140,9 @@ def main():
         shuffle=False,
         sampler=val_sampler,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=(device.type == "cuda"),
         prefetch_factor=2 if args.num_workers > 0 else None,
+        worker_init_fn=seed_worker,
     )
 
     # --- Model ---
@@ -140,9 +158,10 @@ def main():
                 find_unused_parameters=True)
 
     # --- Optimizer / Loss / Scaler ---
+    use_amp = (device.type == "cuda")
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = nn.BCEWithLogitsLoss()
-    scaler = GradScaler()
+    scaler = GradScaler("cuda", enabled=use_amp)
 
     # --- Resume checkpoint ---
     start_epoch = 0
@@ -156,7 +175,7 @@ def main():
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
             underlying_model.load_state_dict(checkpoint["model_state_dict"])
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            if "scaler_state_dict" in checkpoint:
+            if "scaler_state_dict" in checkpoint and checkpoint["scaler_state_dict"]:
                 scaler.load_state_dict(checkpoint["scaler_state_dict"])
             start_epoch = checkpoint.get("epoch", 0)
             if rank == 0:
@@ -171,7 +190,8 @@ def main():
                 start_epoch = 0
 
         del checkpoint
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # --- Log file (rank 0 only) ---
     log_file = None
@@ -202,9 +222,11 @@ def main():
             batch = to_device(batch, device)
             images, masks, texts = batch["image"], batch["mask"], batch["text"]
 
-            with autocast("cuda"):
+            with autocast(device.type, enabled=use_amp):
                 pred = model(images, texts)
-                pred = nn.functional.interpolate(pred, size=masks.shape[-2:], mode="bilinear")
+                pred = nn.functional.interpolate(
+                    pred, size=masks.shape[-2:], mode="bilinear", align_corners=False
+                )
                 loss = loss_fn(pred, masks)
 
             optimizer.zero_grad()
@@ -240,9 +262,12 @@ def main():
                     batch = to_device(batch, device)
                     images, masks, texts = batch["image"], batch["mask"], batch["text"]
 
-                    pred = model(images, texts)
-                    pred = nn.functional.interpolate(pred, size=masks.shape[-2:], mode="bilinear")
-                    loss = loss_fn(pred, masks)
+                    with autocast(device.type, enabled=use_amp):
+                        pred = model(images, texts)
+                        pred = nn.functional.interpolate(
+                            pred, size=masks.shape[-2:], mode="bilinear", align_corners=False
+                        )
+                        loss = loss_fn(pred, masks)
                     val_loss_sum += loss.item()
                     if rank == 0:
                         loop.set_postfix(loss=f"{loss.item():.4f}")

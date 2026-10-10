@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from datetime import datetime
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
+from torchvision.transforms.functional import to_pil_image
 
 from dataset import VizWizGroundingDataset
 from models import GroundingModel
@@ -59,7 +60,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=(device.type == "cuda"),
     )
 
     # --- Model ---
@@ -90,7 +91,7 @@ def main():
             filenames = batch["filename"]
 
             pred = model(images, texts)
-            pred = F.interpolate(pred, size=masks.shape[-2:], mode="bilinear")
+            pred = F.interpolate(pred, size=masks.shape[-2:], mode="bilinear", align_corners=False)
 
             # Score and save the same mask using a probability threshold of 0.5.
             pred_bin = (torch.sigmoid(pred) > 0.5).float()
@@ -101,7 +102,6 @@ def main():
             if args.output_dir:
                 for i, fname in enumerate(filenames):
                     mask_path = os.path.join(args.output_dir, fname.replace(".jpg", ".png"))
-                    from torchvision.transforms.functional import to_pil_image
                     to_pil_image(pred_bin[i, 0].cpu()).save(mask_path)
 
     # --- Results JSON ---
