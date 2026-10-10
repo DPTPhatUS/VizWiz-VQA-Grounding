@@ -4,6 +4,7 @@ from torch.nn import functional as F
 from pathlib import Path
 import numpy as np
 from PIL import Image
+from tqdm.auto import tqdm
 from utils import to_device
 from losses import per_image_iou
 
@@ -21,7 +22,7 @@ def metric_samples(logits, batch):
 def evaluate(model, loader, device, output=None):
     model.eval()
     scores = {}
-    for batch in loader:
+    for batch in tqdm(loader, desc="Evaluating", unit="batch", dynamic_ncols=True):
         batch = to_device(batch, device)
         # Dataset validation/test always supplies question-only text.
         logits = model(batch)["logits"]
