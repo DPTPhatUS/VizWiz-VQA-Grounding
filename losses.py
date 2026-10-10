@@ -3,6 +3,8 @@ from torch.nn import functional as F
 
 
 def resize_logits(logits, target):
+    if logits.shape[-2:] == target.shape[-2:]:
+        return logits
     return F.interpolate(logits, size=target.shape[-2:], mode="bilinear", align_corners=False)
 
 
