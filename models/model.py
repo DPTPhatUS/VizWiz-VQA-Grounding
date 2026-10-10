@@ -37,8 +37,8 @@ class CompactGroundingModel(nn.Module):
         fused = query + self.residual_scale * attended
         fused = fused.transpose(1,2).reshape_as(vision)
         logits = self.decoder(fused, s3, s2, s1, text)
-        return {"logits": logits, "visual": fused, "text_tokens": text.tokens,
-                "text_mask": text.attention_mask, "pooled_text": masked_mean(text.tokens, text.valid_mask)}
+        return {"logits": logits, "visual": fused,
+                "pooled_text": masked_mean(text.tokens, text.valid_mask)}
 
     def forward(self, batch):
         return self.decode(self.encode_image(batch["image"]), batch["text"])

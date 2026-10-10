@@ -2,7 +2,7 @@
 
 This branch trains a compact grounding model with a high-resolution crop refiner and an expected-IoU-gain router. Inputs and evaluation use only the question. The coarse model stays frozen; the refiner is also frozen while training the router.
 
-Install the project dependencies, or keep your notebook's Torch/Torchvision installation and install `transformers pillow numpy`. Run from this branch with a VizWiz root containing `<split>_grounding.json`, `<split>/` images, and `binary_masks_png/<split>/` masks.
+Install the project dependencies, or keep your notebook's Torch/Torchvision installation and install `transformers tqdm pillow numpy`. Run from this branch with a VizWiz root containing `<split>_grounding.json`, `<split>/` images, and `binary_masks_png/<split>/` masks.
 
 ```bash
 python train.py --data-root /path/to/vizwiz --stage refiner --init-checkpoint /path/to/compact-controls/model_final_epoch100.pt --output-dir outputs-refiner --num-epochs 30 --batch-size 1
@@ -21,20 +21,20 @@ Use `train.py --help` and `eval.py --help` for operational options. Real-data ac
 
 ## Training output and separate evaluation
 
-Training reads only the training split: no validation dataset is loaded and no validation runs, including after the final epoch. This also applies to teacher training and both refinement stages.
+Training reads only the training split: no validation dataset is loaded and no validation runs, including after the final epoch. This applies to both the refiner and router stages.
 
 At completion, training saves exactly one raw `state_dict`: `model_final_epoch<N>.pt`, matching the baseline format. It contains model tensors only, with no optimizer, scaler, epoch wrapper, or RNG state. There are no automatic `last.pt` or `best.pt` saves, and `--validate-every` is removed. `--save-every` defaults to **10** and saves resumable `checkpoint_epoch10.pt`, `checkpoint_epoch20.pt`, etc., containing model, optimizer, scaler, and completed epoch. Use `--save-every 0` to disable these periodic checkpoints while still saving the final raw model.
 
 Raw weights use this branch's default model settings. Resumable checkpoints retain their own `run_config` and `experiment_config`; no standalone configuration file is written or read. `history.jsonl` contains training losses only. Run `eval.py` separately with `--dataset val` or `--dataset test`; the commands above show the final weight filename for their epoch count.
 
-To train further from these weights, use `--init-checkpoint /path/to/model_final_epoch<N>.pt`. This starts a new optimizer and epoch counter; `--num-epochs` is the number of additional epochs. Distillation still requires its teacher. To resume a periodic checkpoint, use `--resume-checkpoint /path/to/checkpoint_epoch10.pt` with its existing output directory or a fresh one; optimizer/scaler state and completed epoch are restored, and `--num-epochs` is the final total epoch count. Older supported full checkpoints remain loadable.
+To train further from these weights, use `--init-checkpoint /path/to/model_final_epoch<N>.pt`. This starts a new optimizer and epoch counter; `--num-epochs` is the number of additional epochs. To resume a periodic checkpoint, use `--resume-checkpoint /path/to/checkpoint_epoch10.pt` with its existing output directory or a fresh one; optimizer/scaler state and completed epoch are restored, and `--num-epochs` is the final total epoch count. Repeat the original batch size, seed, learning rate, and experiment-specific training arguments when continuing a run. Older supported full checkpoints remain loadable.
 
-Existing output directories are accepted for all training modes. Matching model filenames are overwritten; other model files remain. History is appended to `history.jsonl`, creating it if absent. To continue in a fresh Kaggle notebook, only the resumable checkpoint is needed to restore training state; no previous history or separate configuration file is required. Dataset files and any teacher required by the experiment must still be available.
+Existing output directories are accepted for all training modes. Matching model filenames are overwritten; other model files remain. History is appended to `history.jsonl`, creating it if absent. To continue in a fresh Kaggle notebook, only the resumable checkpoint is needed to restore training state; no previous history or separate configuration file is required. The training dataset must still be available. Repeat the saved `--stage` when resuming; the full checkpoint already contains the frozen coarse and refiner weights, so the original initialization file is unnecessary.
 
 
 ## Code layout
 
-- `models/model.py`: this branch's grounding model and any teacher/coarse model it needs.
+- `models/model.py`: the frozen compact coarse model, crop refiner, and gain router.
 - `models/image_encoder.py` and `models/text_encoder.py`: CLIP feature extraction.
 - `models/mask_decoder.py`: the decoder used by this experiment.
 - `train.py`: construct the model and dataset, run training, save checkpoints and final weights.
