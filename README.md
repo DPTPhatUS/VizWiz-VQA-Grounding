@@ -27,7 +27,9 @@ At completion, training saves exactly one raw `state_dict`: `model_final_epoch<N
 
 Raw weights load directly without `config.json`. If present, the saved configuration is read to retain the original run settings; checkpoints already include those settings. `history.jsonl` contains training losses only. Run `eval.py` separately with `--dataset val` or `--dataset test`; the commands above show the final weight filename for their epoch count.
 
-To train further from these weights, use `--init-checkpoint /path/to/model_final_epoch<N>.pt` and a fresh output directory. This starts a new optimizer and epoch counter; `--num-epochs` is the number of additional epochs. Distillation still requires its teacher. To resume a periodic checkpoint, use `--resume-checkpoint /path/to/checkpoint_epoch10.pt` and a fresh output directory; optimizer/scaler state and completed epoch are restored, and `--num-epochs` is the final total epoch count. Older supported full checkpoints remain loadable.
+To train further from these weights, use `--init-checkpoint /path/to/model_final_epoch<N>.pt`. This starts a new optimizer and epoch counter; `--num-epochs` is the number of additional epochs. Distillation still requires its teacher. To resume a periodic checkpoint, use `--resume-checkpoint /path/to/checkpoint_epoch10.pt` with its existing output directory or a fresh one; optimizer/scaler state and completed epoch are restored, and `--num-epochs` is the final total epoch count. Older supported full checkpoints remain loadable.
+
+Existing output directories are accepted for all training modes. Matching model filenames and `config.json` are overwritten; other model files remain. History is appended to `history.jsonl`, creating it if absent. To continue in a fresh Kaggle notebook, only the resumable checkpoint is needed to restore training state; no previous history or `config.json` is required. Dataset files and any teacher required by the experiment must still be available.
 
 
 ## Code layout
@@ -42,3 +44,5 @@ To train further from these weights, use `--init-checkpoint /path/to/model_final
 The separate backbone, experiment, and checkpoint modules and model factory are removed. Training still uses no validation, saves resumable checkpoints every 10 epochs by default, and writes final raw weights.
 
 For standalone refiner weights without their saved configuration, use `--stage refiner` with `eval.py`, `predict_save.py`, or `visualize_predictions.py`. Router inference is the default when no saved stage is available.
+
+Training shows a batch progress bar for each epoch (rank 0 under `torchrun`), and evaluation shows a batch progress bar. Install `tqdm` alongside Transformers and Pillow in the Kaggle notebook.

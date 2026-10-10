@@ -119,7 +119,6 @@ class GroundingModel(nn.Module):
         if crop_size <= 0 or budget not in (1,2,4):
             raise ValueError('Invalid crop size or budget')
         coarse = CompactGroundingModel(tiny=tiny) if coarse is None else coarse
-        self.routing_seed=42
         self.coarse=coarse.requires_grad_(False)
         self.stage,self.crop_size,self.budget=stage,crop_size,budget
         self.policy='fixed' if stage=='refiner' else 'gain'

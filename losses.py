@@ -26,18 +26,6 @@ def per_image_iou(logits, target):
     return torch.where(union > 0, intersection / union.clamp_min(1), torch.ones_like(union))
 
 
-def balanced_weights(values, target):
-    """Each nonempty foreground/background region gets equal mass per sample."""
-    values = values.detach().float().clamp_min(0)
-    result = torch.zeros_like(values)
-    for region in (target > .5, target <= .5):
-        masked = values * region
-        mass = masked.flatten(1).sum(1).view(-1,1,1,1)
-        result = result + masked / mass.clamp_min(1e-8)
-    mass = result.flatten(1).sum(1).view(-1,1,1,1)
-    return result / mass.clamp_min(1e-8)
-
-
 class RefinementObjective:
     def __call__(self,model,batch):
         output=model(batch,compute_loss=True)
