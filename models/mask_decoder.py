@@ -8,20 +8,25 @@ from models.text_encoder import masked_mean
 class SkipConditioner(nn.Module):
     def __init__(self, text_dim, channels, reduction=64):
         super().__init__()
+        self.qa_gate = nn.Linear(2 * text_dim, text_dim)
         self.reduction = nn.Linear(text_dim, reduction)
         self.affine = nn.ModuleList([nn.Linear(reduction, 2 * channels) for _ in range(3)])
         for head in self.affine:
             nn.init.zeros_(head.weight)
             nn.init.zeros_(head.bias)
 
-    def forward(self, skips, text):
-        condition = F.gelu(self.reduction(masked_mean(text.tokens, text.valid_mask)))
+    def forward(self, skips, text, answer_vec=None):
+        q = masked_mean(text.tokens, text.valid_mask) if hasattr(text, "tokens") else text  # (B, D_t)
+        a = q if answer_vec is None else answer_vec.to(q.dtype)  # (B, D_t)
+        gate = torch.sigmoid(self.qa_gate(torch.cat([q, a], dim=-1)))  # (B, D_t)
+        blended = gate * q + (1 - gate) * a  # (B, D_t)
+        condition = F.gelu(self.reduction(blended))  # (B, R)
         output = []
         for feature, head in zip(skips, self.affine):
-            gamma, beta = head(condition).chunk(2, dim=-1)
+            gamma, beta = head(condition).chunk(2, dim=-1)  # (B, C), (B, C)
             gamma = gamma.to(feature.dtype)
             beta = beta.to(feature.dtype)
-            output.append(feature * (1 + gamma[:, :, None, None]) + beta[:, :, None, None])
+            output.append(feature * (1 + gamma[:, :, None, None]) + beta[:, :, None, None])  # (B, C, H_p, W_p)
         return output
 
 
@@ -45,18 +50,20 @@ class CompactDecoder(nn.Module):
         ])
         self.output = nn.Conv2d(16, 1, 1)
 
-    def forward(self, bottleneck, skip3, skip2, skip1, text):
-        features = [projection(feature) for projection, feature in zip(
-            self.projections, [bottleneck, skip3, skip2, skip1]
-        )]
-        x = features[0]
-        skips = self.conditioner(features[1:], text)
+    def project_skips(self, skip3, skip2, skip1):
+        return [proj(feat) for proj, feat in zip(self.projections[1:], (skip3, skip2, skip1))]  # 3 x (B, C, H_p, W_p)
+
+    def forward(self, bottleneck, skip3, skip2, skip1, text, answer_vec=None, *, projected_skips=None):
+        x = self.projections[0](bottleneck)  # (B, C, H_p, W_p)
+        skips = projected_skips if projected_skips is not None else self.project_skips(skip3, skip2, skip1)  # 3 x (B, C, H_p, W_p)
+        skips = self.conditioner(skips, text, answer_vec=answer_vec)  # 3 x (B, C, H_p, W_p)
         for block, skip in zip(self.fusion, skips):
-            skip = F.interpolate(skip, size=x.shape[-2:], mode="bilinear", align_corners=False)
-            x = x + block(x + skip)
+            if skip.shape[-2:] != x.shape[-2:]:
+                skip = F.interpolate(skip, size=x.shape[-2:], mode="bilinear", align_corners=False)
+            x = x + block(x + skip)  # (B, C, H_p, W_p)
         for block in self.upsample:
-            x = block(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False))
-        return self.output(x)
+            x = block(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False))  # 2x spatial per stage
+        return self.output(x)  # (B, 1, 16*H_p, 16*W_p)
 
 
 class UNetDecoder(nn.Module):
@@ -122,28 +129,28 @@ class UNetDecoder(nn.Module):
 
     def forward(self, x, enc_feat3, enc_feat2, enc_feat1):
         # stage 1: x(768) -> 1024 upsample + enc_feat3(1024) concat
-        x = self.upconvs[0](x)
+        x = self.upconvs[0](x)  # (B, c0, 2*H_p, 2*W_p)
         if x.shape[2:] != enc_feat3.shape[2:]:
             enc_feat3 = F.interpolate(enc_feat3, size=x.shape[2:], mode="bilinear", align_corners=False)
-        x = torch.cat([x, enc_feat3], dim=1)
-        x = self.dec_blocks[0](x)
+        x = torch.cat([x, enc_feat3], dim=1)  # (B, c0 + D_v, 2*H_p, 2*W_p)
+        x = self.dec_blocks[0](x)  # (B, c0, 2*H_p, 2*W_p)
 
         # stage 2
-        x = self.upconvs[1](x)
+        x = self.upconvs[1](x)  # (B, c1, 4*H_p, 4*W_p)
         if x.shape[2:] != enc_feat2.shape[2:]:
             enc_feat2 = F.interpolate(enc_feat2, size=x.shape[2:], mode="bilinear", align_corners=False)
-        x = torch.cat([x, enc_feat2], dim=1)
-        x = self.dec_blocks[1](x)
+        x = torch.cat([x, enc_feat2], dim=1)  # (B, c1 + D_v, 4*H_p, 4*W_p)
+        x = self.dec_blocks[1](x)  # (B, c1, 4*H_p, 4*W_p)
 
         # stage 3
-        x = self.upconvs[2](x)
+        x = self.upconvs[2](x)  # (B, c2, 8*H_p, 8*W_p)
         if x.shape[2:] != enc_feat1.shape[2:]:
             enc_feat1 = F.interpolate(enc_feat1, size=x.shape[2:], mode="bilinear", align_corners=False)
-        x = torch.cat([x, enc_feat1], dim=1)
-        x = self.dec_blocks[2](x)
+        x = torch.cat([x, enc_feat1], dim=1)  # (B, c2 + D_v, 8*H_p, 8*W_p)
+        x = self.dec_blocks[2](x)  # (B, c2, 8*H_p, 8*W_p)
 
         # stage 4 (no skip)
-        x = self.upconvs[3](x)
-        x = self.dec_blocks[3](x)
+        x = self.upconvs[3](x)  # (B, c3, 16*H_p, 16*W_p)
+        x = self.dec_blocks[3](x)  # (B, c3, 16*H_p, 16*W_p)
 
-        return self.final_conv(x)
+        return self.final_conv(x)  # (B, out_channels, 16*H_p, 16*W_p)

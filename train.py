@@ -11,7 +11,7 @@ from torch import nn
 from torch.utils.data import DistributedSampler
 from tqdm.auto import tqdm
 from dataset import VizWizGroundingDataset, make_loader
-from utils import to_device, read_checkpoint, load_model_weights, initialize_weights
+from utils import to_device, read_checkpoint, load_model_weights, initialize_weights, is_tiny_state
 from models.model import GroundingModel
 from losses import SupervisedObjective, DistillationObjective
 from models.model import CompactGroundingModel, TeacherModel
@@ -20,14 +20,19 @@ from models.model import CompactGroundingModel, TeacherModel
 def load_teacher(path, device):
     saved = read_checkpoint(path)
     config, run = saved.get("experiment_config") or {}, saved["run_config"]
-    if (config and config.get("experiment") != "controls") or (run and (run.get("text_mode") != "dropout" or not 0 < run.get("answer_dropout", 0) < 1)):
+    state = saved["model_state_dict"]
+    if (
+        (config and config.get("experiment") != "controls")
+        or (run and (run.get("text_mode") != "dropout" or not 0 < run.get("answer_dropout", 0) < 1))
+        or any(k.startswith("coarse.") for k in state)
+    ):
         raise ValueError("Teacher must be a corrected model trained with answer dropout")
     if run.get("image_size", IMAGE_SIZE) != IMAGE_SIZE:
         raise ValueError("Teacher/student image sizes must match")
-    teacher_type = CompactGroundingModel if config.get("architecture") == "compact" else TeacherModel
-    teacher = teacher_type(tiny=config.get("tiny", False)).to(device)
+    tiny = config.get("tiny", run.get("tiny", is_tiny_state(state)))
+    teacher = TeacherModel(tiny=tiny)
     load_model_weights(teacher, saved)
-    return teacher
+    return teacher.to(device)
 
 
 IMAGE_SIZE = 336
@@ -59,7 +64,7 @@ def training_parser(teacher_training=False):
     parser.add_argument("--resume-checkpoint", help="Resume a full checkpoint; raw weights use --init-checkpoint")
     parser.add_argument("--init-checkpoint", help="Optional compact control weights; starts a new run")
     if not teacher_training:
-        parser.add_argument("--teacher-checkpoint", required=True, help="Answer-dropout teacher from train_teacher.py")
+        parser.add_argument("--teacher-checkpoint", default=None, help="Optional external teacher; omit for single-stage self-distillation")
     return parser
 
 
@@ -115,11 +120,12 @@ def _train(args, rank, world, distributed, device):
         dist.barrier()
     train_set = VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE,
                 text_mode="dropout" if args.teacher_training else "question")
-    model = (TeacherModel() if args.teacher_training else GroundingModel()).to(device)
+    model = TeacherModel() if args.teacher_training else GroundingModel()
     if getattr(args, "init_checkpoint", None):
-        initialize_weights(args.init_checkpoint,model)
-    objective = (SupervisedObjective() if args.teacher_training else
-                 DistillationObjective(load_teacher(args.teacher_checkpoint, device)))
+        initialize_weights(args.init_checkpoint, model)
+    model = model.to(device)
+    teacher = load_teacher(args.teacher_checkpoint, device) if getattr(args, "teacher_checkpoint", None) else None
+    objective = SupervisedObjective() if args.teacher_training else DistillationObjective(teacher)
     parameters = [p for p in model.parameters() if p.requires_grad]
     if not parameters:
         raise ValueError("No trainable parameters")
@@ -139,6 +145,7 @@ def _train(args, rank, world, distributed, device):
         if checkpoint.get("scaler_state_dict"):
             scaler.load_state_dict(checkpoint["scaler_state_dict"])
         start = checkpoint["epoch"]
+        del checkpoint
         if start >= args.num_epochs:
             raise ValueError("num-epochs must exceed the resumed epoch")
     if distributed:
@@ -166,7 +173,7 @@ def _train(args, rank, world, distributed, device):
         if sampler:
             sampler.set_epoch(epoch)
         model.train()
-        totals = torch.zeros(2,device=device,dtype=torch.float64)
+        totals = torch.zeros(2,device=device,dtype=torch.float64)  # (2,): [weighted_loss_sum, sample_count]
         component_sums = {}
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.num_epochs}",
                           unit="batch", disable=rank != 0, dynamic_ncols=True):
@@ -174,24 +181,28 @@ def _train(args, rank, world, distributed, device):
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device.type,enabled=device.type=="cuda"):
                 loss, components = objective(model,batch)
-            if not torch.isfinite(loss):
+            if device.type != "cuda" and not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite training loss")
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(parameters,1.)
             scaler.step(optimizer); scaler.update()
             n = len(batch["filename"])
-            totals += torch.tensor([loss.detach().item()*n,n],device=device)
+            totals[0] += loss.detach().to(torch.float64) * n
+            totals[1] += n
             for name,value in components.items():
-                component_sums[name] = component_sums.get(name,0.)+float(value.detach())*n
+                val64 = value.detach().to(device=device, dtype=torch.float64) * n
+                component_sums[name] = component_sums[name] + val64 if name in component_sums else val64
+        names = sorted(component_sums)
+        stats = torch.stack([totals[0], totals[1], *(component_sums[k] for k in names)])  # (2 + C,)
         if distributed:
-            dist.all_reduce(totals)
-        record = {"epoch":epoch+1,"train_loss":(totals[0]/totals[1]).item()}
-        for name in sorted(component_sums):
-            value = torch.tensor(component_sums[name],device=device,dtype=torch.float64)
-            if distributed:
-                dist.all_reduce(value)
-            record[name] = (value/totals[1]).item()
+            dist.all_reduce(stats)
+        if not torch.isfinite(stats[0]):
+            raise FloatingPointError("Nonfinite training loss")
+        values = (stats / stats[1]).tolist()
+        record = {"epoch":epoch+1,"train_loss":values[0]}
+        for name, val in zip(names, values[2:]):
+            record[name] = val
         if rank == 0:
             print(json.dumps(record),flush=True)
             with (out/"history.jsonl").open("a") as handle:

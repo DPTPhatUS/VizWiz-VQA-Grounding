@@ -11,11 +11,11 @@ from losses import per_image_iou
 
 def metric_samples(logits, batch):
     for i, name in enumerate(batch["filename"]):
-        truth = batch["original_mask"][i].unsqueeze(0).to(logits.device)
+        truth = batch["original_mask"][i].unsqueeze(0).to(logits.device, non_blocking=True)  # (1, 1, H_orig, W_orig)
         resized = F.interpolate(logits[i:i+1].float(), size=truth.shape[-2:],
-                                mode="bilinear", align_corners=False)
+                                mode="bilinear", align_corners=False)  # (1, 1, H_orig, W_orig)
         score = per_image_iou(resized, truth).item()
-        yield name, score, resized[0,0] > 0
+        yield name, score, resized[0,0] > 0  # (H_orig, W_orig)
 
 
 @torch.no_grad()

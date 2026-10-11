@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 from dataset import VizWizGroundingDataset, make_loader
 from models.model import GroundingModel, TeacherModel
-from utils import read_checkpoint, load_model_weights
+from utils import read_checkpoint, load_model_weights, is_tiny_state
 from metrics import evaluate
 
 
@@ -31,7 +31,7 @@ def eval_main(argv=None):
         or (bool(state) and not any(k.startswith("coarse.") for k in state))
     )
     model_type = TeacherModel if is_teacher else GroundingModel
-    model = model_type(tiny=config.get("tiny", False))
+    model = model_type(tiny=config.get("tiny", is_tiny_state(state)))
     load_model_weights(model, saved)
     device = torch.device(args.device); model.to(device)
     dataset = VizWizGroundingDataset(args.data_root,args.dataset,config.get("image_size", 336))
