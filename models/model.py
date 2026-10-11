@@ -49,18 +49,26 @@ class CompactGroundingModel(nn.Module):
         return self.image_encoder((image - self.image_mean) / self.image_std)  # 4 x (B, D_v, H_p, W_p)
 
     def infer_latent_answer(self, vision, question_vec):
+        B, _, H_p, W_p = vision.shape
         patches = vision.flatten(2).transpose(1, 2)  # (B, N, D_v), N = H_p * W_p
         visual_kv = self.visual_to_text(patches)  # (B, N, D_t)
         query = (question_vec.unsqueeze(1) + self.answer_query.to(question_vec.dtype)).to(visual_kv.dtype)  # (B, 1, D_t)
-        evidence, _ = self.answer_attn(query, visual_kv, visual_kv, need_weights=False)  # (B, 1, D_t)
+        evidence, attn_weights = self.answer_attn(
+            query, visual_kv, visual_kv, need_weights=True, average_attn_weights=True
+        )  # (B, 1, D_t), (B, 1, N)
         latent = self.answer_norm(question_vec.to(evidence.dtype) + evidence.squeeze(1))  # (B, D_t)
-        return latent + self.answer_mlp(latent)  # (B, D_t)
+        latent = latent + self.answer_mlp(latent)  # (B, D_t)
+        attn_map = attn_weights.view(B, 1, H_p, W_p)  # (B, 1, H_p, W_p)
+        return latent, attn_map
 
     def decode(self, features, texts, answer_vec=None, *, projected_skips=None, question_vec=None):
         s1, s2, s3, vision = features  # each (B, D_v, H_p, W_p)
         text = texts if hasattr(texts, "tokens") else self.text_encoder(texts)
         q = question_vec if question_vec is not None else masked_mean(text.tokens, text.valid_mask)  # (B, D_t)
-        latent = self.infer_latent_answer(vision, q) if answer_vec is None else answer_vec.to(text.tokens.dtype)  # (B, D_t)
+        if answer_vec is None:
+            latent, attn_map = self.infer_latent_answer(vision, q)  # (B, D_t), (B, 1, H_p, W_p)
+        else:
+            latent, attn_map = answer_vec.to(text.tokens.dtype), None  # (B, D_t), None
         ans_token = latent.to(text.tokens.dtype).unsqueeze(1)  # (B, 1, D_t)
         kv_tokens = torch.cat([text.tokens, ans_token], dim=1)  # (B, L + 1, D_t)
         ans_mask = torch.ones(ans_token.shape[:2], dtype=torch.bool, device=ans_token.device)  # (B, 1)
@@ -72,8 +80,8 @@ class CompactGroundingModel(nn.Module):
             key_padding_mask=~kv_mask, need_weights=False)  # (B, N, D_v)
         fused = query + self.residual_scale.to(query.dtype) * attended  # (B, N, D_v)
         fused = fused.transpose(1, 2).reshape_as(vision).contiguous()  # (B, D_v, H_p, W_p)
-        logits = self._decode_mask(fused, s3, s2, s1, q, latent, projected_skips=projected_skips)  # (B, 1, H_dec, W_dec)
-        return {"logits": logits, "latent_answer": latent, "question_vec": q.detach()}
+        logits = self._decode_mask(fused, s3, s2, s1, q, latent, projected_skips=projected_skips)  # (B, 1, 16*H_p, 16*W_p)
+        return {"logits": logits, "latent_answer": latent, "answer_attn": attn_map, "question_vec": q.detach()}
 
     def forward(self, batch):
         features = self.encode_image(batch["image"])  # 4 x (B, D_v, H_p, W_p)
@@ -98,10 +106,10 @@ class CompactGroundingModel(nn.Module):
                 with torch.no_grad():
                     question_logits = self.decode(
                         features, text, student["question_vec"], projected_skips=detached_skips, question_vec=student["question_vec"]
-                    )["logits"]  # (B, 1, H_dec, W_dec)
+                    )["logits"]  # (B, 1, 16*H_p, 16*W_p)
                 teacher_logits = self.decode(
                     features, text, target_answer, projected_skips=proj_skips, question_vec=q
-                )["logits"]  # (B, 1, H_dec, W_dec)
+                )["logits"]  # (B, 1, 16*H_p, 16*W_p)
                 student.update(
                     teacher_logits=teacher_logits,
                     question_logits=question_logits,
@@ -151,14 +159,20 @@ class CompactGroundingModel(nn.Module):
         img_tensor = to_tensor(pil_img).unsqueeze(0).to(device)  # (1, 3, H, W)
         batch = {"image": img_tensor, "text": [text], "question_text": [q_text]}
 
+        out = self.forward(batch)
         logits = torch.nn.functional.interpolate(
-            self.forward(batch)["logits"].float(),
+            out["logits"].float(),
             size=size,
             mode="bilinear",
             align_corners=False,
         )  # (1, 1, H, W)
         prob = torch.sigmoid(logits)  # (1, 1, H, W)
         pred_bin = (prob > threshold).float()  # (1, 1, H, W)
+        attn_out = None
+        if out.get("answer_attn") is not None:
+            attn_out = torch.nn.functional.interpolate(
+                out["answer_attn"].float(), size=size, mode="bilinear", align_corners=False
+            )[0, 0].cpu()  # (H, W)
 
         iou, gt_out = None, None
         if gt_mask is not None:
@@ -179,6 +193,7 @@ class CompactGroundingModel(nn.Module):
             "prob_map": prob[0, 0].cpu(),
             "pred_mask": pred_2d,
             "pred_pil": to_pil_image(pred_2d),
+            "answer_attn": attn_out,
             "gt_mask": gt_out,
             "iou": iou,
         }
