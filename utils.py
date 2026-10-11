@@ -3,7 +3,11 @@ import torch
 
 
 def to_device(batch, device):
-    return {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
+    return {key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value for key, value in batch.items()}
+
+
+def is_tiny_state(state):
+    return any(k.endswith("text_encoder.embedding.weight") for k in state)
 
 
 def read_checkpoint(path):
@@ -24,7 +28,7 @@ def load_model_weights(model, saved):
 
 
 def initialize_weights(path, model):
-    saved = read_checkpoint(path)
+    saved = path if isinstance(path, dict) else read_checkpoint(path)
     state = saved["model_state_dict"]
     target = model
     if hasattr(model, "coarse") and set(state) == set(model.coarse.state_dict()):

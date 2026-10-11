@@ -8,7 +8,7 @@ from losses import per_image_iou
 from models.image_encoder import ImageEncoder, TinyVision
 from models.text_encoder import TextEncoder
 from models.mask_decoder import CompactDecoder
-from utils import initialize_weights, read_checkpoint
+from utils import initialize_weights, is_tiny_state, read_checkpoint
 
 class CompactGroundingModel(nn.Module):
     architecture = "compact"
@@ -23,8 +23,8 @@ class CompactGroundingModel(nn.Module):
         self.cross_attn = nn.MultiheadAttention(self.visual_dim, 2 if tiny else 8, batch_first=True)
         self.residual_scale = nn.Parameter(torch.tensor(.01))
         self._init_decoder(tiny)
-        self.register_buffer("image_mean", torch.tensor([.48145466, .4578275, .40821073]).view(1,3,1,1))
-        self.register_buffer("image_std", torch.tensor([.26862954, .26130258, .27577711]).view(1,3,1,1))
+        self.register_buffer("image_mean", torch.tensor([.48145466, .4578275, .40821073]).view(1,3,1,1))  # (1, 3, 1, 1)
+        self.register_buffer("image_std", torch.tensor([.26862954, .26130258, .27577711]).view(1,3,1,1))  # (1, 3, 1, 1)
         self.experiment_config = {"experiment": "controls", "architecture": self.architecture, "tiny": tiny,
                                   "protocol": "normalized-masked-question-v1"}
 
@@ -35,19 +35,19 @@ class CompactGroundingModel(nn.Module):
         return self.decoder(fused, s3, s2, s1, text)
 
     def encode_image(self, image):
-        return self.image_encoder((image - self.image_mean) / self.image_std)
+        return self.image_encoder((image - self.image_mean) / self.image_std)  # 4 x (B, D_v, H_p, W_p)
 
     def decode(self, features, texts):
-        s1, s2, s3, vision = features
-        text = self.text_encoder(texts)
-        query = vision.flatten(2).transpose(1, 2)
-        projected = self.text_proj(text.tokens)
+        s1, s2, s3, vision = features  # each (B, D_v, H_p, W_p)
+        text = self.text_encoder(texts)  # tokens: (B, L, D_t), masks: (B, L)
+        query = vision.flatten(2).transpose(1, 2)  # (B, N, D_v), N = H_p * W_p
+        projected = self.text_proj(text.tokens)  # (B, L, D_v)
         query = query.to(projected.dtype)
         attended, _ = self.cross_attn(query, projected, projected,
-            key_padding_mask=~text.attention_mask, need_weights=False)
-        fused = query + self.residual_scale.to(query.dtype) * attended
-        fused = fused.transpose(1, 2).reshape_as(vision).contiguous()
-        logits = self._decode_mask(fused, s3, s2, s1, text)
+            key_padding_mask=~text.attention_mask, need_weights=False)  # (B, N, D_v)
+        fused = query + self.residual_scale.to(query.dtype) * attended  # (B, N, D_v)
+        fused = fused.transpose(1, 2).reshape_as(vision).contiguous()  # (B, D_v, H_p, W_p)
+        logits = self._decode_mask(fused, s3, s2, s1, text)  # (B, 1, 16*H_p, 16*W_p)
         return {"logits": logits}
 
     def forward(self, batch):
@@ -57,10 +57,12 @@ class CompactGroundingModel(nn.Module):
     def from_checkpoint(cls, checkpoint_path, device=None, **kwargs):
         device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         saved = read_checkpoint(checkpoint_path)
-        tiny = kwargs.pop("tiny", saved.get("run_config", {}).get("tiny", False))
-        model = cls(tiny=tiny, **kwargs).to(device)
-        initialize_weights(checkpoint_path, model)
-        return model.eval()
+        config, run = saved.get("experiment_config") or {}, saved["run_config"]
+        default_tiny = config.get("tiny", run.get("tiny", is_tiny_state(saved["model_state_dict"])))
+        tiny = kwargs.pop("tiny", default_tiny)
+        model = cls(tiny=tiny, **kwargs)
+        initialize_weights(saved, model)
+        return model.to(device).eval()
 
     @torch.no_grad()
     def predict(
@@ -79,7 +81,7 @@ class CompactGroundingModel(nn.Module):
 
         q = str(question or "").strip()
         a = str(answer or "").strip()
-        q_text = f"Q: {q}" if q else str(text or "").strip()
+        q_text = f"Q: {q}" if q else str(text or "").strip().split(" A: ", 1)[0]
         if text is None:
             text = f"{q_text} A: {a}" if a else q_text
         else:
@@ -92,12 +94,14 @@ class CompactGroundingModel(nn.Module):
             pil_img = ImageOps.exif_transpose(image).convert("RGB")
 
         pil_img = pil_img.resize(size, Image.Resampling.BICUBIC)
-        img_tensor = to_tensor(pil_img).unsqueeze(0).to(device)
+        img_tensor = to_tensor(pil_img).unsqueeze(0).to(device)  # (1, 3, H, W)
         batch = {"image": img_tensor, "text": [text], "question_text": [q_text]}
 
-        logits = self.forward(batch)["logits"].float()
-        prob = torch.sigmoid(logits)
-        pred_bin = (prob > threshold).float()
+        logits = torch.nn.functional.interpolate(
+            self.forward(batch)["logits"].float(), size=size, mode="bilinear", align_corners=False
+        )  # (1, 1, H, W)
+        prob = torch.sigmoid(logits)  # (1, 1, H, W)
+        pred_bin = (prob > threshold).float()  # (1, 1, H, W)
 
         iou, gt_out = None, None
         if gt_mask is not None:
@@ -107,11 +111,11 @@ class CompactGroundingModel(nn.Module):
             else:
                 gt_pil = gt_mask.convert("L")
             gt_pil = gt_pil.resize(size, Image.Resampling.NEAREST)
-            gt_4d = (to_tensor(gt_pil) > 0.5).float().unsqueeze(0).to(device)
+            gt_4d = (to_tensor(gt_pil) > 0.5).float().unsqueeze(0).to(device)  # (1, 1, H, W)
             iou = round(per_image_iou(logits, gt_4d).item(), 6)
-            gt_out = gt_4d[0, 0].cpu()
+            gt_out = gt_4d[0, 0].cpu()  # (H, W)
 
-        pred_2d = pred_bin[0, 0].cpu()
+        pred_2d = pred_bin[0, 0].cpu()  # (H, W)
         return {
             "text": text,
             "image_pil": pil_img,

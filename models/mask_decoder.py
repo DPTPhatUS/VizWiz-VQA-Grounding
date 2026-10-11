@@ -15,13 +15,13 @@ class SkipConditioner(nn.Module):
             nn.init.zeros_(head.bias)
 
     def forward(self, skips, text):
-        condition = F.gelu(self.reduction(masked_mean(text.tokens, text.valid_mask)))
+        condition = F.gelu(self.reduction(masked_mean(text.tokens, text.valid_mask)))  # (B, R)
         output = []
         for feature, head in zip(skips, self.affine):
-            gamma, beta = head(condition).chunk(2, dim=-1)
+            gamma, beta = head(condition).chunk(2, dim=-1)  # (B, W_c), (B, W_c)
             gamma = gamma.to(feature.dtype)
             beta = beta.to(feature.dtype)
-            output.append(feature * (1 + gamma[:, :, None, None]) + beta[:, :, None, None])
+            output.append(feature * (1 + gamma[:, :, None, None]) + beta[:, :, None, None])  # (B, W_c, H_p, W_p)
         return output
 
 
@@ -48,15 +48,16 @@ class CompactDecoder(nn.Module):
     def forward(self, bottleneck, skip3, skip2, skip1, text):
         features = [projection(feature) for projection, feature in zip(
             self.projections, [bottleneck, skip3, skip2, skip1]
-        )]
-        x = features[0]
-        skips = self.conditioner(features[1:], text)
+        )]  # 4 x (B, W_c, H_p, W_p)
+        x = features[0]  # (B, W_c, H_p, W_p)
+        skips = self.conditioner(features[1:], text)  # 3 x (B, W_c, H_p, W_p)
         for block, skip in zip(self.fusion, skips):
-            skip = F.interpolate(skip, size=x.shape[-2:], mode="bilinear", align_corners=False)
-            x = x + block(x + skip)
+            if skip.shape[-2:] != x.shape[-2:]:
+                skip = F.interpolate(skip, size=x.shape[-2:], mode="bilinear", align_corners=False)
+            x = x + block(x + skip)  # (B, W_c, H_p, W_p)
         for block in self.upsample:
-            x = block(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False))
-        return self.output(x)
+            x = block(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False))  # -> (B, 16, 16*H_p, 16*W_p)
+        return self.output(x)  # (B, 1, 16*H_p, 16*W_p)
 
 
 class UNetDecoder(nn.Module):

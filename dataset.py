@@ -31,7 +31,7 @@ class VizWizGroundingDataset(Dataset):
 
     @staticmethod
     def mask_tensor(mask, size):
-        return (to_tensor(mask.resize((size, size), Image.Resampling.NEAREST)) > 0.5).float()
+        return (to_tensor(mask.resize((size, size), Image.Resampling.NEAREST)) > 0.5).float()  # (1, H, W)
 
     def __getitem__(self, index):
         name = self.names[index]
@@ -48,15 +48,15 @@ class VizWizGroundingDataset(Dataset):
         answer_text = f"{question_text} A: {answer}" if answer else question_text
         use_answer = self.text_mode == "dropout" and random.random() >= self.answer_dropout
         result = {
-            "image": to_tensor(image.resize((self.image_size, self.image_size), Image.Resampling.BICUBIC)),
-            "mask": self.mask_tensor(mask, self.image_size),
+            "image": to_tensor(image.resize((self.image_size, self.image_size), Image.Resampling.BICUBIC)),  # (3, H, W)
+            "mask": self.mask_tensor(mask, self.image_size),  # (1, H, W)
             "text": answer_text if use_answer else question_text,
             "question_text": question_text, "answer_text": answer_text,
             "answer_available": bool(answer), "filename": name,
             "original_size": (image.height, image.width),
         }
         if self.split != "train":
-            result["original_mask"] = (to_tensor(mask) > .5).float()
+            result["original_mask"] = (to_tensor(mask) > .5).float()  # (1, H_orig, W_orig)
         return result
 
 
@@ -67,9 +67,9 @@ def collate_samples(samples):
         if key == "original_mask":
             result[key] = values
         elif isinstance(values[0], torch.Tensor):
-            result[key] = torch.stack(values)
+            result[key] = torch.stack(values)  # (B, ...)
         elif isinstance(values[0], bool):
-            result[key] = torch.tensor(values, dtype=torch.bool)
+            result[key] = torch.tensor(values, dtype=torch.bool)  # (B,)
         else:
             result[key] = values
     return result

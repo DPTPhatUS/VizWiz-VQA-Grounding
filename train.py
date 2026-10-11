@@ -11,7 +11,7 @@ from torch import nn
 from torch.utils.data import DistributedSampler
 from tqdm.auto import tqdm
 from dataset import VizWizGroundingDataset, make_loader
-from utils import to_device, read_checkpoint, load_model_weights, initialize_weights
+from utils import to_device, read_checkpoint, load_model_weights, initialize_weights, is_tiny_state
 from models.model import GroundingModel
 from losses import SupervisedObjective, DistillationObjective
 from models.model import CompactGroundingModel, TeacherModel
@@ -25,9 +25,10 @@ def load_teacher(path, device):
     if run.get("image_size", IMAGE_SIZE) != IMAGE_SIZE:
         raise ValueError("Teacher/student image sizes must match")
     teacher_type = CompactGroundingModel if config.get("architecture") == "compact" else TeacherModel
-    teacher = teacher_type(tiny=config.get("tiny", False)).to(device)
+    tiny = config.get("tiny", run.get("tiny", is_tiny_state(saved["model_state_dict"])))
+    teacher = teacher_type(tiny=tiny)
     load_model_weights(teacher, saved)
-    return teacher
+    return teacher.to(device)
 
 
 IMAGE_SIZE = 336
@@ -139,6 +140,7 @@ def _train(args, rank, world, distributed, device):
         if checkpoint.get("scaler_state_dict"):
             scaler.load_state_dict(checkpoint["scaler_state_dict"])
         start = checkpoint["epoch"]
+        del checkpoint
         if start >= args.num_epochs:
             raise ValueError("num-epochs must exceed the resumed epoch")
     if distributed:
@@ -166,32 +168,37 @@ def _train(args, rank, world, distributed, device):
         if sampler:
             sampler.set_epoch(epoch)
         model.train()
-        totals = torch.zeros(2,device=device,dtype=torch.float64)
+        totals = torch.zeros(2,device=device,dtype=torch.float64)  # (2,) [weighted_loss_sum, sample_count]
         component_sums = {}
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.num_epochs}",
                           unit="batch", disable=rank != 0, dynamic_ncols=True):
             batch = to_device(batch,device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device.type,enabled=device.type=="cuda"):
-                loss, components = objective(model,batch)
-            if not torch.isfinite(loss):
+                loss, components = objective(model,batch)  # loss: ()
+            if device.type != "cuda" and not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite training loss")
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(parameters,1.)
             scaler.step(optimizer); scaler.update()
             n = len(batch["filename"])
-            totals += torch.tensor([loss.detach().item()*n,n],device=device)
+            totals[0] += loss.detach().to(torch.float64) * n
+            totals[1] += n
             for name,value in components.items():
-                component_sums[name] = component_sums.get(name,0.)+float(value.detach())*n
+                val = value.detach().to(device=device, dtype=torch.float64) * n  # ()
+                component_sums[name] = component_sums[name] + val if name in component_sums else val
+        names = sorted(component_sums)
+        stats = torch.cat([totals, torch.stack([component_sums[k] for k in names])]) if names else totals  # (2 + C,)
         if distributed:
-            dist.all_reduce(totals)
-        record = {"epoch":epoch+1,"train_loss":(totals[0]/totals[1]).item()}
-        for name in sorted(component_sums):
-            value = torch.tensor(component_sums[name],device=device,dtype=torch.float64)
-            if distributed:
-                dist.all_reduce(value)
-            record[name] = (value/totals[1]).item()
+            dist.all_reduce(stats)
+        if not torch.isfinite(stats[0]):
+            raise FloatingPointError("Nonfinite training loss")
+        stats_cpu = stats.tolist()
+        count = stats_cpu[1]
+        record = {"epoch":epoch+1,"train_loss":stats_cpu[0]/count}
+        for i, name in enumerate(names):
+            record[name] = stats_cpu[2 + i] / count
         if rank == 0:
             print(json.dumps(record),flush=True)
             with (out/"history.jsonl").open("a") as handle:
