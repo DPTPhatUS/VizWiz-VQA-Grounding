@@ -24,10 +24,11 @@ def eval_main(argv=None):
         raise ValueError("Invalid batch size or worker count")
     saved = read_checkpoint(args.checkpoint)
     config = saved["run_config"]
+    state = saved["model_state_dict"]
     is_teacher = (
         args.teacher
         or config.get("teacher_training", False)
-        or "skip_conditioner.reduction.weight" in saved["model_state_dict"]
+        or (bool(state) and not any(k.startswith("coarse.") for k in state))
     )
     model_type = TeacherModel if is_teacher else GroundingModel
     model = model_type(tiny=config.get("tiny", False))

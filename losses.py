@@ -30,28 +30,34 @@ def per_image_iou(logits, target):
 
 
 def balanced_weights(values, target):
-    """Each nonempty foreground/background region gets equal mass per sample."""
-    values = values.detach().float().clamp_min(0)
+    """Balance foreground/background focus while scaling each region by its effective gain."""
+    values = values.detach().float().clamp(0, 1)
     result = torch.zeros_like(values)
-    for region in (target > .5, target <= .5):
+    regions = (target > .5, target <= .5)
+    nonempty = sum(r.flatten(1).any(1).float() for r in regions).view(-1, 1, 1, 1).clamp_min(1)
+    for region in regions:
         masked = values * region
-        mass = masked.flatten(1).sum(1).view(-1,1,1,1)
-        result = result + masked / mass.clamp_min(1e-8)
-    mass = result.flatten(1).sum(1).view(-1,1,1,1)
-    return result / mass.clamp_min(1e-8)
+        mass = masked.flatten(1).sum(1).view(-1, 1, 1, 1)
+        dist = masked / mass.clamp_min(1e-8)
+        scale = (dist * masked).flatten(1).sum(1).view(-1, 1, 1, 1)
+        result = result + scale * dist
+    return result / nonempty
 
 
 def distillation_weights(answer_logits, question_logits, target):
-    """Positive answer-induced BCE reduction, weighted by teacher confidence."""
+    """Positive answer-induced BCE reduction on teacher-correct pixels, weighted by confidence."""
     with torch.no_grad():
         answer = resize_logits(answer_logits, target).float()
         question = resize_logits(question_logits, target).float()
+        truth = target > .5
+        correct = (answer > 0) == truth
         probability = answer.sigmoid()
         error = F.binary_cross_entropy_with_logits(answer, target.float(), reduction="none")
         question_error = F.binary_cross_entropy_with_logits(question, target.float(), reduction="none")
         entropy = F.binary_cross_entropy_with_logits(answer, probability, reduction="none")
         confidence = (1 - entropy / math.log(2)).clamp(0, 1)
-        values = (question_error - error).clamp_min(0) * confidence
+        gain = 1 - torch.exp(-(question_error - error).clamp_min(0))
+        values = gain * confidence * correct
         return balanced_weights(values, target)
 
 
@@ -73,7 +79,7 @@ class DistillationObjective:
             answer = resize_logits(answer, target).float()
             probability = answer.sigmoid()
             entropy = F.binary_cross_entropy_with_logits(answer, probability, reduction="none")
-            active = (weights.flatten(1).sum(1) > 0).float().mean()
+            active = weights.flatten(1).sum(1).mean()
         student = resize_logits(output["logits"], target).float()
         divergence = F.binary_cross_entropy_with_logits(student, probability, reduction="none") - entropy
         # Batch mean: no-answer/no-gain examples contribute zero KD.

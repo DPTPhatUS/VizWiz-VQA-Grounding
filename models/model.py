@@ -7,8 +7,8 @@ from torchvision.transforms.functional import to_pil_image, to_tensor
 from losses import per_image_iou
 from models.image_encoder import ImageEncoder, TinyVision
 from models.text_encoder import TextEncoder
-from models.mask_decoder import CompactDecoder, SkipConditioner, UNetDecoder
-from utils import load_model_weights, read_checkpoint
+from models.mask_decoder import CompactDecoder
+from utils import initialize_weights, read_checkpoint
 
 class CompactGroundingModel(nn.Module):
     architecture = "compact"
@@ -59,7 +59,7 @@ class CompactGroundingModel(nn.Module):
         saved = read_checkpoint(checkpoint_path)
         tiny = kwargs.pop("tiny", saved.get("run_config", {}).get("tiny", False))
         model = cls(tiny=tiny, **kwargs).to(device)
-        load_model_weights(model, saved)
+        initialize_weights(checkpoint_path, model)
         return model.eval()
 
     @torch.no_grad()
@@ -124,20 +124,7 @@ class CompactGroundingModel(nn.Module):
 
 
 class TeacherModel(CompactGroundingModel):
-    """Joint question/answer teacher with the original wide U-Net decoder."""
-    architecture = "joint"
-
-    def __init__(self, tiny=False):
-        if tiny:
-            raise ValueError("Tiny offline model supports compact architecture only")
-        super().__init__(tiny=False)
-
-    def _init_decoder(self, tiny):
-        self.decoder = UNetDecoder(self.visual_dim)
-        self.skip_conditioner = SkipConditioner(self.text_dim, self.visual_dim)
-
-    def _decode_mask(self, fused, s3, s2, s1, text):
-        return self.decoder(fused, *self.skip_conditioner([s3, s2, s1], text))
+    """Question/answer teacher using the compact decoder architecture."""
 
 
 EXPERIMENT = 'answer-value-distillation'
