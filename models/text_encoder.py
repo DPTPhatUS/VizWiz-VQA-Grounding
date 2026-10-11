@@ -22,6 +22,6 @@ class TextEncoder(nn.Module):
         outputs = self.model(**inputs)
         if return_mask:
             # True indicates padded token positions to be ignored by MultiheadAttention
-            key_padding_mask = ~inputs["attention_mask"].bool()
-            return outputs.last_hidden_state, key_padding_mask
-        return outputs.last_hidden_state  # (B, L, D)
+            key_padding_mask = ~inputs["attention_mask"].bool()  # (B, L)
+            return outputs.last_hidden_state, key_padding_mask  # (B, L, D_t), (B, L)
+        return outputs.last_hidden_state  # (B, L, D_t)

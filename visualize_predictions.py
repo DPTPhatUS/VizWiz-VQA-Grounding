@@ -3,13 +3,12 @@ from PIL import Image, ImageOps
 import matplotlib.pyplot as plt
 import torchvision.transforms as T
 import os
-from models import TextEncoder, ImageEncoder, GroundingModel
+from dataset import CLIP_MEAN, CLIP_STD
+from models import GroundingModel
 
 # load model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = GroundingModel().to(device)
-model.load_state_dict(torch.load("outputs/cross_model_final_epoch100.pt", map_location=device))
-model.eval()
+model = GroundingModel.from_checkpoint("outputs/cross_model_final_epoch100.pt", device=device)
 
 # test data
 image_path = "data/vizwiz/test/VizWiz_test_00000006.jpg"
@@ -18,25 +17,31 @@ text_input = [f"Q: {question}"]
 
 # preprocess
 transform = T.Compose([
-    T.Resize((336, 336)),
-    T.ToTensor()
+    T.Resize((336, 336), interpolation=T.InterpolationMode.BICUBIC, antialias=True),
+    T.ToTensor(),
+    T.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
 ])
 
-image = transform(ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")).unsqueeze(0).to(device)
+with Image.open(image_path) as img:
+    orig_image = ImageOps.exif_transpose(img).convert("RGB")
+image = transform(orig_image).unsqueeze(0).to(device)  # (1, 3, H, W)
 
 # predict
 with torch.no_grad():
-    mask = model(image, text_input)
-    mask = torch.nn.functional.interpolate(mask, size=(336, 336), mode="bilinear")[0, 0].cpu()
+    logits = model(image, text_input)  # (1, 1, 16*H_p, 16*W_p)
+    logits = torch.nn.functional.interpolate(
+        logits.float(), size=(orig_image.height, orig_image.width), mode="bilinear", align_corners=False
+    )  # (1, 1, H_orig, W_orig)
+    mask = torch.sigmoid(logits)[0, 0].cpu()  # (H_orig, W_orig)
 
 # visualize and save
 plt.figure(figsize=(10, 5))
 plt.subplot(1, 2, 1)
-plt.imshow(ImageOps.exif_transpose(Image.open(image_path)))
+plt.imshow(orig_image)
 plt.title("Original Image")
 
 plt.subplot(1, 2, 2)
-plt.imshow(ImageOps.exif_transpose(Image.open(image_path)))
+plt.imshow(orig_image)
 plt.imshow(mask, alpha=0.5, cmap="jet", interpolation='bilinear')
 plt.title("Predicted Mask")
 

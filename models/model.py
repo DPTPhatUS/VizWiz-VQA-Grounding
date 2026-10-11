@@ -31,15 +31,15 @@ class GroundingModel(nn.Module):
         self.decoder = UNetDecoder(in_channels=self.hidden_dim)
 
     def forward(self, image, text):
-        enc_feat1, enc_feat2, enc_feat3, bottleneck = self.image_encoder(image)
+        enc_feat1, enc_feat2, enc_feat3, bottleneck = self.image_encoder(image)  # each (B, D_v, H_p, W_p)
         B, D, H, W = bottleneck.shape
-        img_tokens = bottleneck.flatten(2).permute(0, 2, 1)  # (B, N, D)
+        img_tokens = bottleneck.flatten(2).permute(0, 2, 1)  # (B, N, D_v), N = H_p * W_p
 
         text_tokens, key_padding_mask = self.text_encoder(
             text,
             return_mask=True,
-        )  # (B, L, D_text), (B, L)
-        text_tokens = self.text_proj(text_tokens)  # align to (B, L, D)
+        )  # (B, L, D_t), (B, L)
+        text_tokens = self.text_proj(text_tokens)  # (B, L, D_v)
         img_tokens = img_tokens.to(text_tokens.dtype)
 
         attn_output, _ = self.cross_attn(
@@ -48,21 +48,21 @@ class GroundingModel(nn.Module):
             value=text_tokens,
             key_padding_mask=key_padding_mask,
             need_weights=False,
-        )
-        fused = attn_output.view(B, H, W, D).permute(0, 3, 1, 2).contiguous()
+        )  # (B, N, D_v)
+        fused = attn_output.view(B, H, W, D).permute(0, 3, 1, 2).contiguous()  # (B, D_v, H_p, W_p)
 
-        output = self.decoder(fused, enc_feat3, enc_feat2, enc_feat1)
+        output = self.decoder(fused, enc_feat3, enc_feat2, enc_feat1)  # (B, 1, 16*H_p, 16*W_p)
         return output
 
     @classmethod
     def from_checkpoint(cls, checkpoint_path, device=None, **kwargs):
         device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        model = cls(**kwargs).to(device)
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        model = cls(**kwargs)
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
         state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
         model.load_state_dict(state_dict)
-        return model.eval()
+        return model.to(device).eval()
 
     @torch.no_grad()
     def predict(
@@ -77,6 +77,7 @@ class GroundingModel(nn.Module):
     ):
         self.eval()
         device = next(self.parameters()).device
+        size = (image_size, image_size) if isinstance(image_size, int) else tuple(image_size)
 
         if text is None:
             q, a = str(question or "").strip(), str(answer or "").strip()
@@ -88,12 +89,14 @@ class GroundingModel(nn.Module):
         else:
             pil_img = ImageOps.exif_transpose(image).convert("RGB")
 
-        pil_img = TF.resize(pil_img, image_size, interpolation=T.InterpolationMode.BICUBIC, antialias=True)
-        img_tensor = TF.normalize(TF.to_tensor(pil_img), mean=CLIP_MEAN, std=CLIP_STD).unsqueeze(0).to(device)
+        pil_img = TF.resize(pil_img, size, interpolation=T.InterpolationMode.BICUBIC, antialias=True)
+        img_tensor = TF.normalize(TF.to_tensor(pil_img), mean=CLIP_MEAN, std=CLIP_STD).unsqueeze(0).to(device)  # (1, 3, H, W)
 
-        logits = self.forward(img_tensor, [text])
-        prob = torch.sigmoid(logits)
-        pred_bin = (prob > threshold).float()
+        logits = torch.nn.functional.interpolate(
+            self.forward(img_tensor, [text]).float(), size=size, mode="bilinear", align_corners=False
+        )  # (1, 1, H, W)
+        prob = torch.sigmoid(logits)  # (1, 1, H, W)
+        pred_bin = (prob > threshold).float()  # (1, 1, H, W)
 
         iou, gt_out = None, None
         if gt_mask is not None:
@@ -102,12 +105,12 @@ class GroundingModel(nn.Module):
                     gt_pil = m.convert("L")
             else:
                 gt_pil = gt_mask.convert("L")
-            gt_pil = TF.resize(gt_pil, image_size, interpolation=T.InterpolationMode.NEAREST)
-            gt_4d = (TF.to_tensor(gt_pil) > 0.5).float().unsqueeze(0).to(device)
+            gt_pil = TF.resize(gt_pil, size, interpolation=T.InterpolationMode.NEAREST)
+            gt_4d = (TF.to_tensor(gt_pil) > 0.5).float().unsqueeze(0).to(device)  # (1, 1, H, W)
             iou = round(compute_iou(pred_bin, gt_4d, threshold=0.5), 6)
-            gt_out = gt_4d[0, 0].cpu()
+            gt_out = gt_4d[0, 0].cpu()  # (H, W)
 
-        pred_2d = pred_bin[0, 0].cpu()
+        pred_2d = pred_bin[0, 0].cpu()  # (H, W)
         return {
             "text": text,
             "image_pil": pil_img,

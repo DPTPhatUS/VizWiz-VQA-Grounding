@@ -21,14 +21,14 @@ class ImageEncoder(nn.Module):
         hidden_states = outputs.hidden_states
 
         # intermediate layers + final bottleneck
-        enc_feat1 = hidden_states[4]  # (B, seq, D)
-        enc_feat2 = hidden_states[7]
-        enc_feat3 = hidden_states[9]
-        bottleneck = outputs.last_hidden_state
+        enc_feat1 = hidden_states[4]  # (B, 1 + N, D_v), N = H_p * W_p = 576
+        enc_feat2 = hidden_states[7]  # (B, 1 + N, D_v)
+        enc_feat3 = hidden_states[9]  # (B, 1 + N, D_v)
+        bottleneck = outputs.last_hidden_state  # (B, 1 + N, D_v)
 
         def reshape_feat(feat):
             B, _, D = feat.shape
-            feat = feat[:, 1:, :]
+            feat = feat[:, 1:, :]  # (B, N, D_v) drop [CLS] token
             num_patches = feat.shape[1]
             grid_size = int(num_patches**0.5)
             if grid_size * grid_size != num_patches:
@@ -39,7 +39,7 @@ class ImageEncoder(nn.Module):
                 feat.view(B, grid_size, grid_size, D)
                 .permute(0, 3, 1, 2)
                 .contiguous()
-            )
+            )  # (B, D_v, H_p, W_p)
 
         return tuple(map(reshape_feat, [enc_feat1, enc_feat2, enc_feat3])) + (
             reshape_feat(bottleneck),

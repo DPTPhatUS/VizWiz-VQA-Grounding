@@ -75,43 +75,43 @@ class UNetDecoder(nn.Module):
 
     def forward(self, x, enc_feat3, enc_feat2, enc_feat1):
         # stage 1
-        x = self.upconvs[0](x)
+        x = self.upconvs[0](x)  # (B, 1024, 2*H_p, 2*W_p)
         if x.shape[2:] != enc_feat3.shape[2:]:
             enc_feat3 = F.interpolate(
                 enc_feat3,
                 size=x.shape[2:],
                 mode="bilinear",
                 align_corners=False,
-            )
-        x = torch.cat([x, enc_feat3], dim=1)
-        x = self.dec_blocks[0](x)
+            )  # (B, 1024, 2*H_p, 2*W_p)
+        x = torch.cat([x, enc_feat3], dim=1)  # (B, 2048, 2*H_p, 2*W_p)
+        x = self.dec_blocks[0](x)  # (B, 1024, 2*H_p, 2*W_p)
 
         # stage 2
-        x = self.upconvs[1](x)
+        x = self.upconvs[1](x)  # (B, 512, 4*H_p, 4*W_p)
         if x.shape[2:] != enc_feat2.shape[2:]:
             enc_feat2 = F.interpolate(
                 enc_feat2,
                 size=x.shape[2:],
                 mode="bilinear",
                 align_corners=False,
-            )
-        x = torch.cat([x, enc_feat2], dim=1)
-        x = self.dec_blocks[1](x)
+            )  # (B, 1024, 4*H_p, 4*W_p)
+        x = torch.cat([x, enc_feat2], dim=1)  # (B, 1536, 4*H_p, 4*W_p)
+        x = self.dec_blocks[1](x)  # (B, 512, 4*H_p, 4*W_p)
 
         # stage 3
-        x = self.upconvs[2](x)
+        x = self.upconvs[2](x)  # (B, 256, 8*H_p, 8*W_p)
         if x.shape[2:] != enc_feat1.shape[2:]:
             enc_feat1 = F.interpolate(
                 enc_feat1,
                 size=x.shape[2:],
                 mode="bilinear",
                 align_corners=False,
-            )
-        x = torch.cat([x, enc_feat1], dim=1)
-        x = self.dec_blocks[2](x)
+            )  # (B, 1024, 8*H_p, 8*W_p)
+        x = torch.cat([x, enc_feat1], dim=1)  # (B, 1280, 8*H_p, 8*W_p)
+        x = self.dec_blocks[2](x)  # (B, 256, 8*H_p, 8*W_p)
 
         # stage 4 (no skip)
-        x = self.upconvs[3](x)
-        x = self.dec_blocks[3](x)
+        x = self.upconvs[3](x)  # (B, 128, 16*H_p, 16*W_p)
+        x = self.dec_blocks[3](x)  # (B, 128, 16*H_p, 16*W_p)
 
-        return self.final_conv(x)
+        return self.final_conv(x)  # (B, 1, 16*H_p, 16*W_p)

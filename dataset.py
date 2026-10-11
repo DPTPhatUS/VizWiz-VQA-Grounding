@@ -90,8 +90,8 @@ class VizWizGroundingDataset(Dataset):
                 mask = TF.hflip(mask)
 
         # 6. Convert to tensor and apply CLIP normalization
-        image_tensor = self.normalize(TF.to_tensor(image))
-        mask_tensor = (TF.to_tensor(mask) > 0.5).float()
+        image_tensor = self.normalize(TF.to_tensor(image))  # (3, H, W)
+        mask_tensor = (TF.to_tensor(mask) > 0.5).float()  # (1, H, W)
 
         return {
             "image": image_tensor,

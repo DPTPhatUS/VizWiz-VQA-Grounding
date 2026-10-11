@@ -61,20 +61,24 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
 
     # --- Model ---
-    model = GroundingModel().to(device)
+    model = GroundingModel()
 
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
 
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"])
+        state_dict = {k.removeprefix("module."): v for k, v in checkpoint["model_state_dict"].items()}
+        model.load_state_dict(state_dict)
         print(f"Loaded checkpoint (epoch {checkpoint.get('epoch', '?')})")
     else:
-        model.load_state_dict(checkpoint)
+        state_dict = {k.removeprefix("module."): v for k, v in checkpoint.items()}
+        model.load_state_dict(state_dict)
         print("Loaded raw state dict")
-    model.eval()
+    del checkpoint
+    model = model.to(device).eval()
 
     # --- Inference ---
     per_sample_iou = {}
@@ -82,20 +86,20 @@ def main():
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    loop = tqdm(loader, desc=f"Eval ({args.dataset})")
+    loop = tqdm(loader, desc=f"Eval ({args.dataset})", dynamic_ncols=True)
     with torch.no_grad():
         for batch in loop:
-            images = batch["image"].to(device)
+            images = batch["image"].to(device, non_blocking=True)  # (B, 3, H, W)
             texts = batch["text"]
-            masks = batch["mask"]
+            masks = batch["mask"].to(device, non_blocking=True)  # (B, 1, H, W)
             filenames = batch["filename"]
 
-            pred = model(images, texts)
-            pred = F.interpolate(pred, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+            pred = model(images, texts)  # (B, 1, 16*H_p, 16*W_p)
+            pred = F.interpolate(pred.float(), size=masks.shape[-2:], mode="bilinear", align_corners=False)  # (B, 1, H, W)
 
             # Score and save the same mask using a probability threshold of 0.5.
-            pred_bin = (torch.sigmoid(pred) > 0.5).float()
-            iou_per_sample = compute_iou_per_sample(pred_bin, masks.to(device))
+            pred_bin = (torch.sigmoid(pred) > 0.5).float()  # (B, 1, H, W)
+            iou_per_sample = compute_iou_per_sample(pred_bin, masks)  # (B,)
             for fname, iou_val in zip(filenames, iou_per_sample.tolist()):
                 per_sample_iou[fname] = round(iou_val, 6)
 

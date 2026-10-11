@@ -167,21 +167,25 @@ def main():
     start_epoch = 0
 
     if args.resume_checkpoint is not None:
-        checkpoint = torch.load(args.resume_checkpoint, map_location="cpu")
+        checkpoint = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False)
         # Always load into the *unwrapped* model so state-dict keys match
         # regardless of DDP / SyncBN wrapping.
         underlying_model = model.module if is_dist else model
 
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            underlying_model.load_state_dict(checkpoint["model_state_dict"])
+            state_dict = {k.removeprefix("module."): v for k, v in checkpoint["model_state_dict"].items()}
+            underlying_model.load_state_dict(state_dict)
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            for group in optimizer.param_groups:
+                group["lr"] = args.lr
             if "scaler_state_dict" in checkpoint and checkpoint["scaler_state_dict"]:
                 scaler.load_state_dict(checkpoint["scaler_state_dict"])
             start_epoch = checkpoint.get("epoch", 0)
             if rank == 0:
                 print(f"✅ Resumed full training state from {args.resume_checkpoint} (epoch {start_epoch})")
         else:
-            underlying_model.load_state_dict(checkpoint)
+            state_dict = {k.removeprefix("module."): v for k, v in checkpoint.items()}
+            underlying_model.load_state_dict(state_dict)
             if rank == 0:
                 print(f"✅ Resumed model from {args.resume_checkpoint}")
             try:
@@ -208,106 +212,100 @@ def main():
     # ===================================================================
     #  Training loop
     # ===================================================================
-    for epoch in range(start_epoch, args.num_epochs):
-        # Shuffle partitions differently each epoch  (mandatory for DDP)
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
+    try:
+        for epoch in range(start_epoch, args.num_epochs):
+            # Shuffle partitions differently each epoch  (mandatory for DDP)
+            loader_generator.manual_seed(args.seed + epoch * world_size + rank)
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
 
-        # ---- Train ----
-        model.train()
-        train_loss_sum = 0.0
+            # ---- Train ----
+            model.train()
+            train_loss_sum = torch.zeros(1, device=device, dtype=torch.float64)  # (1,)
 
-        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} (Train)", disable=(rank != 0))
-        for batch in loop:
-            batch = to_device(batch, device)
-            images, masks, texts = batch["image"], batch["mask"], batch["text"]
+            loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} (Train)", disable=(rank != 0), dynamic_ncols=True)
+            for batch in loop:
+                batch = to_device(batch, device)
+                images, masks, texts = batch["image"], batch["mask"], batch["text"]  # (B, 3, H, W), (B, 1, H, W), list[str]
 
-            with autocast(device.type, enabled=use_amp):
-                pred = model(images, texts)
-                pred = nn.functional.interpolate(
-                    pred, size=masks.shape[-2:], mode="bilinear", align_corners=False
-                )
-                loss = loss_fn(pred, masks)
+                optimizer.zero_grad(set_to_none=True)
+                with autocast(device.type, enabled=use_amp):
+                    pred = model(images, texts)  # (B, 1, 16*H_p, 16*W_p)
+                    pred = nn.functional.interpolate(
+                        pred, size=masks.shape[-2:], mode="bilinear", align_corners=False
+                    )  # (B, 1, H, W)
+                    loss = loss_fn(pred, masks)  # ()
 
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
-            train_loss_sum += loss.item()
-            if rank == 0:
-                loop.set_postfix(loss=f"{loss.item():.4f}")
+                train_loss_sum += loss.detach().to(torch.float64)
 
-        avg_train_loss = train_loss_sum / len(train_loader)
-
-        # Reduce train loss across all ranks  (same value everywhere after this)
-        if is_dist:
-            t = torch.tensor([avg_train_loss], device=device)
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            avg_train_loss = t.item() / world_size
-
-        if rank == 0:
-            print(f"[Epoch {epoch+1}] Average Training Loss: {avg_train_loss:.4f}")
-            log_file.write(f"train epoch={epoch+1} loss={avg_train_loss:.6f}\n")
-            log_file.flush()
-
-        # ---- Validation ----
-        if args.validate_every > 0 and (epoch + 1) % args.validate_every == 0:
-            model.eval()
-            val_loss_sum = 0.0
-
-            loop = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} (Val)", disable=(rank != 0))
-            with torch.no_grad():
-                for batch in loop:
-                    batch = to_device(batch, device)
-                    images, masks, texts = batch["image"], batch["mask"], batch["text"]
-
-                    with autocast(device.type, enabled=use_amp):
-                        pred = model(images, texts)
-                        pred = nn.functional.interpolate(
-                            pred, size=masks.shape[-2:], mode="bilinear", align_corners=False
-                        )
-                        loss = loss_fn(pred, masks)
-                    val_loss_sum += loss.item()
-                    if rank == 0:
-                        loop.set_postfix(loss=f"{loss.item():.4f}")
-
-            avg_val_loss = val_loss_sum / len(val_loader)
-
+            # Reduce train loss across all ranks once per epoch (avoids per-batch CPU-GPU syncs)
             if is_dist:
-                t = torch.tensor([avg_val_loss], device=device)
-                dist.all_reduce(t, op=dist.ReduceOp.SUM)
-                avg_val_loss = t.item() / world_size
+                dist.all_reduce(train_loss_sum, op=dist.ReduceOp.SUM)
+            avg_train_loss = (train_loss_sum / (len(train_loader) * world_size)).item()
 
             if rank == 0:
-                print(f"[Epoch {epoch+1}] Average Validation Loss: {avg_val_loss:.4f}")
-                log_file.write(f"val epoch={epoch+1} loss={avg_val_loss:.6f}\n")
+                print(f"[Epoch {epoch+1}] Average Training Loss: {avg_train_loss:.4f}")
+                log_file.write(f"train epoch={epoch+1} loss={avg_train_loss:.6f}\n")
                 log_file.flush()
 
-        # ---- Checkpoint (rank 0 only) ----
-        if rank == 0 and args.save_every > 0 and (epoch + 1) % args.save_every == 0:
-            ckpt_path = os.path.join(args.output_dir, f"checkpoint_epoch{epoch+1}.pt")
+            # ---- Validation ----
+            if args.validate_every > 0 and (epoch + 1) % args.validate_every == 0:
+                model.eval()
+                val_loss_sum = torch.zeros(1, device=device, dtype=torch.float64)  # (1,)
+
+                loop = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} (Val)", disable=(rank != 0), dynamic_ncols=True)
+                with torch.no_grad():
+                    for batch in loop:
+                        batch = to_device(batch, device)
+                        images, masks, texts = batch["image"], batch["mask"], batch["text"]  # (B, 3, H, W), (B, 1, H, W), list[str]
+
+                        with autocast(device.type, enabled=use_amp):
+                            pred = model(images, texts)  # (B, 1, 16*H_p, 16*W_p)
+                            pred = nn.functional.interpolate(
+                                pred, size=masks.shape[-2:], mode="bilinear", align_corners=False
+                            )  # (B, 1, H, W)
+                            loss = loss_fn(pred, masks)  # ()
+                        val_loss_sum += loss.detach().to(torch.float64)
+
+                if is_dist:
+                    dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+                avg_val_loss = (val_loss_sum / (len(val_loader) * world_size)).item()
+
+                if rank == 0:
+                    print(f"[Epoch {epoch+1}] Average Validation Loss: {avg_val_loss:.4f}")
+                    log_file.write(f"val epoch={epoch+1} loss={avg_val_loss:.6f}\n")
+                    log_file.flush()
+
+            # ---- Checkpoint (rank 0 only) ----
+            if rank == 0 and args.save_every > 0 and (epoch + 1) % args.save_every == 0:
+                ckpt_path = os.path.join(args.output_dir, f"checkpoint_epoch{epoch+1}.pt")
+                underlying_model = model.module if is_dist else model
+                ckpt = {
+                    "epoch": epoch + 1,
+                    "model_state_dict": underlying_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                    "loss": avg_train_loss,
+                }
+                torch.save(ckpt, ckpt_path, _use_new_zipfile_serialization=False)
+                print(f"✅ Checkpoint saved at {ckpt_path}")
+
+        # ---- Final model (rank 0 only) ----
+        if rank == 0:
             underlying_model = model.module if is_dist else model
-            ckpt = {
-                "epoch": epoch + 1,
-                "model_state_dict": underlying_model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "loss": avg_train_loss,
-            }
-            torch.save(ckpt, ckpt_path, _use_new_zipfile_serialization=False)
-            print(f"✅ Checkpoint saved at {ckpt_path}")
-
-    # ---- Final model (rank 0 only) ----
-    if rank == 0:
-        underlying_model = model.module if is_dist else model
-        final_path = os.path.join(args.output_dir, f"model_final_epoch{args.num_epochs}.pt")
-        torch.save(underlying_model.state_dict(), final_path, _use_new_zipfile_serialization=False)
-        print(f"🔚 Final model saved → {final_path}")
-        log_file.close()
-        print(f"📝 Training log saved → {log_path}")
-
-    cleanup_distributed()
+            final_path = os.path.join(args.output_dir, f"model_final_epoch{args.num_epochs}.pt")
+            torch.save(underlying_model.state_dict(), final_path, _use_new_zipfile_serialization=False)
+            print(f"🔚 Final model saved → {final_path}")
+    finally:
+        if log_file is not None:
+            log_file.close()
+            if rank == 0:
+                print(f"📝 Training log saved → {log_path}")
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
