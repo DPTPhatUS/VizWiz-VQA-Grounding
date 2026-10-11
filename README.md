@@ -1,12 +1,12 @@
-# Answer-value distillation
+# Latent-answer distillation
 
-This branch trains a compact question-only student using a frozen joint-skip teacher. The teacher is trained with 50% answer dropout. Student distillation uses positive answer-induced teacher improvement, with fixed weight 1; the teacher is unnecessary at inference.
+This branch trains a compact question-only student with a learnable **latent answer query** and **disentangled Q/A skip gating** using single-stage self-distillation (or an optional frozen teacher via `--teacher-checkpoint`). During training, the privileged `Q + A` branch supervises both the latent answer representation (via cosine + MSE alignment) and the spatial mask predictions (via answer-value gain-weighted KL distillation); at inference, only the question and image are needed.
 
 The experiment uses the existing `train.py`, `eval.py`, `dataset.py`, and `models/` layout. CLIP input is fixed at 336 pixels; architecture and loss settings are defined in code.
 
 ## Kaggle
 
-Clone branch `exp/answer-value-distillation`. Enable a GPU and Internet for CLIP downloads. Use Kaggle's installed Torch/Torchvision and install missing dependencies:
+Clone branch `exp/latent-answer-distillation`. Enable a GPU and Internet for CLIP downloads. Use Kaggle's installed Torch/Torchvision and install missing dependencies:
 
 ```bash
 pip install transformers tqdm pillow
@@ -20,13 +20,10 @@ Run in a `%%bash` cell, replacing the dataset path:
 set -e
 cd /kaggle/working/VizWiz-VQA-Grounding
 DATA_ROOT=/kaggle/input/YOUR_DATASET/vizwiz
-# Train this experiment's teacher first.
-python train_teacher.py --data-root "$DATA_ROOT" --num-epochs 100 --batch-size 1 --num-workers 2 --seed 42 --output-dir /kaggle/working/teacher
+# Single-stage self-distillation (no separate teacher training required; optional --teacher-checkpoint or --init-checkpoint supported).
+python train.py --data-root "$DATA_ROOT" --num-epochs 100 --batch-size 4 --num-workers 4 --seed 42 --output-dir /kaggle/working/outputs
 
-# Train the student. Optional --init-checkpoint may point to a compact-control checkpoint.
-python train.py --data-root "$DATA_ROOT" --teacher-checkpoint /kaggle/working/teacher/model_final_epoch100.pt --num-epochs 100 --batch-size 1 --num-workers 2 --seed 42 --output-dir /kaggle/working/outputs
-
-python eval.py --data-root "$DATA_ROOT" --checkpoint /kaggle/working/outputs/model_final_epoch100.pt --dataset test --batch-size 1 --num-workers 2 --output-dir /kaggle/working/results
+python eval.py --data-root "$DATA_ROOT" --checkpoint /kaggle/working/outputs/model_final_epoch100.pt --dataset test --batch-size 4 --num-workers 4 --output-dir /kaggle/working/results
 ```
 
 Training selects CUDA automatically and supports `torchrun`; batch size is global across GPUs. `--seed`, `--num-workers`, and the usual training/data/output controls are retained. Evaluation accepts an optional `--device`. Run either script with `--help` for its short argument list.
