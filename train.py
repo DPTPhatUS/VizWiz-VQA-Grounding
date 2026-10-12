@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from dataset import VizWizGroundingDataset
-from utils import to_device
+from utils import align_state_dict, to_device
 from models import GroundingModel
 
 
@@ -173,7 +173,7 @@ def main():
         underlying_model = model.module if is_dist else model
 
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            state_dict = {k.removeprefix("module."): v for k, v in checkpoint["model_state_dict"].items()}
+            state_dict = align_state_dict(checkpoint["model_state_dict"], underlying_model)
             underlying_model.load_state_dict(state_dict)
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             for group in optimizer.param_groups:
@@ -184,7 +184,7 @@ def main():
             if rank == 0:
                 print(f"✅ Resumed full training state from {args.resume_checkpoint} (epoch {start_epoch})")
         else:
-            state_dict = {k.removeprefix("module."): v for k, v in checkpoint.items()}
+            state_dict = align_state_dict(checkpoint, underlying_model)
             underlying_model.load_state_dict(state_dict)
             if rank == 0:
                 print(f"✅ Resumed model from {args.resume_checkpoint}")

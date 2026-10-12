@@ -9,6 +9,7 @@ from torchvision.transforms.functional import to_pil_image
 from dataset import CLIP_MEAN, CLIP_STD
 from metrics import compute_iou
 from models import ImageEncoder, TextEncoder, UNetDecoder
+from utils import align_state_dict
 
 
 class GroundingModel(nn.Module):
@@ -60,7 +61,7 @@ class GroundingModel(nn.Module):
         model = cls(**kwargs)
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
-        state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
+        state_dict = align_state_dict(state_dict, model)
         model.load_state_dict(state_dict)
         return model.to(device).eval()
 

@@ -18,6 +18,7 @@ from torchvision.transforms.functional import to_pil_image
 from dataset import VizWizGroundingDataset
 from models import GroundingModel
 from metrics import compute_iou_per_sample
+from utils import align_state_dict
 
 
 def main():
@@ -70,11 +71,11 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
 
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        state_dict = {k.removeprefix("module."): v for k, v in checkpoint["model_state_dict"].items()}
+        state_dict = align_state_dict(checkpoint["model_state_dict"], model)
         model.load_state_dict(state_dict)
         print(f"Loaded checkpoint (epoch {checkpoint.get('epoch', '?')})")
     else:
-        state_dict = {k.removeprefix("module."): v for k, v in checkpoint.items()}
+        state_dict = align_state_dict(checkpoint, model)
         model.load_state_dict(state_dict)
         print("Loaded raw state dict")
     del checkpoint
