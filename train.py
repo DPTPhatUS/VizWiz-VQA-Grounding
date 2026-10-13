@@ -60,7 +60,8 @@ def training_parser(teacher_training=False):
     parser.add_argument("--resume-checkpoint", help="Resume a full checkpoint; raw weights use --init-checkpoint")
     parser.add_argument("--init-checkpoint", help="Optional compact control weights; starts a new run")
     if not teacher_training:
-        parser.add_argument("--teacher-checkpoint", required=True, help="Answer-dropout teacher from train_teacher.py")
+        parser.add_argument("--teacher-checkpoint", help="Answer-dropout compact teacher from train_teacher.py")
+        parser.add_argument("--supervised-only", action="store_true", help="Train the same Q-only compact student with BCE only")
     return parser
 
 
@@ -73,6 +74,11 @@ def check_arguments(args):
         raise ValueError("Workers cannot be negative; learning rate must be positive")
     if args.resume_checkpoint and getattr(args, "init_checkpoint", None):
         raise ValueError("Use either resume or weight initialization, not both")
+    if not getattr(args, "teacher_training", False):
+        if not args.supervised_only and not args.teacher_checkpoint:
+            raise ValueError("Distillation requires --teacher-checkpoint; use --supervised-only for the compact control")
+        if args.supervised_only and args.teacher_checkpoint:
+            raise ValueError("A supervised-only control must not use a teacher checkpoint")
     for name in ('resume_checkpoint', 'init_checkpoint', 'teacher_checkpoint'):
         path = getattr(args, name, None)
         if path and not Path(path).is_file():
@@ -119,7 +125,7 @@ def _train(args, rank, world, distributed, device):
     model = (TeacherModel() if args.teacher_training else GroundingModel()).to(device)
     if getattr(args, "init_checkpoint", None):
         initialize_weights(args.init_checkpoint,model)
-    objective = (SupervisedObjective() if args.teacher_training else
+    objective = (SupervisedObjective() if args.teacher_training or getattr(args, "supervised_only", False) else
                  DistillationObjective(load_teacher(args.teacher_checkpoint, device)))
     parameters = [p for p in model.parameters() if p.requires_grad]
     if not parameters:

@@ -66,6 +66,19 @@ def distillation_weights(answer_logits, question_logits, target, *, probability=
         return balanced_weights(values, target)  # (B, 1, H, W)
 
 
+@torch.no_grad()
+def distillation_diagnostics(answer, question, target, weights):
+    qa_iou = per_image_iou(answer, target)
+    q_iou = per_image_iou(question, target)
+    return {
+        "mean_kd_weight_mass": weights.flatten(1).sum(1).mean(),
+        "kd_pixel_fraction": (weights > 0).float().flatten(1).mean(1).mean(),
+        "teacher_qa_iou": qa_iou.mean(),
+        "teacher_q_iou": q_iou.mean(),
+        "teacher_iou_gain": (qa_iou - q_iou).mean(),
+    }
+
+
 class DistillationObjective:
     def __init__(self, teacher):
         self.teacher = teacher.requires_grad_(False).eval()
@@ -84,12 +97,12 @@ class DistillationObjective:
             entropy = F.binary_cross_entropy_with_logits(answer, probability, reduction="none")  # (B, 1, H, W)
             weights = distillation_weights(answer, question, target, probability=probability, entropy=entropy)  # (B, 1, H, W)
             weights *= batch["answer_available"].to(weights).view(-1,1,1,1)  # (B, 1, 1, 1) -> (B, 1, H, W)
-            active = weights.flatten(1).sum(1).mean()  # ()
+            diagnostics = distillation_diagnostics(answer, question, target, weights)
         divergence = F.binary_cross_entropy_with_logits(student, probability, reduction="none") - entropy  # (B, 1, H, W)
         # Batch mean: no-answer/no-gain examples contribute zero KD.
         kd = (weights * divergence).flatten(1).sum(1).mean()  # ()
         return supervised + kd, {"segmentation": supervised.detach(),
-                "distillation": kd.detach(), "active_fraction": active}
+                "distillation": kd.detach(), **diagnostics}
 
 
 class SupervisedObjective:
