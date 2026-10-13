@@ -67,7 +67,7 @@ def training_parser():
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-every", type=int, default=10,
-                        help="Save a resumable checkpoint every N epochs; 0 disables periodic saves")
+                        help="Save a resumable checkpoint every N epochs; 0 disables all model saves")
     parser.add_argument("--resume-checkpoint", help="Resume a full checkpoint; raw weights use --init-checkpoint")
     parser.add_argument("--stage", choices=("refiner", "router"), default="refiner")
     parser.add_argument("--init-checkpoint", help="Compact controls checkpoint for refiner; refiner checkpoint for router")
@@ -208,10 +208,6 @@ def _train(args, rank, world, distributed, device):
                             "experiment_config": unwrap(model).experiment_config,
                             "run_config": run_config}, checkpoint_path, _use_new_zipfile_serialization=False)
                 print(f"Checkpoint saved: {checkpoint_path}", flush=True)
-    if rank == 0:
-        final_path = out / f"model_final_epoch{args.num_epochs}.pt"
-        torch.save(unwrap(model).state_dict(), final_path, _use_new_zipfile_serialization=False)
-        print(f"Final model saved: {final_path}", flush=True)
     if distributed:
         dist.barrier()
 
