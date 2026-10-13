@@ -11,4 +11,5 @@ models/__pycache__/
 !.omo/rules/**
 yolo*.pt
 docs/
-tests/
+tests/*
+!tests/test_baseline_protocol.py

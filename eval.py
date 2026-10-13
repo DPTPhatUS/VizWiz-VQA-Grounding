@@ -15,13 +15,13 @@ from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from torchvision.transforms.functional import to_pil_image
 
-from dataset import VizWizGroundingDataset
+from dataset import VizWizGroundingDataset, collate_eval_samples
 from models import GroundingModel
 from metrics import compute_iou_per_sample
 from utils import align_state_dict
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--dataset", type=str, default="val", choices=["val", "test"])
@@ -30,7 +30,13 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir", type=str, default=None)
-    args = parser.parse_args()
+    parser.add_argument("--text-mode", choices=["qa", "question"], default="qa")
+    parser.add_argument("--metric-resolution", choices=["original", "resized"], default="original",
+                        help="Native GT scoring (default); resized reproduces the legacy 336-pixel protocol")
+    args = parser.parse_args(argv)
+
+    if args.batch_size <= 0 or args.num_workers < 0:
+        parser.error("Batch size must be positive and worker count nonnegative")
 
     if not os.path.isfile(args.checkpoint):
         parser.error(f"Checkpoint is not a file: {args.checkpoint}")
@@ -55,6 +61,8 @@ def main():
         mask_root=mask_root,
         image_size=image_size,
         is_test=True,  # disable augmentation
+        text_mode=args.text_mode,
+        return_original_mask=args.metric_resolution == "original",
     )
     loader = DataLoader(
         dataset,
@@ -63,6 +71,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
         prefetch_factor=2 if args.num_workers > 0 else None,
+        collate_fn=collate_eval_samples,
     )
 
     # --- Model ---
@@ -96,18 +105,22 @@ def main():
             filenames = batch["filename"]
 
             pred = model(images, texts)  # (B, 1, 16*H_p, 16*W_p)
-            pred = F.interpolate(pred.float(), size=masks.shape[-2:], mode="bilinear", align_corners=False)  # (B, 1, H, W)
+            for i, fname in enumerate(filenames):
+                truth = (batch["original_mask"][i].unsqueeze(0).to(device)
+                         if args.metric_resolution == "original" else masks[i:i+1])
+                logits = F.interpolate(pred[i:i+1].float(), size=truth.shape[-2:],
+                                       mode="bilinear", align_corners=False)
+                prediction = (logits > 0).float()
+                score = compute_iou_per_sample(prediction, truth,
+                                               legacy=args.metric_resolution == "resized").item()
+                per_sample_iou[fname] = round(score, 6) if args.metric_resolution == "resized" else score
+                if args.output_dir:
+                    mask_path = os.path.join(args.output_dir, os.path.splitext(fname)[0] + ".png")
+                    os.makedirs(os.path.dirname(mask_path), exist_ok=True)
+                    to_pil_image(prediction[0, 0].cpu()).save(mask_path)
 
-            # Score and save the same mask using a probability threshold of 0.5.
-            pred_bin = (torch.sigmoid(pred) > 0.5).float()  # (B, 1, H, W)
-            iou_per_sample = compute_iou_per_sample(pred_bin, masks)  # (B,)
-            for fname, iou_val in zip(filenames, iou_per_sample.tolist()):
-                per_sample_iou[fname] = round(iou_val, 6)
-
-            if args.output_dir:
-                for i, fname in enumerate(filenames):
-                    mask_path = os.path.join(args.output_dir, fname.replace(".jpg", ".png"))
-                    to_pil_image(pred_bin[i, 0].cpu()).save(mask_path)
+    if not per_sample_iou:
+        raise ValueError("Evaluation dataset is empty")
 
     # --- Results JSON ---
     if args.output_dir:
@@ -117,6 +130,9 @@ def main():
         summary = {
             "checkpoint": args.checkpoint,
             "dataset": args.dataset,
+            "text_mode": args.text_mode,
+            "metric_resolution": args.metric_resolution,
+            "empty_union_score": 1.0 if args.metric_resolution == "original" else 0.0,
             "num_samples": len(per_sample_iou),
             "mean_iou": round(sum(iou_values) / len(iou_values), 6),
             "min_iou": round(min(iou_values), 6),

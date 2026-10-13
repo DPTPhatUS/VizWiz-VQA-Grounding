@@ -67,6 +67,8 @@ def main():
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--text-mode", choices=["qa", "question"], default="qa",
+                        help="QA baseline (default) or a separately trained question-only control")
     args = parser.parse_args()
 
     if args.resume_checkpoint is not None and not os.path.isfile(args.resume_checkpoint):
@@ -99,6 +101,7 @@ def main():
         image_root=os.path.join(args.data_root, "train"),
         mask_root=os.path.join(args.data_root, "binary_masks_png", "train"),
         image_size=image_size,
+        text_mode=args.text_mode,
     )
     val_set = VizWizGroundingDataset(
         json_path=os.path.join(args.data_root, "val_grounding.json"),
@@ -106,6 +109,7 @@ def main():
         mask_root=os.path.join(args.data_root, "binary_masks_png", "val"),
         image_size=image_size,
         is_test=True,  # validation must not use random training augmentation
+        text_mode=args.text_mode,
     )
 
     # --- Samplers & Loaders ---
