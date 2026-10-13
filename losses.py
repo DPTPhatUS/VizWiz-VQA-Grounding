@@ -78,27 +78,54 @@ def latent_answer_loss(latent, target, available=None):
     return loss.mean()  # ()
 
 
-def attention_guidance_loss(attn_map, weights, target, available=None):
-    """Guide latent-answer spatial cross-attention toward counterfactual answer-gain foreground patches."""
-    attn = attn_map.float().flatten(1).clamp_min(1e-6)  # (B, N), N = H_p * W_p
+def attention_target_distribution(weights, target, size, available=None, gain_mix=0.75):
+    """Mix separately normalized patch gain and foreground distributions; no gain falls back to foreground."""
+    if not 0 <= gain_mix <= 1:
+        raise ValueError("gain_mix must be in [0,1]")
     with torch.no_grad():
-        fg = (target > 0.5).float()  # (B, 1, H, W)
-        salience = weights.detach().float() * fg + 0.25 * fg  # (B, 1, H, W)
-        pooled = F.adaptive_avg_pool2d(salience, attn_map.shape[-2:]).flatten(1)  # (B, N)
-        mass = pooled.sum(dim=-1, keepdim=True)  # (B, 1)
-        valid = (mass.squeeze(-1) > 1e-6).float()  # (B,)
+        fg = (target > 0.5).float()
+        fg_pooled = F.adaptive_avg_pool2d(fg, size).flatten(1)
+        gain_pooled = F.adaptive_avg_pool2d(weights.detach().float() * fg, size).flatten(1)
+        fg_mass = fg_pooled.sum(-1, keepdim=True)
+        gain_mass = gain_pooled.sum(-1, keepdim=True)
+        prior = fg_pooled / fg_mass.clamp_min(1e-12)
+        gain = gain_pooled / gain_mass.clamp_min(1e-12)
+        mixed = gain_mix * gain + (1 - gain_mix) * prior
+        distribution = torch.where(gain_mass > 1e-12, mixed, prior)
+        valid = (fg_mass.squeeze(-1) > 0).float()
         if available is not None:
-            valid = valid * torch.as_tensor(available, dtype=valid.dtype, device=valid.device).view(-1)  # (B,)
-        target_dist = pooled / mass.clamp_min(1e-6)  # (B, N)
-    kl = (target_dist * (target_dist.clamp_min(1e-6).log() - attn.log())).sum(dim=-1)  # (B,)
-    return (kl * valid).mean()  # ()
+            valid *= torch.as_tensor(available, device=valid.device, dtype=valid.dtype).view(-1)
+        return distribution, valid
+
+
+def attention_guidance_loss(attn_map, weights, target, available=None, gain_mix=0.75):
+    attn = attn_map.float().flatten(1).clamp_min(1e-6)
+    target_dist, valid = attention_target_distribution(weights, target, attn_map.shape[-2:], available, gain_mix)
+    kl = (target_dist * (target_dist.clamp_min(1e-6).log() - attn.log())).sum(-1)
+    return (kl * valid).mean()
+
+
+@torch.no_grad()
+def distillation_diagnostics(answer, question, target, weights):
+    qa_iou = per_image_iou(answer, target)
+    q_iou = per_image_iou(question, target)
+    return {
+        "mean_kd_weight_mass": weights.flatten(1).sum(1).mean(),
+        "kd_pixel_fraction": (weights > 0).float().flatten(1).mean(1).mean(),
+        "teacher_qa_iou": qa_iou.mean(),
+        "teacher_q_iou": q_iou.mean(),
+        "teacher_iou_gain": (qa_iou - q_iou).mean(),
+        "attention_gain_image_fraction": ((weights * (target > .5)).flatten(1).sum(1) > 1e-12).float().mean(),
+    }
 
 
 class DistillationObjective:
-    def __init__(self, teacher=None, *, dice_weight=0.5, oracle_weight=0.5, latent_weight=0.5, attn_weight=0.2):
+    def __init__(self, teacher=None, *, dice_weight=0.5, oracle_weight=0.5, question_weight=0.5, latent_weight=0.5, attn_weight=0.2, gain_mix=0.75):
         self.teacher = teacher.requires_grad_(False).eval() if teacher is not None else None
         self.dice_weight = dice_weight
         self.oracle_weight = oracle_weight
+        self.question_weight = question_weight
+        self.gain_mix = gain_mix
         self.latent_weight = latent_weight
         self.attn_weight = attn_weight
 
@@ -116,10 +143,12 @@ class DistillationObjective:
                 question_logits = self.teacher.decode(features, batch["question_text"])["logits"]  # (B, 1, 16*H_p, 16*W_p)
                 del features
             oracle = torch.zeros_like(supervised)  # ()
+            question_supervised = torch.zeros_like(supervised)
         else:
             answer_logits = output["teacher_logits"]  # (B, 1, 16*H_p, 16*W_p)
             question_logits = output["question_logits"]  # (B, 1, 16*H_p, 16*W_p)
             oracle = segmentation_loss(answer_logits, target, self.dice_weight)  # ()
+            question_supervised = segmentation_loss(question_logits, target, self.dice_weight)
         with torch.no_grad():
             answer = resize_logits(answer_logits.detach(), target).float()  # (B, 1, H, W)
             question = resize_logits(question_logits.detach(), target).float()  # (B, 1, H, W)
@@ -129,7 +158,7 @@ class DistillationObjective:
             if "answer_available" in batch:
                 avail = torch.as_tensor(batch["answer_available"], dtype=weights.dtype, device=weights.device)
                 weights = weights * avail.view(-1, 1, 1, 1)  # (B, 1, 1, 1) -> (B, 1, H, W)
-            active = weights.flatten(1).sum(1).mean()  # ()
+            diagnostics = distillation_diagnostics(answer, question, target, weights)
         divergence = F.binary_cross_entropy_with_logits(student, probability, reduction="none") - entropy  # (B, 1, H, W)
         # Batch mean: no-answer/no-gain examples contribute zero KD.
         kd = (weights * divergence).flatten(1).sum(1).mean()  # ()
@@ -138,10 +167,11 @@ class DistillationObjective:
             latent = latent_answer_loss(output["latent_answer"], output["target_answer"], batch.get("answer_available"))
         attn_align = torch.zeros_like(supervised)  # ()
         if output.get("answer_attn") is not None:
-            attn_align = attention_guidance_loss(output["answer_attn"], weights, target, batch.get("answer_available"))
+            attn_align = attention_guidance_loss(output["answer_attn"], weights, target, batch.get("answer_available"), self.gain_mix)
         total = (
             supervised
             + self.oracle_weight * oracle
+            + self.question_weight * question_supervised
             + kd
             + self.latent_weight * latent
             + self.attn_weight * attn_align
@@ -149,10 +179,11 @@ class DistillationObjective:
         return total, {
             "segmentation": supervised.detach(),
             "oracle_segmentation": oracle.detach(),
+            "question_segmentation": question_supervised.detach(),
             "distillation": kd.detach(),
             "latent_alignment": latent.detach(),
             "attn_guidance": attn_align.detach(),
-            "active_fraction": active,
+            **diagnostics,
         }
 
 
@@ -160,6 +191,6 @@ class SupervisedObjective:
     def __init__(self, dice_weight=0.):
         self.dice_weight = dice_weight
     def __call__(self, model, batch):
-        output = model(batch)
+        output = model(dict(batch, self_distill=False, encode_answer_target=False))
         loss = segmentation_loss(output["logits"], batch["mask"], self.dice_weight)  # ()
         return loss, {"segmentation": loss.detach()}

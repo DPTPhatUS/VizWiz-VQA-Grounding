@@ -37,15 +37,15 @@ def read_checkpoint(path):
     return saved
 
 
-def load_model_weights(model, saved):
-    """Strictly load tensors, checking model identity when the file records it."""
+def load_model_weights(model, saved, *, allow_latent_initialization=False):
+    """Strict for inference/resume/teachers; only explicit student initialization may omit latent tensors."""
     config = saved.get("experiment_config")
     if config is not None and config != model.experiment_config:
         raise ValueError("Checkpoint configuration does not match model configuration")
     state = saved.get("model_state_dict", saved)
     target_keys = set(model.state_dict())
     missing = target_keys - set(state)
-    if set(state) < target_keys and missing in (LATENT_ANSWER_KEYS, COARSENED_LATENT_ANSWER_KEYS):
+    if allow_latent_initialization and set(state) < target_keys and missing in (LATENT_ANSWER_KEYS, COARSENED_LATENT_ANSWER_KEYS):
         model.load_state_dict(state, strict=False)
     else:
         model.load_state_dict(state, strict=True)
@@ -59,4 +59,4 @@ def initialize_weights(path, model):
         coarse_keys = set(model.coarse.state_dict())
         if set(state) == coarse_keys or (set(state) < coarse_keys and coarse_keys - set(state) == LATENT_ANSWER_KEYS):
             target = model.coarse
-    load_model_weights(target, saved)
+    load_model_weights(target, saved, allow_latent_initialization=True)

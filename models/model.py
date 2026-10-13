@@ -8,7 +8,7 @@ from losses import per_image_iou
 from models.image_encoder import ImageEncoder, TinyVision
 from models.text_encoder import TextEncoder, masked_mean
 from models.mask_decoder import CompactDecoder
-from utils import initialize_weights, is_tiny_state, read_checkpoint
+from utils import load_model_weights, is_tiny_state, read_checkpoint
 
 class CompactGroundingModel(nn.Module):
     architecture = "compact"
@@ -61,18 +61,28 @@ class CompactGroundingModel(nn.Module):
         attn_map = attn_weights.view(B, 1, H_p, W_p)  # (B, 1, H_p, W_p)
         return latent, attn_map
 
-    def decode(self, features, texts, answer_vec=None, *, projected_skips=None, question_vec=None):
+    def decode(self, features, texts, answer_vec=None, *, projected_skips=None, question_vec=None, question_only=False, answer_available=None):
         s1, s2, s3, vision = features  # each (B, D_v, H_p, W_p)
         text = texts if hasattr(texts, "tokens") else self.text_encoder(texts)
         q = question_vec if question_vec is not None else masked_mean(text.tokens, text.valid_mask)  # (B, D_t)
-        if answer_vec is None:
-            latent, attn_map = self.infer_latent_answer(vision, q)  # (B, D_t), (B, 1, H_p, W_p)
+        if question_only:
+            # A real Q-only counterfactual: no answer token and Q-only skip conditioning.
+            latent, attn_map = None, None
+            kv_tokens, kv_mask = text.tokens, text.attention_mask
         else:
-            latent, attn_map = answer_vec.to(text.tokens.dtype), None  # (B, D_t), None
-        ans_token = latent.to(text.tokens.dtype).unsqueeze(1)  # (B, 1, D_t)
-        kv_tokens = torch.cat([text.tokens, ans_token], dim=1)  # (B, L + 1, D_t)
-        ans_mask = torch.ones(ans_token.shape[:2], dtype=torch.bool, device=ans_token.device)  # (B, 1)
-        kv_mask = torch.cat([text.attention_mask, ans_mask], dim=1)  # (B, L + 1)
+            if answer_vec is None:
+                latent, attn_map = self.infer_latent_answer(vision, q)
+            else:
+                latent, attn_map = answer_vec.to(text.tokens.dtype), None
+            ans_token = latent.to(text.tokens.dtype).unsqueeze(1)
+            ans_mask = torch.ones(ans_token.shape[:2], dtype=torch.bool, device=ans_token.device)
+            if answer_available is not None:
+                ans_mask = torch.as_tensor(answer_available, device=ans_token.device, dtype=torch.bool).view(-1, 1)
+                # Missing-answer examples use the same Q-only skip condition as the reference.
+                latent = torch.where(ans_mask, latent, q.to(latent.dtype))
+                ans_token = torch.where(ans_mask.unsqueeze(-1), ans_token, torch.zeros_like(ans_token))
+            kv_tokens = torch.cat([text.tokens, ans_token], dim=1)
+            kv_mask = torch.cat([text.attention_mask, ans_mask], dim=1)
         query = vision.flatten(2).transpose(1, 2)  # (B, N, D_v)
         projected = self.text_proj(kv_tokens)  # (B, L + 1, D_v)
         query = query.to(projected.dtype)
@@ -88,7 +98,7 @@ class CompactGroundingModel(nn.Module):
         questions = batch.get("question_text", batch["text"])
         text = self.text_encoder(questions)
         q = masked_mean(text.tokens, text.valid_mask)  # (B, D_t)
-        has_answer = self.training and ("answer_only_text" in batch or "answer_text" in batch)
+        has_answer = self.training and batch.get("encode_answer_target", True) and ("answer_only_text" in batch or "answer_text" in batch)
         self_distill = has_answer and batch.get("self_distill", True)
         s1, s2, s3, _ = features
         proj_skips = self.decoder.project_skips(s3, s2, s1) if self_distill and hasattr(self.decoder, "project_skips") else None
@@ -102,14 +112,13 @@ class CompactGroundingModel(nn.Module):
                 target_answer = masked_mean(ans_feat.tokens, ans_feat.valid_mask)  # (B, D_t)
             student["target_answer"] = target_answer
             if self_distill:
-                detached_skips = [s.detach() for s in proj_skips] if proj_skips is not None else None
-                with torch.no_grad():
-                    question_logits = self.decode(
-                        features, text, student["question_vec"], projected_skips=detached_skips, question_vec=student["question_vec"]
-                    )["logits"]  # (B, 1, 16*H_p, 16*W_p)
+                question_logits = self.decode(
+                    features, text, projected_skips=proj_skips, question_vec=q, question_only=True
+                )["logits"]
                 teacher_logits = self.decode(
-                    features, text, target_answer, projected_skips=proj_skips, question_vec=q
-                )["logits"]  # (B, 1, 16*H_p, 16*W_p)
+                    features, text, target_answer, projected_skips=proj_skips, question_vec=q,
+                    answer_available=batch.get("answer_available")
+                )["logits"]
                 student.update(
                     teacher_logits=teacher_logits,
                     question_logits=question_logits,
@@ -123,7 +132,7 @@ class CompactGroundingModel(nn.Module):
         default_tiny = saved.get("run_config", {}).get("tiny", is_tiny_state(saved["model_state_dict"]))
         tiny = kwargs.pop("tiny", default_tiny)
         model = cls(tiny=tiny, **kwargs)
-        initialize_weights(saved, model)
+        load_model_weights(model, saved)
         return model.to(device).eval()
 
     @torch.no_grad()

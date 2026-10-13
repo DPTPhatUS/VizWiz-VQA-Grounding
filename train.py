@@ -11,7 +11,7 @@ from torch import nn
 from torch.utils.data import DistributedSampler
 from tqdm.auto import tqdm
 from dataset import VizWizGroundingDataset, make_loader
-from utils import to_device, read_checkpoint, load_model_weights, initialize_weights, is_tiny_state
+from utils import to_device, read_checkpoint, load_model_weights, initialize_weights, is_tiny_state, LATENT_ANSWER_KEYS
 from models.model import GroundingModel
 from losses import SupervisedObjective, DistillationObjective
 from models.model import CompactGroundingModel, TeacherModel
@@ -29,6 +29,8 @@ def load_teacher(path, device):
         raise ValueError("Teacher must be a corrected model trained with answer dropout")
     if run.get("image_size", IMAGE_SIZE) != IMAGE_SIZE:
         raise ValueError("Teacher/student image sizes must match")
+    if not LATENT_ANSWER_KEYS <= set(state):
+        raise ValueError("Frozen teacher lacks trained latent-answer tensors; compact checkpoints may only initialize a student via --init-checkpoint")
     tiny = config.get("tiny", run.get("tiny", is_tiny_state(state)))
     teacher = TeacherModel(tiny=tiny)
     load_model_weights(teacher, saved)
@@ -64,7 +66,8 @@ def training_parser(teacher_training=False):
     parser.add_argument("--resume-checkpoint", help="Resume a full checkpoint; raw weights use --init-checkpoint")
     parser.add_argument("--init-checkpoint", help="Optional compact control weights; starts a new run")
     if not teacher_training:
-        parser.add_argument("--teacher-checkpoint", default=None, help="Optional external teacher; omit for single-stage self-distillation")
+        parser.add_argument("--teacher-checkpoint", default=None, help="Optional fully trained latent-architecture teacher; omit for single-stage self-distillation")
+        parser.add_argument("--supervised-only", action="store_true", help="Matched latent student trained with BCE + 0.5 Dice only")
     return parser
 
 
@@ -77,6 +80,8 @@ def check_arguments(args):
         raise ValueError("Workers cannot be negative; learning rate must be positive")
     if args.resume_checkpoint and getattr(args, "init_checkpoint", None):
         raise ValueError("Use either resume or weight initialization, not both")
+    if getattr(args, "supervised_only", False) and getattr(args, "teacher_checkpoint", None):
+        raise ValueError("A supervised-only control must not use an external teacher")
     for name in ('resume_checkpoint', 'init_checkpoint', 'teacher_checkpoint'):
         path = getattr(args, name, None)
         if path and not Path(path).is_file():
@@ -113,6 +118,9 @@ def _train(args, rank, world, distributed, device):
     run_config = vars(args).copy()
     run_config.update(world_size=world, image_size=IMAGE_SIZE,
                       text_mode="dropout" if args.teacher_training else "question", answer_dropout=.5)
+    objective_version = ("supervised-teacher-v1" if args.teacher_training else
+                         "latent-supervised-v1" if args.supervised_only else "latent-gain-v2")
+    run_config["objective_version"] = objective_version
     out = Path(args.output_dir)
     if rank == 0:
         out.mkdir(parents=True, exist_ok=True)
@@ -125,7 +133,11 @@ def _train(args, rank, world, distributed, device):
         initialize_weights(args.init_checkpoint, model)
     model = model.to(device)
     teacher = load_teacher(args.teacher_checkpoint, device) if getattr(args, "teacher_checkpoint", None) else None
-    objective = SupervisedObjective() if args.teacher_training else DistillationObjective(teacher)
+    objective = (SupervisedObjective() if args.teacher_training else
+                 SupervisedObjective(dice_weight=.5) if args.supervised_only else DistillationObjective(teacher))
+    if isinstance(objective, DistillationObjective):
+        run_config["loss_config"] = {name: getattr(objective, name) for name in
+                                   ("dice_weight", "oracle_weight", "question_weight", "latent_weight", "attn_weight", "gain_mix")}
     parameters = [p for p in model.parameters() if p.requires_grad]
     if not parameters:
         raise ValueError("No trainable parameters")
@@ -200,7 +212,7 @@ def _train(args, rank, world, distributed, device):
         if not torch.isfinite(stats[0]):
             raise FloatingPointError("Nonfinite training loss")
         values = (stats / stats[1]).tolist()
-        record = {"epoch":epoch+1,"train_loss":values[0]}
+        record = {"epoch":epoch+1,"train_loss":values[0],"objective_version":objective_version}
         for name, val in zip(names, values[2:]):
             record[name] = val
         if rank == 0:
