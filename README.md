@@ -19,10 +19,10 @@ set -e
 cd /kaggle/working/VizWiz-VQA-Grounding
 DATA_ROOT=/kaggle/input/YOUR_DATASET/vizwiz
 python train.py --data-root "$DATA_ROOT" --num-epochs 100 --batch-size 1 --num-workers 2 --seed 42 --output-dir /kaggle/working/outputs-extent
-python eval.py --data-root "$DATA_ROOT" --checkpoint /kaggle/working/outputs-extent/model_final_epoch100.pt --dataset test --batch-size 1 --num-workers 2 --output-dir /kaggle/working/results-extent
+python eval.py --data-root "$DATA_ROOT" --checkpoint /kaggle/working/outputs-extent/checkpoint_epoch100.pt --dataset test --batch-size 1 --num-workers 2 --output-dir /kaggle/working/results-extent
 ```
 
-Training selects CUDA when available. `--init-checkpoint /path/to/compact/model_final_epoch100.pt` optionally initializes the coarse model from a compatible corrected compact checkpoint. It starts a fresh optimizer. Matching extent checkpoints can also initialize a run.
+Training selects CUDA when available. `--init-checkpoint /path/to/compact/checkpoint_epoch100.pt` optionally initializes the coarse model from a compatible corrected compact checkpoint. It starts a fresh optimizer. Matching extent checkpoints can also initialize a run.
 
 ## Optional paired questions
 
@@ -48,8 +48,8 @@ With a manifest, signed mask-difference and same-region consistency losses each 
 ## Single-image prediction
 
 ```bash
-python predict_save.py --checkpoint /path/to/model_final_epoch100.pt --image /path/to/image.jpg --question "What does it say?" --output mask.png
-python visualize_predictions.py --checkpoint /path/to/model_final_epoch100.pt --image /path/to/image.jpg --question "What does it say?" --output overlay.png
+python predict_save.py --checkpoint /path/to/checkpoint_epoch100.pt --image /path/to/image.jpg --question "What does it say?" --output mask.png
+python visualize_predictions.py --checkpoint /path/to/checkpoint_epoch100.pt --image /path/to/image.jpg --question "What does it say?" --output overlay.png
 ```
 
 `IoU.py` delegates to the same evaluator. `models/model.py` contains the extent model, the compact coarse model is in that same file, `dataset.py` the aligned data loader, and `losses.py` the objective. `docs/` and `tests/` remain ignored local development files.
@@ -58,11 +58,11 @@ python visualize_predictions.py --checkpoint /path/to/model_final_epoch100.pt --
 
 Training reads only the training split: no validation dataset is loaded and no validation runs, including after the final epoch. Paired question supervision is training-only.
 
-At completion, training saves exactly one raw `state_dict`: `model_final_epoch<N>.pt`, matching the baseline format. It contains model tensors only, with no optimizer, scaler, epoch wrapper, or RNG state. There are no automatic `last.pt` or `best.pt` saves, and `--validate-every` is removed. `--save-every` defaults to **10** and saves resumable `checkpoint_epoch10.pt`, `checkpoint_epoch20.pt`, etc., containing model, optimizer, scaler, and completed epoch. Use `--save-every 0` to disable these periodic checkpoints while still saving the final raw model.
+Training saves only periodic resumable checkpoints: `checkpoint_epoch10.pt`, `checkpoint_epoch20.pt`, etc. `--save-every` defaults to **10**. Each checkpoint contains model weights, optimizer/scaler state, completed epoch, and embedded run configuration, and uses legacy PyTorch serialization. There is no additional final raw-model export or automatic final checkpoint. If training ends between checkpoint intervals, the latest saved model is from the preceding interval; use `--save-every 1` to save every completed epoch. `--save-every 0` disables all model saving.
 
-Raw weights use this branch's default model settings. Resumable checkpoints retain their own `run_config` and `experiment_config`; no standalone configuration file is written or read. `history.jsonl` contains training losses only. Run `eval.py` separately with `--dataset val` or `--dataset test`; the commands above show the final weight filename for their epoch count.
+Existing raw weights remain loadable using this branch's default model settings. Resumable checkpoints retain their own `run_config` and `experiment_config`; no standalone configuration file is written or read. `history.jsonl` contains training losses only. Run `eval.py` separately with `--dataset val` or `--dataset test`; the commands above use the periodic checkpoint saved at their epoch count.
 
-To train further from these weights, use `--init-checkpoint /path/to/model_final_epoch<N>.pt`. This starts a new optimizer and epoch counter; `--num-epochs` is the number of additional epochs. To resume a periodic checkpoint, use `--resume-checkpoint /path/to/checkpoint_epoch10.pt` with its existing output directory or a fresh one; optimizer/scaler state and completed epoch are restored, and `--num-epochs` is the final total epoch count. Repeat the original batch size, seed, learning rate, and experiment-specific training arguments when continuing a run. Older supported full checkpoints remain loadable.
+To resume a periodic checkpoint, use `--resume-checkpoint /path/to/checkpoint_epoch10.pt` with its existing output directory or a fresh one; optimizer/scaler state and completed epoch are restored, and `--num-epochs` is the final total epoch count. To start a new run from checkpoint weights, use `--init-checkpoint /path/to/checkpoint_epoch<N>.pt`; this starts a fresh optimizer and epoch counter. Repeat the original batch size, seed, learning rate, and experiment-specific training arguments when continuing a run. Older supported full checkpoints remain loadable.
 
 Existing output directories are accepted for all training modes. Matching model filenames are overwritten; other model files remain. History is appended to `history.jsonl`, creating it if absent. To continue in a fresh Kaggle notebook, only the resumable checkpoint is needed to restore training state; no previous history or separate configuration file is required. The training dataset must still be available. To continue a paired run, repeat `--pairs` and provide the manifest and all masks it references.
 
@@ -72,10 +72,10 @@ Existing output directories are accepted for all training modes. Matching model 
 - `models/model.py`: the compact coarse model and the two-token location/extent model.
 - `models/image_encoder.py` and `models/text_encoder.py`: CLIP feature extraction.
 - `models/mask_decoder.py`: the decoder used by this experiment.
-- `train.py`: construct the model and dataset, run training, save checkpoints and final weights.
+- `train.py`: construct the model and dataset, run training, save periodic resumable checkpoints.
 - `eval.py`: construct the model, load weights, evaluate and export masks.
 - `utils.py`: batch transfer and a few plain weight-loading helpers.
 
-The separate backbone, experiment, and checkpoint modules and model factory are removed. Training still uses no validation, saves resumable checkpoints every 10 epochs by default, and writes final raw weights.
+The separate backbone, experiment, and checkpoint modules and model factory are removed. Training uses no validation and saves only resumable checkpoints every 10 epochs by default.
 
 Training shows a batch progress bar for each epoch (rank 0 under `torchrun`), and evaluation shows a batch progress bar. Install `tqdm` alongside Transformers and Pillow in the Kaggle notebook.
