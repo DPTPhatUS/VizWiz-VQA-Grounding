@@ -32,7 +32,7 @@ def predict_image(checkpoint,image_path,question,device,stage=None):
         image=ImageOps.exif_transpose(source).convert('RGB')
     question_text=f'Q: {question}'
     batch={'image':to_tensor(image.resize((config.get("image_size",336),config.get("image_size",336)),Image.Resampling.BICUBIC)).unsqueeze(0).to(device),
-           'text':[question_text],'question_text':[question_text],'filename':[Path(image_path).name]}
+           'question_text':[question_text]}
     batch['detail_image']=to_tensor(image.resize((config.get("detail_size",672),config.get("detail_size",672)),Image.Resampling.BICUBIC)).unsqueeze(0).to(device)
     logits=model(batch)['logits'].float()
     mask=F.interpolate(logits,size=(image.height,image.width),mode='bilinear',align_corners=False)[0,0]>0

@@ -39,7 +39,6 @@ class VizWizGroundingDataset(Dataset):
         question_text = f"Q: {question}"
         result = {
             "image": to_tensor(image.resize((self.image_size, self.image_size), Image.Resampling.BICUBIC)),
-            "text": question_text,
             "question_text": question_text, "filename": name,
         }
         if self.split != "train":
@@ -61,8 +60,6 @@ def collate_samples(samples):
             result[key] = values
         elif isinstance(values[0], torch.Tensor):
             result[key] = torch.stack(values)
-        elif isinstance(values[0], bool):
-            result[key] = torch.tensor(values, dtype=torch.bool)
         else:
             result[key] = values
     return result

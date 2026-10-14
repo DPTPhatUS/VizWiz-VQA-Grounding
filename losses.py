@@ -20,9 +20,3 @@ def per_image_iou(logits, target):
     intersection = (prediction & truth).sum(axes).float()
     union = (prediction | truth).sum(axes).float()
     return torch.where(union > 0, intersection / union.clamp_min(1), torch.ones_like(union))
-
-
-class RefinementObjective:
-    def __call__(self,model,batch):
-        output=model(batch,compute_loss=True)
-        return output['loss'],{'stage_loss':output['loss'].detach()}

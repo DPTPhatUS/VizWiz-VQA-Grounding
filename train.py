@@ -13,31 +13,24 @@ from tqdm.auto import tqdm
 from dataset import VizWizGroundingDataset, make_loader
 from utils import to_device, read_checkpoint, load_model_weights, initialize_weights
 from models.model import GroundingModel, EXPERIMENT
-from losses import RefinementObjective
 
 
-def validate_experiment_args(args):
-    args.detail_size = DETAIL_SIZE
-    args.crop_size = CROP_SIZE
-    if not (args.init_checkpoint or args.resume_checkpoint):
-        raise ValueError("A frozen reference requires --init-checkpoint or --resume-checkpoint")
-    if args.init_checkpoint:
-        saved = read_checkpoint(args.init_checkpoint)
-        config = saved.get("experiment_config") or {}
-        run = saved["run_config"]
-        if not config:
-            if args.stage == "router" and not any(key.startswith("refiner.") for key in saved["model_state_dict"]):
-                raise ValueError("Router initialization requires trained refiner weights")
-            return
-        if config.get("experiment") == EXPERIMENT:
-            allowed = ("refiner",) if args.stage == "refiner" else ("refiner", "router")
-            if run.get("stage") not in allowed:
-                raise ValueError("Refiner initialization requires refiner weights; router initialization requires refiner or router weights")
-        elif args.stage == "refiner" and config.get("experiment") == "controls" and config.get("architecture") == "compact":
-            if run.get("text_mode", "question") != "question":
-                raise ValueError("Refiner initialization requires question-only controls")
-        else:
-            raise ValueError("Refiner initialization requires compact controls or refiner weights; router initialization requires refiner or router weights")
+def validate_initialization(args, saved):
+    config = saved.get("experiment_config") or {}
+    run = saved["run_config"]
+    if not config:
+        if args.stage == "router" and not any(key.startswith("refiner.") for key in saved["model_state_dict"]):
+            raise ValueError("Router initialization requires trained refiner weights")
+        return
+    if config.get("experiment") == EXPERIMENT:
+        allowed = ("refiner",) if args.stage == "refiner" else ("refiner", "router")
+        if run.get("stage") not in allowed:
+            raise ValueError("Refiner initialization requires refiner weights; router initialization requires refiner or router weights")
+    elif args.stage == "refiner" and config.get("experiment") == "controls" and config.get("architecture") == "compact":
+        if run.get("text_mode", "question") != "question":
+            raise ValueError("Refiner initialization requires question-only controls")
+    else:
+        raise ValueError("Refiner initialization requires compact controls or refiner weights; router initialization requires refiner or router weights")
 
 
 IMAGE_SIZE = 336
@@ -75,19 +68,22 @@ def training_parser():
 
 
 def check_arguments(args):
+    args.detail_size = DETAIL_SIZE
+    args.crop_size = CROP_SIZE
+    if not (args.init_checkpoint or args.resume_checkpoint):
+        raise ValueError("A frozen reference requires --init-checkpoint or --resume-checkpoint")
     if min(args.num_epochs, args.batch_size) <= 0:
         raise ValueError("Epochs and batch size must be positive")
     if args.save_every < 0:
         raise ValueError("save-every cannot be negative")
     if args.num_workers < 0 or args.lr <= 0:
         raise ValueError("Workers cannot be negative; learning rate must be positive")
-    if args.resume_checkpoint and getattr(args, "init_checkpoint", None):
+    if args.resume_checkpoint and args.init_checkpoint:
         raise ValueError("Use either resume or weight initialization, not both")
     for name in ('resume_checkpoint', 'init_checkpoint'):
-        path = getattr(args, name, None)
+        path = getattr(args, name)
         if path and not Path(path).is_file():
             raise ValueError(f"{name} does not exist: {path}")
-    validate_experiment_args(args)
 
 
 def train_main(argv=None):
@@ -113,6 +109,9 @@ def train_main(argv=None):
 
 
 def _train(args, rank, world, distributed, device):
+    initialization = read_checkpoint(args.init_checkpoint) if args.init_checkpoint else None
+    if initialization is not None:
+        validate_initialization(args, initialization)
     seed_everything(args.seed)
     run_config = vars(args).copy()
     run_config.update(world_size=world, image_size=IMAGE_SIZE, text_mode="question")
@@ -123,9 +122,9 @@ def _train(args, rank, world, distributed, device):
         dist.barrier()
     train_set = VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE, DETAIL_SIZE)
     model = GroundingModel(stage=args.stage, crop_size=CROP_SIZE).to(device)
-    if getattr(args, "init_checkpoint", None):
-        initialize_weights(args.init_checkpoint,model)
-    objective = RefinementObjective()
+    if initialization is not None:
+        initialize_weights(initialization, model)
+    del initialization
     parameters = [p for p in model.parameters() if p.requires_grad]
     if not parameters:
         raise ValueError("No trainable parameters")
@@ -135,7 +134,7 @@ def _train(args, rank, world, distributed, device):
     if args.resume_checkpoint:
         checkpoint = read_checkpoint(args.resume_checkpoint)
         load_model_weights(model, checkpoint)
-        if checkpoint["run_config"].get("stage") != getattr(args, "stage", None):
+        if checkpoint["run_config"].get("stage") != args.stage:
             raise ValueError("Resume requires the same training stage; use --init-checkpoint to change stage")
         if "optimizer_state_dict" not in checkpoint:
             raise ValueError("Raw model weights have no optimizer state; use --init-checkpoint for a new run")
@@ -151,13 +150,12 @@ def _train(args, rank, world, distributed, device):
             raise ValueError("num-epochs must exceed the resumed epoch")
     if distributed:
         model = nn.parallel.DistributedDataParallel(model,
-            device_ids=[device.index] if device.type=="cuda" else None,
-            find_unused_parameters=True)
+            device_ids=[device.index] if device.type=="cuda" else None)
     sampler = DistributedSampler(train_set,num_replicas=world,rank=rank,seed=args.seed) if distributed else None
     generator = torch.Generator()
     train_loader = make_loader(train_set,args,args.batch_size//world,sampler,sampler is None,generator)
     run_config["experiment_config"] = unwrap(model).experiment_config
-    run_config["tiny"] = getattr(unwrap(model), "coarse", unwrap(model)).experiment_config.get("tiny", False)
+    run_config["tiny"] = unwrap(model).coarse.experiment_config["tiny"]
     if rank == 0:
         print(json.dumps({"parameters":sum(p.numel() for p in unwrap(model).parameters()),
                           "trainable":sum(p.numel() for p in parameters),"device":str(device),
@@ -175,13 +173,14 @@ def _train(args, rank, world, distributed, device):
             batch = to_device(batch,device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device.type,enabled=device.type=="cuda"):
-                loss, _ = objective(model,batch)
+                loss = model(batch, compute_loss=True)["loss"]
             if not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite training loss")
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(parameters,1.)
-            scaler.step(optimizer); scaler.update()
+            scaler.step(optimizer)
+            scaler.update()
             n = len(batch["filename"])
             totals[0].add_(loss.detach(),alpha=n)
             totals[1].add_(n)
