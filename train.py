@@ -148,6 +148,8 @@ def _train(args, rank, world, distributed, device):
         start = checkpoint["epoch"]
         if start >= args.num_epochs:
             raise ValueError("num-epochs must exceed the resumed epoch")
+        # Release the loaded CPU copies after restoring all training state.
+        del checkpoint
     if distributed:
         model = nn.parallel.DistributedDataParallel(model,
             device_ids=[device.index] if device.type=="cuda" else None)
