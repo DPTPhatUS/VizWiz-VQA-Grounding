@@ -122,7 +122,7 @@ class GroundingModel(nn.Module):
         self.coarse=coarse.requires_grad_(False)
         self.stage,self.crop_size,self.budget=stage,crop_size,budget
         self.policy='fixed' if stage=='refiner' else 'gain'
-        self.dice_weight,self.diversity_iou,self.skip_nonpositive=0.,.3,True
+        self.diversity_iou,self.skip_nonpositive=.3,True
         width=16 if coarse.experiment_config['tiny'] else 64
         context_dim=coarse.visual_dim+coarse.text_dim
         self.refiner=CropRefiner(context_dim,width)
@@ -187,7 +187,7 @@ class GroundingModel(nn.Module):
                 prediction=coarse_crop+F.interpolate(residual,size=coarse_crop.shape[-2:],
                                                      mode='bilinear',align_corners=False)
                 losses.append(segmentation_loss(prediction,
-                              crop(batch['detail_mask'][i:i+1],boxes[j]),self.dice_weight))
+                              crop(batch['detail_mask'][i:i+1],boxes[j])))
             return {'loss':torch.stack(losses).mean()}
         if self.stage=='refiner':
             scores=-torch.arange(len(boxes),device=coarse.device,dtype=coarse.dtype).expand(len(coarse),-1)

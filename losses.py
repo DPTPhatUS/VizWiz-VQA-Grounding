@@ -8,15 +8,9 @@ def resize_logits(logits, target):
     return F.interpolate(logits, size=target.shape[-2:], mode="bilinear", align_corners=False)
 
 
-def segmentation_loss(logits, target, dice_weight=0.0):
+def segmentation_loss(logits, target):
     logits = resize_logits(logits, target).float()
-    target = target.float()
-    bce = F.binary_cross_entropy_with_logits(logits, target)
-    probability = logits.sigmoid()
-    axes = tuple(range(1, target.ndim))
-    dice = 1 - (2*(probability*target).sum(axes)+1) / (
-        probability.sum(axes)+target.sum(axes)+1)
-    return bce + dice_weight*dice.mean()
+    return F.binary_cross_entropy_with_logits(logits, target.float())
 
 
 def per_image_iou(logits, target):

@@ -1,4 +1,4 @@
-"""Aligned question-only images and masks at coarse and crop resolutions."""
+"""Question-only images with detail training masks and original evaluation masks."""
 import json
 import random
 from pathlib import Path
@@ -39,15 +39,14 @@ class VizWizGroundingDataset(Dataset):
         question_text = f"Q: {question}"
         result = {
             "image": to_tensor(image.resize((self.image_size, self.image_size), Image.Resampling.BICUBIC)),
-            "mask": self.mask_tensor(mask, self.image_size),
             "text": question_text,
             "question_text": question_text, "filename": name,
-            "original_size": (image.height, image.width),
         }
         if self.split != "train":
             result["original_mask"] = (to_tensor(mask) > .5).float()
         if self.detail_size:
-            result["detail_mask"] = self.mask_tensor(mask, self.detail_size)
+            if self.split == "train":
+                result["detail_mask"] = self.mask_tensor(mask, self.detail_size)
             # Independent resize from the original image: never enlarge the CLIP input.
             result["detail_image"] = to_tensor(image.resize(
                 (self.detail_size, self.detail_size), Image.Resampling.BICUBIC))
