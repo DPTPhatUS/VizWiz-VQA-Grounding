@@ -43,7 +43,8 @@ class VizWizGroundingDataset(Dataset):
             else tuple(image_size)
         )
         self.entries = list(self.data.items())
-        self.normalize = T.Normalize(mean=CLIP_MEAN, std=CLIP_STD)
+        self.normalize = (T.Normalize(mean=CLIP_MEAN, std=CLIP_STD)
+                          if self.naflex_processor is None else None)
 
     def __len__(self):
         return len(self.entries)

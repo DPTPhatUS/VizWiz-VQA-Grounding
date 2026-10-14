@@ -13,8 +13,8 @@ from tqdm.auto import tqdm
 
 from dataset import VizWizGroundingDataset, collate_eval_samples
 from utils import align_state_dict, to_device, grounding_loss
-from models import GroundingModel, NaFlexGroundingModel, build_grounding_model, make_naflex_processor
-from models.naflex import BASE_NAFLEX, CLIP_BASELINE, VISION_MODELS
+from models import GroundingModel, build_grounding_model, make_naflex_processor
+from models.image_encoder import BASE_NAFLEX, CLIP_BASELINE, VISION_MODELS
 
 
 # ---------------------------------------------------------------------------
@@ -123,8 +123,8 @@ def main(argv=None):
                 parser.error("--max-num-patches applies only to NaFlex")
             model = GroundingModel()
         else:
-            model = NaFlexGroundingModel(vision_model=vision_model,
-                                        max_num_patches=args.max_num_patches or 512)
+            model = GroundingModel(vision_model=vision_model,
+                                   max_num_patches=args.max_num_patches or 512)
     model_config = getattr(model, "model_config", None)
     processor = make_naflex_processor(model_config) if model_config else None
     if rank == 0:

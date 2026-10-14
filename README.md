@@ -5,6 +5,27 @@ This experiment replaces the **vision encoder** with SigLIP 2 Base NaFlex.
 It retains CLIP text, image-to-text cross-attention, the one-channel U-Net,
 Adam and BCE. No F annotations, teacher or distillation.
 
+Both vision backends are implemented in `models/image_encoder.py`; one shared
+`GroundingModel` in `models/model.py` handles fusion, decoder and prediction.
+`models/text_encoder.py` remains the CLIP text encoder. The previous standalone
+`models/naflex.py` has been removed; checkpoint parameter keys/shapes and CLI
+options are preserved. NaFlex checkpoints from before this refactor still load.
+
+QA text is one sequence: `Q: <question> A: <answer>`, not two text encoders or
+two independently embedded streams. Question-only mode uses `Q: <question>`.
+
+## Image normalization
+
+NaFlex receives raw RGB PIL images. Its saved SigLIP processor resizes/patchifies,
+rescales pixels by `1/255` and normalizes with RGB mean/std `[0.5,0.5,0.5]`.
+This yields `(pixel/255 - 0.5)/0.5`; there is no preceding CLIP normalization or
+second rescale. Dataset, evaluation and single-image prediction use this same
+processor convention. Masks are binary labels and are never image-normalized.
+The retained CLIP path keeps mean `[0.48145466,0.4578275,0.40821073]` and std
+`[0.26862954,0.26130258,0.27577711]`. Restoring NaFlex preprocessing rejects
+CLIP statistics or disabled rescaling/normalization.
+[Official processor config](https://huggingface.co/google/siglip2-base-patch16-naflex/blob/main/preprocessor_config.json)
+
 ## Backbone choices
 
 | Vision checkpoint | Width / layers | Input variant |
@@ -136,7 +157,7 @@ metrics and metadata.
 uv run python -m unittest discover -s tests -v
 ```
 
-11 CPU/offline tests pass with the real NaFlex processor and tiny randomly
+12 CPU/offline tests pass with the real NaFlex processor and tiny randomly
 initialized vision/text models. They cover rectangular grids, mask alignment,
 padding invariance, gradients, equal-image loss, extraction from a full SigLIP
 checkpoint, checkpoint roundtrip, native prediction/export, train/eval/resume
