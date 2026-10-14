@@ -84,3 +84,75 @@ No model parameters were added, removed, or reshaped. Complete latent checkpoint
 Legacy compact checkpoints lacking the latent-answer/gating tensors are permitted only for explicit student `--init-checkpoint` initialization followed by training. Inference, resume, and frozen external-teacher loading require complete model tensors and reject such partial checkpoints. The optional external teacher must have the full latent architecture trained with answer dropout. The default self-distillation run does not need this teacher or a separate training stage.
 
 Run offline regression checks with `python -m unittest discover -s tests -p test_latent_distillation.py`. These cover gain-sensitive attention targets, Q-reference supervision, missing-answer masking, strict teacher loading, and old raw/full checkpoint inference and optimizer compatibility with tiny encoders. They do not establish real-data accuracy or GPU execution.
+
+## Paired latent-answer diagnostic (no retraining)
+
+`diagnose.py` evaluates the **whole validation split** using three views of the
+same checkpoint. It does not modify weights, architecture, training or eval.py:
+
+- `question`: remove the answer token and use Q-only skip conditioning.
+- `predicted_answer`: infer A′ from image/Q, matching ordinary student inference.
+- `oracle_answer`: encode the real answer separately, pool it into the answer
+  vector and pass it through the existing oracle path. This is not joint Q+A
+  tokenization, a separate teacher, or deployable Q/I inference.
+
+```bash
+uv run python diagnose.py \
+    --checkpoint outputs/checkpoint_epoch20.pt \
+    --data-root /kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz \
+    --dataset val \
+    --batch-size 4 \
+    --num-workers 2 \
+    --device cuda \
+    --top-k 8 \
+    --seed 42 \
+    --save-masks \
+    --output-dir outputs/diagnostic_latent_ep20
+```
+
+Use a single GPU process, not torchrun. Lower batch size if needed. The output
+directory must be empty; use a new name for each checkpoint/run. Raw final
+weights and full legacy latent checkpoints both work without retraining.
+Weights lacking latent/gating tensors are rejected rather than initialized.
+The saved objective version is reported when available; raw/older checkpoints
+are labelled unknown, not assumed to be corrected `latent-gain-v2` runs.
+
+Outputs:
+
+- `summary.json`: native mIoU, paired gains, helped/hurt counts, GT-area groups,
+  descriptive cosine correlations and protocol metadata.
+- `per_image.csv` / `per_image.json`: question/answer, three IoUs, paired
+  differences, cosine, Smooth L1, vector norms, GT fraction and aspect ratio.
+- `selected_cases.json`: highest A′ gains, worst A′ harms, largest oracle–A′
+  gaps, failures with nonempty GT under 1% of the image, high-alignment/low-IoU
+  cases (cosine >= 0.8 and IoU < 0.5), and a seeded random group. These thresholds
+  are descriptive review rules, not answer-correctness criteria.
+  `--top-k` is examples per group. Images may appear in several groups.
+- `gallery.html` + `cases/`: aggregate scores and image/GT/three-mask overlays
+  for selected cases. Download the entire output folder, then open the HTML.
+- `masks/{question,predicted_answer,oracle_answer}/`: all native binary PNG
+  masks when `--save-masks` is enabled. Omit the flag to export only review overlays.
+
+No manual image selection is needed for aggregate diagnostic results. To also
+review specific images, put filenames in a UTF-8 file, one per line, and add
+`--review-list filenames.txt`. This adds a gallery group; metrics still cover
+the whole split. Ranked examples explain individual failures, not their
+prevalence. The random group provides an additional less selective visual check.
+
+Missing-answer records have null oracle/alignment fields and no oracle PNG.
+Compare all three mIoUs on the **same answer-available subset**, which is shown
+separately from whole-split Q/A′ scores. Cosine is representation alignment,
+not answer accuracy; correlations are descriptive, not causal evidence.
+The Q-only view is a same-checkpoint counterfactual, not a separately trained
+Q-only baseline. An oracle can score worse than A′; it is not a mathematical
+upper bound. Use validation for diagnosis/model selection, not test tuning.
+
+All scoring resizes logits to native GT dimensions before thresholding at
+logit 0; empty unions score 1, matching eval.py. Gallery rendering preserves
+the scoring batch composition, and display thumbnails do not affect metrics.
+The diagnostic always uses FP32 inference, without AMP.
+
+Run `python -m unittest discover -s tests -p 'test_latent*.py' -v` for offline
+checks covering no real-answer leakage, prediction equivalence, checkpoint
+loading, missing answers, native mask sizes and CLI/gallery output. These are
+tiny-model CPU checks, not real-data diagnostic findings.
