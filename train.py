@@ -170,13 +170,12 @@ def _train(args, rank, world, distributed, device):
             sampler.set_epoch(epoch)
         model.train()
         totals = torch.zeros(2,device=device,dtype=torch.float64)
-        component_sums = {}
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.num_epochs}",
                           unit="batch", disable=rank != 0, dynamic_ncols=True):
             batch = to_device(batch,device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device.type,enabled=device.type=="cuda"):
-                loss, components = objective(model,batch)
+                loss, _ = objective(model,batch)
             if not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite training loss")
             scaler.scale(loss).backward()
@@ -184,18 +183,13 @@ def _train(args, rank, world, distributed, device):
             torch.nn.utils.clip_grad_norm_(parameters,1.)
             scaler.step(optimizer); scaler.update()
             n = len(batch["filename"])
-            totals += torch.tensor([loss.detach().item()*n,n],device=device)
-            for name,value in components.items():
-                component_sums[name] = component_sums.get(name,0.)+float(value.detach())*n
+            totals[0].add_(loss.detach(),alpha=n)
+            totals[1].add_(n)
         if distributed:
             dist.all_reduce(totals)
-        record = {"epoch":epoch+1,"train_loss":(totals[0]/totals[1]).item()}
-        for name in sorted(component_sums):
-            value = torch.tensor(component_sums[name],device=device,dtype=torch.float64)
-            if distributed:
-                dist.all_reduce(value)
-            record[name] = (value/totals[1]).item()
         if rank == 0:
+            epoch_loss = (totals[0]/totals[1]).item()
+            record = {"epoch":epoch+1,"train_loss":epoch_loss,"stage_loss":epoch_loss}
             print(json.dumps(record),flush=True)
             with (out/"history.jsonl").open("a") as handle:
                 handle.write(json.dumps(record)+"\n")
