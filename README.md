@@ -1,155 +1,140 @@
-# VizWiz VQA Grounding — SigLIP 2 NaFlex baseline
+# VizWiz VQA Grounding — fixed SigLIP 2 Base NaFlex
 
-Branch `exp/siglip2-naflex-baseline`, based on `exp/baseline-fixes` at `cb7f7c7`.
-This experiment replaces the **vision encoder** with SigLIP 2 Base NaFlex.
-It retains CLIP text, image-to-text cross-attention, the one-channel U-Net,
-Adam and BCE. No F annotations, teacher or distillation.
+Branch `exp/siglip2-naflex-baseline`, derived from `exp/baseline-fixes`.
+Vision is fixed to **`google/siglip2-base-patch16-naflex`** (768 channels,
+12 transformer layers). The separate `exp/siglip2-so400m-naflex-baseline`
+branch fixes vision to So400m (1152 channels, 27 layers).
+There is no vision-backbone switch in either branch.
 
-Both vision backends are implemented in `models/image_encoder.py`; one shared
-`GroundingModel` in `models/model.py` handles fusion, decoder and prediction.
-`models/text_encoder.py` remains the CLIP text encoder. The previous standalone
-`models/naflex.py` has been removed; checkpoint parameter keys/shapes and CLI
-options are preserved. NaFlex checkpoints from before this refactor still load.
+`models/image_encoder.py` owns the vision encoder and patch grids;
+`models/text_encoder.py` owns text; `models/model.py` owns cross-attention,
+decoder and prediction. Both branches retain the same three feature skips
+(hidden states 4/7/9), final-state fusion, decoder channels 1024/512/256/128,
+Adam and per-image BCE. These skips have the same spatial grid, not a spatial
+pyramid. No teacher, distillation or additional annotation is involved.
 
-QA text is one sequence: `Q: <question> A: <answer>`, not two text encoders or
-two independently embedded streams. Question-only mode uses `Q: <question>`.
+## Text and image inputs
 
-## Image normalization
+**CLIP text is the default**, using `openai/clip-vit-large-patch14-336`.
+`--text-encoder siglip2` instead selects the text tower from this branch's
+fixed SigLIP2 checkpoint. Its tokenizer uses fixed-length 64-token padding;
+CLIP uses dynamic padding with a 77-token limit. Projection into the fusion
+layer uses the actual text/vision widths. The unused SigLIP pooled text head
+is frozen; token features are used for grounding.
 
-NaFlex receives raw RGB PIL images. Its saved SigLIP processor resizes/patchifies,
-rescales pixels by `1/255` and normalizes with RGB mean/std `[0.5,0.5,0.5]`.
-This yields `(pixel/255 - 0.5)/0.5`; there is no preceding CLIP normalization or
-second rescale. Dataset, evaluation and single-image prediction use this same
-processor convention. Masks are binary labels and are never image-normalized.
-The retained CLIP path keeps mean `[0.48145466,0.4578275,0.40821073]` and std
-`[0.26862954,0.26130258,0.27577711]`. Restoring NaFlex preprocessing rejects
-CLIP statistics or disabled rescaling/normalization.
-[Official processor config](https://huggingface.co/google/siglip2-base-patch16-naflex/blob/main/preprocessor_config.json)
+`--text-mode qa` merges question and answer into one sequence:
+`Q: <question> A: <answer>`. `--text-mode question` trains a separate Q-only
+control. Changing text encoder or removing A is a separate experiment.
 
-## Backbone choices
+Images go directly from raw RGB PIL into the SigLIP2 processor. It resizes
+approximately preserving aspect ratio under `--max-num-patches`, patchifies,
+rescales by `1/255`, then normalizes with RGB mean/std `[0.5,0.5,0.5]`:
+`(pixel/255 - 0.5)/0.5`. There is no preceding 336-square resize or CLIP
+normalization. Saved processor metadata is validated on restoration.
+GT masks remain binary labels and use nearest resize to the processed grid.
+Padding is removed before CNN decoding and loss computation.
+[Official Base processor](https://huggingface.co/google/siglip2-base-patch16-naflex/blob/main/preprocessor_config.json)
 
-| Vision checkpoint | Width / layers | Input variant |
-|---|---|---|
-| `google/siglip2-base-patch16-naflex` (default) | 768 / 12 | NaFlex |
-| `google/siglip2-so400m-patch16-naflex` | 1152 / 27 | Larger NaFlex |
-| `openai/clip-vit-large-patch14-336` | 1024 / 24 | Retained CLIP baseline |
+NaFlex still resizes images. The default patch budget here is 512, compared
+with the upstream processor's 256. Test 1024 separately with a new output
+directory. Resolution and pretrained vision features both change relative
+to CLIP; a gain alone does not identify which caused it.
 
-Google publishes **Base and So400m NaFlex**, not Large NaFlex. SigLIP 2 Large
-has a 1024-wide, 24-layer vision tower (~303M vision parameters), but its released
-checkpoints are FixRes. Base has ~86M vision parameters. These counts exclude
-the text tower and decoder; this branch retains the 123M CLIP text tower.
-[Official checkpoint table](https://github.com/google-research/big_vision/blob/main/big_vision/configs/proj/image_text/README_siglip2.md)
-
-NaFlex still resizes, approximately preserving aspect ratio within a patch
-budget. The upstream processor defaults to 256 patches; this branch defaults
-to **512**. Use 1024 in a separate run to test resolution effects. There is no
-336-square resize before NaFlex. Larger budgets need more compute/VRAM;
-improvement on VizWiz has not been measured.
-[Preprocessing documentation](https://huggingface.co/docs/transformers/model_doc/siglip2)
-
-## Setup
+## Setup and training
 
 ```bash
 uv sync --locked
 ```
 
-Existing data layout: `train_grounding.json`, `val_grounding.json`,
+Data layout under `--data-root`: `train_grounding.json`, `val_grounding.json`,
 `test_grounding.json`, `train/`, `val/`, `test/`, and
-`binary_masks_png/{train,val,test}/` under `--data-root`.
-The first run downloads SigLIP vision weights/processor and CLIP text
-weights/tokenizer. Hugging Face may cache the full SigLIP checkpoint file,
-although only its vision tower is used here.
+`binary_masks_png/{train,val,test}/`. First use downloads encoder weights,
+processor and tokenizers; Hugging Face can cache a full checkpoint file even
+when only one tower is loaded.
 
-## Train
-
-Base, 512 patches, QA text as in the parent baseline:
+Suggested starting configuration for two GPUs:
 
 ```bash
-uv run train.py --data-root /kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz --num-epochs 20 --batch-size 4 --validate-every 1 --save-every 5 --output-dir outputs/naflex_base_512
+uv run torchrun --nproc_per_node=2 train.py \
+    --data-root /kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz \
+    --num-epochs 20 \
+    --batch-size 2 \
+    --gradient-accumulation-steps 2 \
+    --lr 0.00001 \
+    --num-workers 2 \
+    --max-num-patches 512 \
+    --text-encoder clip \
+    --text-mode qa \
+    --gradient-checkpointing \
+    --amp \
+    --validate-every 1 \
+    --save-every 10 \
+    --seed 42 \
+    --output-dir outputs/naflex_base_clip_512
 ```
 
-For a separate 1024-patch experiment, add `--max-num-patches 1024` and use a new
-output directory. For the larger NaFlex tower:
+`--batch-size` is the **global micro-batch**, so this uses one image per GPU.
+The effective batch is `2 * 2 = 4` images per optimizer update, except the
+last partial window. Do not multiply by GPU count again. Worker count is
+per process. AMP uses FP16 with gradient scaling on CUDA. Gradient
+checkpointing recomputes encoder activations to reduce memory.
+
+Use the same micro-batch/accumulation on both experiment branches for a
+matched comparison. NaFlex decoding groups images by patch H/W and uses
+local BatchNorm: different ranks can have different group counts, making
+per-group SyncBN unsafe. Accumulation does not reproduce the BatchNorm
+statistics of the original larger CLIP micro-batch.
+
+This is a conservative starting suggestion, **not a measured VRAM fit**.
+Full GPU runs have not been performed here. So400m is substantially heavier;
+switching its text to SigLIP2 also adds a large text tower and optimizer state.
+Reducing micro-batch alone may be insufficient for that configuration on
+16 GB GPUs. Keep CLIP text first to assess vision changes.
+
+All training options are shown above except `--resume-checkpoint`, which is
+omitted for a fresh run. Disable the booleans with `--no-amp` or
+`--no-gradient-checkpointing`. `--save-every 0` disables periodic checkpoints;
+the final model is still saved. `--validate-every 0` disables epoch validation.
+Validation during training reports BCE, not mIoU; the distributed validation
+sampler can duplicate its last sample. Use eval.py for the full validation
+set's mIoU without sampler duplication.
+
+## Checkpoints, evaluation and resume
 
 ```bash
-uv run train.py --data-root data/vizwiz --vision-model google/siglip2-so400m-patch16-naflex --max-num-patches 512 --num-epochs 20 --batch-size 4 --output-dir outputs/naflex_so400m_512
+uv run eval.py --checkpoint outputs/naflex_base_clip_512/checkpoint_epoch20.pt --dataset val --data-root /kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz --output-dir outputs/eval_naflex_base_clip_512
+uv run train.py --data-root data/vizwiz --resume-checkpoint outputs/naflex_base_clip_512/checkpoint_epoch20.pt --num-epochs 30 --output-dir outputs/naflex_base_clip_512
 ```
 
-Start with Base. GPU peak memory has not been measured; lower batch size if
-necessary and report the changed effective batch size. No gradient accumulation
-flag is implemented. Both encoders start pretrained; fusion/decoder layers are
-normally initialized. CLIP checkpoints cannot resume a NaFlex model.
+Checkpoints save architecture, encoder configurations, preprocessing, patch
+budget, text encoder/mode and training arguments. Eval/resume restore these;
+tokenizer files must be cached or accessible. Resume rejects changing vision,
+text encoder/mode or patch budget. Micro-batch, accumulation, AMP and gradient
+checkpointing restore from saved arguments unless explicitly overridden.
+`--num-epochs` on resume is the total desired epoch count.
 
-`--text-mode question` trains a separate Q-only control. Use the same text mode
-on both backbones for comparison. QA and Q-only are separate settings. NaFlex
-also changes image/GT spatial sampling; gains cannot be attributed solely to
-pretrained visual features without a resolution control.
+Periodic checkpoints contain optimizer/scaler state; final model files contain
+weights and metadata only. Resuming a final file starts a new optimizer.
+Existing Base NaFlex checkpoints with CLIP text retain their parameter
+keys/shapes; missing text-encoder metadata defaults to CLIP. Use the matching
+experiment branch to load its checkpoint. Original CLIP-vision checkpoints
+belong to `exp/baseline-fixes`; this experiment does not convert them.
 
-Retained CLIP path:
-
-```bash
-uv run train.py --data-root data/vizwiz --vision-model openai/clip-vit-large-patch14-336 --num-epochs 20 --output-dir outputs/clip_control
-```
-
-Existing `--lr`, `--num-workers`, `--seed`, `--resume-checkpoint`,
-`--validate-every` and `--save-every` remain. Training validation reports BCE,
-not mIoU; run eval.py for mIoU. `--save-every 0` saves only the final model.
-
-## Evaluate and resume
-
-```bash
-uv run eval.py --checkpoint outputs/naflex_base_512/checkpoint_epoch20.pt --dataset val --data-root /kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz --output-dir outputs/eval_naflex_base_512
-uv run train.py --data-root data/vizwiz --resume-checkpoint outputs/naflex_base_512/checkpoint_epoch20.pt --num-epochs 30 --output-dir outputs/naflex_base_512
-```
-
-All NaFlex checkpoints, including final files, record architecture,
-preprocessing, patch budget and text mode. Eval/resume restore these
-automatically without redownloading encoder weights; tokenizer files must
-be cached or available. Resume rejects changing backbone/budget/text mode.
-Periodic checkpoints contain optimizer/scaler state. Final NaFlex files
-contain weights+metadata only, so their optimizer starts fresh on resume.
-
-Old CLIP raw/full checkpoints still load as CLIP. Baseline-fixes itself is an
-unchanged separate branch. Start a new NaFlex experiment from pretrained
-SigLIP; there is no direct CLIP checkpoint conversion.
-
-Eval defaults to native GT size: resize logits, then threshold, score and
-export the same mask. `--metric-resolution resized` uses the legacy **336 GT
-reference**, including for NaFlex. JSON records backbone, patch budget, text
-mode and resolution. Eval restores checkpoint text mode unless overridden;
-legacy files default to QA. Removing A from a QA-trained checkpoint is a
-diagnostic, not a Q-only-trained baseline.
-
-Single-image prediction:
+Eval defaults to native GT resolution: resize logits, threshold, score and
+export the same mask. `--metric-resolution resized` instead uses the legacy
+336-square GT reference. Compare scores using the same resolution and text
+mode. Removing A at eval from a QA-trained model is a diagnostic, not a
+Q-only-trained baseline. Metadata records the selected protocol.
 
 ```python
 from models import GroundingModel
-model = GroundingModel.from_checkpoint('outputs/naflex_base_512/checkpoint_epoch20.pt')
-result = model.predict('image.jpg', question='What does this label say?')
-result['pred_pil'].save('mask.png')  # NaFlex: original image dimensions
+model = GroundingModel.from_checkpoint('outputs/naflex_base_clip_512/checkpoint_epoch20.pt')
+result = model.predict('image.jpg', question='What does this label say?', answer='example')
+result['pred_pil'].save('mask.png')  # original image dimensions
 ```
 
-Legacy example scripts select NaFlex preprocessing for NaFlex checkpoints;
-update their hardcoded paths/questions first. Prefer eval.py for benchmark
-metrics and metadata.
-
-## Shape and loss handling
-
-- Processor emits patch pixels, `pixel_attention_mask` and per-image
-  `spatial_shapes=(patch_height,patch_width)`. There is no first CLS token to drop.
-- Intermediate layers 4/7/9 and the final state supply decoder features. These
-  remain one spatial grid, not a true spatial pyramid.
-- Group equal H/W grids for decoding. Padding is removed before all CNN
-  bottlenecks/skips, and never participates in BCE.
-- Use SigLIP processor normalization. GT uses nearest resize to the same
-  processed image size; native image/mask alignment is mandatory.
-- Average BCE per image, then across the batch, retaining equal image weights.
-- Decoder channels stay 1024/512/256/128. Input/skip channels and text projection
-  adapt to the vision width (768 or 1152).
-- NaFlex DDP uses **local BatchNorm**: ranks may have different numbers of
-  spatial groups, so per-group SyncBN collectives could hang. CLIP retains
-  SyncBN. Grouping changes BN statistics relative to a full fixed-grid batch;
-  CUDA/DDP execution has not been tested here.
+Update the example scripts' hardcoded paths/questions before using them.
+Prefer eval.py for dataset metrics and exported prediction masks.
 
 ## Verification
 
@@ -157,18 +142,16 @@ metrics and metadata.
 uv run python -m unittest discover -s tests -v
 ```
 
-12 CPU/offline tests pass with the real NaFlex processor and tiny randomly
-initialized vision/text models. They cover rectangular grids, mask alignment,
-padding invariance, gradients, equal-image loss, extraction from a full SigLIP
-checkpoint, checkpoint roundtrip, native prediction/export, train/eval/resume
-and legacy CLIP compatibility.
-
-No full pretrained Base/So400m training, CUDA memory benchmark, DDP execution
-or VizWiz accuracy result has been established. This is an experimental
-baseline implementation, not evidence that NaFlex improves mIoU.
+12 CPU tests cover rectangular grids, GT alignment, normalization, padding,
+gradients, equal-image loss, pretrained tower extraction, checkpoint/native
+prediction, train/eval/resume, text switching and incomplete accumulation.
+They include two-process Gloo DDP with different per-rank grid groups and
+gradient checkpointing. Actual pretrained tokenizer loading was also checked.
+Model tests use tiny random towers; no full pretrained training, CUDA/NCCL
+execution, GPU memory benchmark or VizWiz accuracy result is established.
 
 ## Project
 
 Research fork of [yjh9929/VizWiz-VQA-Grounding](https://github.com/yjh9929/VizWiz-VQA-Grounding).
 Licensed under [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/).
-Figures in images/ are historical illustrations, not results of this experiment.
+Figures in images/ are historical illustrations, not experiment results.

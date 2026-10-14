@@ -6,14 +6,13 @@ from models import GroundingModel
 # ===== Settings =====
 image_path = "data/vizwiz/test/VizWiz_test_00000006.jpg"
 question = "What does it say on here?"
-checkpoint_path = "outputs/clip-vit-L-p14-336-wo-crop_epoch3.pt"
-save_path = "result/clip-vit-L-p14-336-wo-crop_epoch3/VizWiz_test_00000006_pred_mask.png"
+checkpoint_path = "outputs/naflex_base_clip_512/checkpoint_epoch20.pt"
+save_path = "results/preview/VizWiz_test_00000006_pred_mask.png"
 device = torch.device("cpu")
 # ===== Model load =====
 model = GroundingModel.from_checkpoint(checkpoint_path, device=device)
 
-# predict() selects checkpoint preprocessing: NaFlex exports native size;
-# legacy CLIP keeps this example's 336 output convention.
+# predict() uses the saved NaFlex processor and exports native size.
 binary_mask = model.predict(image_path, question=question)["pred_mask"]
 
 # ===== Save =====

@@ -16,7 +16,8 @@ from torch.utils.data import DataLoader
 from torchvision.transforms.functional import to_pil_image
 
 from dataset import VizWizGroundingDataset, collate_eval_samples
-from models import GroundingModel, build_grounding_model, make_naflex_processor
+from models import build_grounding_model, make_naflex_processor
+from models.image_encoder import VISION_MODEL
 from metrics import compute_iou_per_sample
 from utils import align_state_dict, to_device
 
@@ -48,16 +49,11 @@ def main(argv=None):
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model_config = checkpoint.get("model_config") if isinstance(checkpoint, dict) else None
     args.text_mode = args.text_mode or (checkpoint.get("text_mode", "qa") if isinstance(checkpoint, dict) else "qa")
-    model = build_grounding_model(model_config, pretrained=False) if model_config else GroundingModel()
-    processor = make_naflex_processor(model_config) if model_config else None
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        state_dict = align_state_dict(checkpoint["model_state_dict"], model)
-        model.load_state_dict(state_dict)
-        print(f"Loaded checkpoint (epoch {checkpoint.get('epoch', '?')})")
-    else:
-        state_dict = align_state_dict(checkpoint, model)
-        model.load_state_dict(state_dict)
-        print("Loaded raw state dict")
+    model = build_grounding_model(model_config, pretrained=False)
+    processor = make_naflex_processor(model_config)
+    state_dict = align_state_dict(checkpoint["model_state_dict"], model)
+    model.load_state_dict(state_dict)
+    print(f"Loaded checkpoint (epoch {checkpoint.get('epoch', '?')})")
     del state_dict, checkpoint
     model = model.to(device).eval()
 
@@ -76,11 +72,10 @@ def main(argv=None):
         json_path=json_path,
         image_root=image_root,
         mask_root=mask_root,
-        image_size=image_size,
         is_test=True,  # disable augmentation
         text_mode=args.text_mode,
-        return_original_mask=args.metric_resolution == "original" or processor is not None,
-        naflex_processor=processor,
+        return_original_mask=True,
+        image_processor=processor,
     )
     loader = DataLoader(
         dataset,
@@ -103,19 +98,14 @@ def main(argv=None):
         for batch in loop:
             images = to_device(batch["image"], device)
             texts = batch["text"]
-            masks = batch["mask"]
             filenames = batch["filename"]
 
-            pred = model(images, texts)  # (B, 1, 16*H_p, 16*W_p)
+            pred = model(images, texts)  # list of (1, 1, 16*H_p, 16*W_p)
             for i, fname in enumerate(filenames):
-                if args.metric_resolution == "original" or processor is not None:
-                    truth = batch["original_mask"][i].unsqueeze(0).to(device)
-                    if args.metric_resolution == "resized":
-                        truth = F.interpolate(truth, size=image_size, mode="nearest")
-                else:
-                    truth = masks[i:i+1].to(device)
-                sample_pred = pred[i] if isinstance(pred, list) else pred[i:i+1]
-                logits = F.interpolate(sample_pred.float(), size=truth.shape[-2:],
+                truth = batch["original_mask"][i].unsqueeze(0).to(device)
+                if args.metric_resolution == "resized":
+                    truth = F.interpolate(truth, size=image_size, mode="nearest")
+                logits = F.interpolate(pred[i].float(), size=truth.shape[-2:],
                                        mode="bilinear", align_corners=False)
                 prediction = (logits > 0).float()
                 score = compute_iou_per_sample(prediction, truth,
@@ -139,8 +129,9 @@ def main(argv=None):
             "dataset": args.dataset,
             "text_mode": args.text_mode,
             "metric_resolution": args.metric_resolution,
-            "vision_model": model_config["vision_model"] if model_config else "openai/clip-vit-large-patch14-336",
-            "max_num_patches": model_config["max_num_patches"] if model_config else 576,
+            "vision_model": VISION_MODEL,
+            "text_encoder": model_config.get("text_backbone", "clip"),
+            "max_num_patches": model_config["max_num_patches"],
             "empty_union_score": 1.0 if args.metric_resolution == "original" else 0.0,
             "num_samples": len(per_sample_iou),
             "mean_iou": round(sum(iou_values) / len(iou_values), 6),

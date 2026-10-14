@@ -14,11 +14,7 @@ def to_device(batch, device):
 
 
 def grounding_loss(predictions, masks, loss_fn):
-    """Equal image weighting, preserving baseline BCE for fixed-size batches."""
-    if torch.is_tensor(predictions):
-        predictions = torch.nn.functional.interpolate(
-            predictions, size=masks.shape[-2:], mode="bilinear", align_corners=False)
-        return loss_fn(predictions, masks)
+    """Average BCE within each rectangular mask, then equally across images."""
     if len(predictions) != len(masks) or not predictions:
         raise ValueError("Prediction/mask batch sizes differ or are empty")
     losses = []
@@ -30,12 +26,10 @@ def grounding_loss(predictions, masks, loss_fn):
 
 
 def align_state_dict(state_dict, model):
-    """Normalize DDP prefix and CLIPVisionModel/CLIPTextModel key paths across transformers versions."""
+    """Normalize DDP prefixes and text-tower nesting across transformers versions."""
     target_state = model.state_dict()
     target_keys = set(target_state.keys())
     replacements = (
-        ("vision_encoder.", "vision_encoder.vision_model."),
-        ("vision_encoder.vision_model.", "vision_encoder."),
         ("text_encoder.model.", "text_encoder.model.text_model."),
         ("text_encoder.model.text_model.", "text_encoder.model."),
     )

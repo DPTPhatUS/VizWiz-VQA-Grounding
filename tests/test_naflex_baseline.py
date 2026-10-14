@@ -5,18 +5,26 @@ These validate geometry/checkpoints/gradients, not pretrained accuracy or CUDA.
 import json
 import tempfile
 import unittest
+from contextlib import nullcontext
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch import nn
+from torch.utils.data import DataLoader, Dataset
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.amp import GradScaler
 from PIL import Image, ImageDraw
 from transformers import (CLIPTextConfig, CLIPTextModel, Siglip2Config, Siglip2Model,
-                          Siglip2TextConfig, Siglip2ImageProcessor, Siglip2VisionConfig)
+                          Siglip2TextConfig, Siglip2VisionModel, Siglip2ImageProcessor, Siglip2VisionConfig, BatchEncoding)
 
 from dataset import VizWizGroundingDataset, collate_eval_samples
-from models.image_encoder import BASE_NAFLEX, ImageEncoder, make_naflex_processor
+from models.image_encoder import VISION_MODEL, ImageEncoder, make_naflex_processor
 from models import GroundingModel
+from models.text_encoder import TextEncoder
 from utils import grounding_loss, to_device
 import eval as evaluator
 import train as trainer
@@ -25,7 +33,7 @@ torch.set_num_threads(1)
 
 
 class TinyText(nn.Module):
-    def __init__(self, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__()
         self.model = CLIPTextModel(CLIPTextConfig(vocab_size=32, hidden_size=16,
             intermediate_size=32, num_hidden_layers=1, num_attention_heads=2,
@@ -46,7 +54,7 @@ class TinyText(nn.Module):
 def tiny_model(max_num_patches=24, **kwargs):
     config = Siglip2VisionConfig(hidden_size=16, intermediate_size=32, num_hidden_layers=3,
                                num_attention_heads=2, num_patches=16, patch_size=16)
-    return GroundingModel(vision_model=BASE_NAFLEX, max_num_patches=max_num_patches,
+    return GroundingModel(max_num_patches=max_num_patches,
         pretrained=False, vision_config=config.to_dict(), text_encoder=TinyText(),
         image_processor=Siglip2ImageProcessor().to_dict(), feature_layers=(1, 2, 3),
         n_heads=2, decoder_channels=(16, 12, 8, 4))
@@ -75,7 +83,7 @@ class NaFlexBaselineTests(unittest.TestCase):
     def dataset(self, **kwargs):
         return VizWizGroundingDataset(self.root / "val_grounding.json", self.root / "val",
             self.root / "binary_masks_png" / "val", is_test=True,
-            naflex_processor=Siglip2ImageProcessor(max_num_patches=24), **kwargs)
+            image_processor=Siglip2ImageProcessor(max_num_patches=24), **kwargs)
 
     def test_processor_mask_alignment_and_variable_collation(self):
         dataset = self.dataset(return_original_mask=True)
@@ -105,7 +113,7 @@ class NaFlexBaselineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mean/std"):
             make_naflex_processor({"image_processor": bad})
         dataset = self.dataset()
-        self.assertIsNone(dataset.normalize)
+        self.assertEqual(list(dataset.image_processor.image_mean), [0.5] * 3)
         self.assertEqual(dataset[0]["text"], "Q: Which side? A: right")
 
     def test_padding_is_ignored_and_grids_are_not_transposed(self):
@@ -165,8 +173,12 @@ class NaFlexBaselineTests(unittest.TestCase):
         full = Siglip2Model(Siglip2Config(vision_config=vc.to_dict(), text_config=tc.to_dict())).eval()
         path = self.root / "pretrained_bundle"
         full.save_pretrained(path)
-        extracted = ImageEncoder(str(path), config=vc.to_dict(), pretrained=True,
-                                 image_processor=Siglip2ImageProcessor().to_dict(), feature_layers=(1, 2, 3)).eval()
+        loader = Siglip2VisionModel.from_pretrained
+        with patch("models.image_encoder.Siglip2VisionModel.from_pretrained",
+                   side_effect=lambda name, **kwargs: loader(path, **kwargs)) as load:
+            extracted = ImageEncoder(config=vc.to_dict(), pretrained=True,
+                image_processor=Siglip2ImageProcessor().to_dict(), feature_layers=(1, 2, 3)).eval()
+            self.assertEqual(load.call_args.args[0], VISION_MODEL)
         for key, value in extracted.vision_encoder.state_dict().items():
             self.assertTrue(torch.equal(value, full.vision_model.state_dict()[key]), key)
         batch = collate_eval_samples([self.dataset()[0]])
@@ -178,7 +190,8 @@ class NaFlexBaselineTests(unittest.TestCase):
     def test_train_eval_resume_and_legacy_export(self):
         out = self.root / "run"
         common = ["--data-root", str(self.root), "--batch-size", "3", "--num-workers", "0",
-                  "--validate-every", "1", "--save-every", "1", "--output-dir", str(out)]
+                  "--validate-every", "1", "--save-every", "1", "--output-dir", str(out),
+                  "--gradient-checkpointing", "--gradient-accumulation-steps", "2", "--text-encoder", "clip"]
         with patch.object(trainer, "GroundingModel", tiny_model):
             trainer.main(common + ["--num-epochs", "1", "--max-num-patches", "24", "--text-mode", "question"])
         ckpt = out / "checkpoint_epoch1.pt"
@@ -198,6 +211,142 @@ class NaFlexBaselineTests(unittest.TestCase):
                         self.assertEqual(mask.size, size if resolution == "original" else (336, 336))
             with self.assertRaises(SystemExit):
                 trainer.main(common + ["--num-epochs", "2", "--resume-checkpoint", str(ckpt), "--max-num-patches", "32"])
+
+    def test_text_switch_tokenizer_padding_and_projection(self):
+        for choice in ("clip", "siglip2"):
+            tokenizer = FakeTokenizer(choice)
+            cfg = (CLIPTextConfig(vocab_size=32, hidden_size=16, intermediate_size=32,
+                num_hidden_layers=1, num_attention_heads=2, max_position_embeddings=12,
+                bos_token_id=1, eos_token_id=2, pad_token_id=0) if choice == "clip" else
+                Siglip2TextConfig(vocab_size=32, hidden_size=12, intermediate_size=24,
+                num_hidden_layers=1, num_attention_heads=2, max_position_embeddings=8,
+                projection_size=12, bos_token_id=1, eos_token_id=2, pad_token_id=0))
+            target = "CLIPTokenizer" if choice == "clip" else "Siglip2Tokenizer"
+            with patch(f"models.text_encoder.{target}.from_pretrained", return_value=tokenizer) as load:
+                encoder = TextEncoder(choice, pretrained=False, config=cfg.to_dict())
+            self.assertEqual(load.call_args.args[0], "openai/clip-vit-large-patch14-336" if choice == "clip" else VISION_MODEL)
+            features, padding = encoder(["Q: A", "Q: A A: BLUE"], return_mask=True)
+            self.assertEqual(features.shape[-1], cfg.hidden_size)
+            self.assertTrue(torch.equal(padding, ~tokenizer.last["attention_mask"].bool()))
+            self.assertEqual(tokenizer.options["padding"], True if choice == "clip" else "max_length")
+            if choice == "siglip2":
+                self.assertEqual(features.shape[1], 8)
+                self.assertFalse(encoder.model.head.weight.requires_grad)
+
+    def test_siglip_text_checkpoint_and_checkpointed_gradients(self):
+        tokenizer = FakeTokenizer("siglip2")
+        cfg = Siglip2TextConfig(vocab_size=32, hidden_size=12, intermediate_size=24,
+            num_hidden_layers=1, num_attention_heads=2, max_position_embeddings=8,
+            projection_size=12, bos_token_id=1, eos_token_id=2, pad_token_id=0)
+        with patch("models.text_encoder.Siglip2Tokenizer.from_pretrained", return_value=tokenizer):
+            encoder = TextEncoder("siglip2", pretrained=False, config=cfg.to_dict())
+            vc = Siglip2VisionConfig(hidden_size=16, intermediate_size=32, num_hidden_layers=3,
+                                    num_attention_heads=2, num_patches=16, patch_size=16)
+            model = GroundingModel(pretrained=False, vision_config=vc.to_dict(), text_encoder=encoder,
+                text_backbone="siglip2", max_num_patches=24, image_processor=Siglip2ImageProcessor().to_dict(),
+                feature_layers=(1, 2, 3), n_heads=2, decoder_channels=(16, 12, 8, 4))
+            self.assertEqual(tuple(model.text_proj.weight.shape), (16, 12))
+            model.enable_gradient_checkpointing()
+            batch = collate_eval_samples([self.dataset()[0], self.dataset()[1]])
+            loss = grounding_loss(model(batch["image"], batch["text"]), batch["mask"], nn.BCEWithLogitsLoss())
+            loss.backward()
+            self.assertTrue(torch.isfinite(model.text_proj.weight.grad).all())
+            self.assertTrue(torch.isfinite(encoder.model.embeddings.token_embedding.weight.grad).all())
+            model.eval()
+            with torch.no_grad():
+                expected = model(batch["image"], batch["text"])
+            p = self.root / "siglip_text.pt"
+            torch.save({"model_state_dict": model.state_dict(), "model_config": model.model_config}, p)
+            restored = GroundingModel.from_checkpoint(p, device="cpu")
+            self.assertEqual(restored.text_encoder.backbone, "siglip2")
+            with torch.no_grad():
+                for a, b in zip(expected, restored(batch["image"], batch["text"])):
+                    self.assertTrue(torch.equal(a, b))
+
+    def test_accumulation_matches_full_batches_with_short_tail(self):
+        models = []
+        for batch_size, accumulation in ((4, 1), (2, 2)):
+            model = ScalarGrounding()
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+            loader = DataLoader(ScalarDataset(), batch_size=batch_size, collate_fn=collate_eval_samples)
+            with patch.object(optimizer, "step", wraps=optimizer.step) as step:
+                trainer.train_one_epoch(model, loader, optimizer, nn.BCEWithLogitsLoss(),
+                    GradScaler("cuda", enabled=False), torch.device("cpu"), accumulation, rank=1)
+                self.assertEqual(step.call_count, 2)
+            models.append(model)
+        self.assertTrue(torch.allclose(models[0].weight, models[1].weight, atol=1e-7))
+
+    def test_cpu_ddp_mixed_grids_and_accumulation(self):
+        mp.spawn(ddp_worker, args=(str(self.root),), nprocs=2, join=True)
+
+    def test_other_vision_checkpoint_is_rejected(self):
+        from models import build_grounding_model
+        config = dict(tiny_model().model_config, vision_model="other-vision")
+        with self.assertRaisesRegex(ValueError, "matching branch"):
+            build_grounding_model(config, pretrained=False)
+
+
+class FakeTokenizer:
+    def __init__(self, choice):
+        self.choice = choice
+
+    def __call__(self, texts, **kwargs):
+        self.options = kwargs
+        rows = []
+        for text in texts:
+            if self.choice == "siglip2":
+                text = text.lower()
+            rows.append([1] + [3 + sum(map(ord, word)) % 29 for word in text.split()][:kwargs["max_length"] - 2] + [2])
+        length = kwargs["max_length"] if kwargs["padding"] == "max_length" else max(map(len, rows))
+        ids = torch.zeros(len(rows), length, dtype=torch.long)
+        for i, row in enumerate(rows):
+            ids[i, :len(row)] = torch.tensor(row)
+        self.last = BatchEncoding({"input_ids": ids, "attention_mask": (ids != 0).long()})
+        return self.last
+
+
+class ScalarDataset(Dataset):
+    def __len__(self):
+        return 5
+
+    def __getitem__(self, i):
+        return {"image": torch.tensor([float(i + 1)]), "mask": torch.tensor([float(i % 2)]).reshape(1, 1, 1), "text": str(i)}
+
+
+class ScalarGrounding(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(0.2))
+
+    def forward(self, images, texts):
+        return [(row * self.weight).reshape(1, 1, 1, 1) for row in images]
+
+
+def ddp_worker(rank, root):
+    root = Path(root)
+    dist.init_process_group("gloo", init_method=f"file://{root / 'rendezvous'}", rank=rank,
+                            world_size=2, timeout=timedelta(seconds=45))
+    try:
+        torch.manual_seed(42)
+        dataset = VizWizGroundingDataset(root / "train_grounding.json", root / "train",
+            root / "binary_masks_png" / "train", Siglip2ImageProcessor(max_num_patches=24))
+        sampler = [0, 0, 0, 0, 1] if rank == 0 else [0, 1, 1, 2, 2]
+        loader = DataLoader(dataset, batch_size=2, sampler=sampler, collate_fn=collate_eval_samples)
+        model = tiny_model()
+        model.enable_gradient_checkpointing()
+        model = DDP(model, find_unused_parameters=False)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+        with patch.object(optimizer, "step", wraps=optimizer.step) as step:
+            loss = trainer.train_one_epoch(model, loader, optimizer, nn.BCEWithLogitsLoss(),
+                GradScaler("cuda", enabled=False), torch.device("cpu"), 2, rank=rank, is_dist=True)
+            assert step.call_count == 2
+        assert torch.isfinite(torch.tensor(loss))
+        actual = torch.cat([p.detach().flatten() for p in model.parameters()])
+        reference = actual.clone()
+        dist.broadcast(reference, src=0)
+        assert torch.equal(actual, reference)
+    finally:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
