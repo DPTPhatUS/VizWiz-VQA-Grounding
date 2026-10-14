@@ -148,7 +148,7 @@ class GroundingModel(nn.Module):
             boxes=candidate_windows(h,w)
             logits=F.interpolate(output['logits'],size=(h,w),mode='bilinear',align_corners=False)
             contexts,descriptors=[],[]
-            probability=logits.sigmoid()
+            probability=logits.sigmoid() if self.stage=='router' else None
             for box in boxes:
                 y0,x0,y1,x1=box
                 # Pool on the native coarse feature map; do not materialize a huge upsampled CLIP map.
@@ -157,13 +157,15 @@ class GroundingModel(nn.Module):
                             max(y0*vh//h+1,(y1*vh+h-1)//h),max(x0*vw//w+1,(x1*vw+w-1)//w))).mean((-2,-1))
                 text=output['pooled_text']
                 context=torch.cat([visual,text],dim=1)
-                p=crop(probability,box)
-                statistics=torch.stack([p.mean((1,2,3)),(4*p*(1-p)).mean((1,2,3)),
-                                         (p>.5).float().mean((1,2,3))],dim=1)
-                coordinates=logits.new_tensor([y0/h,x0/w,y1/h,x1/w]).expand(len(logits),-1)
                 contexts.append(context)
-                descriptors.append(torch.cat([context,statistics,coordinates],dim=1))
-        return logits,boxes,torch.stack(contexts,1),torch.stack(descriptors,1)
+                if self.stage=='router':
+                    p=crop(probability,box)
+                    statistics=torch.stack([p.mean((1,2,3)),(4*p*(1-p)).mean((1,2,3)),
+                                             (p>.5).float().mean((1,2,3))],dim=1)
+                    coordinates=logits.new_tensor([y0/h,x0/w,y1/h,x1/w]).expand(len(logits),-1)
+                    descriptors.append(torch.cat([context,statistics,coordinates],dim=1))
+        descriptors=torch.stack(descriptors,1) if descriptors else None
+        return logits,boxes,torch.stack(contexts,1),descriptors
 
     def residual(self,batch,coarse,box,context):
         rgb=crop(batch['detail_image'],box)
@@ -187,7 +189,10 @@ class GroundingModel(nn.Module):
                 losses.append(segmentation_loss(prediction,
                               crop(batch['detail_mask'][i:i+1],boxes[j]),self.dice_weight))
             return {'loss':torch.stack(losses).mean()}
-        scores=self.router(descriptors).squeeze(-1)
+        if self.stage=='refiner':
+            scores=-torch.arange(len(boxes),device=coarse.device,dtype=coarse.dtype).expand(len(coarse),-1)
+        else:
+            scores=self.router(descriptors).squeeze(-1)
         if compute_loss:
             with torch.no_grad():
                 # Stream candidates to avoid retaining 13 detail-resolution predictions.
@@ -200,8 +205,6 @@ class GroundingModel(nn.Module):
                 targets=torch.stack(gains,dim=1)
             return {'logits':coarse,'loss':F.mse_loss(scores.float(),targets),
                     'gain_targets':targets,'gain_scores':scores}
-        if self.stage=='refiner':
-            scores=-torch.arange(len(boxes),device=coarse.device,dtype=coarse.dtype).expand(len(coarse),-1)
         chosen=select_windows(scores,boxes,self.budget,
                               self.skip_nonpositive and self.policy=='gain',self.diversity_iou)
         predictions=[]
