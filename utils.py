@@ -1,5 +1,6 @@
 """Batch transfer and plain PyTorch weight loading."""
 import torch
+from models.model import GroundingModel
 
 
 def to_device(batch, device):
@@ -29,3 +30,13 @@ def initialize_weights(saved, model):
     if set(state) == set(model.coarse.state_dict()):
         target = model.coarse
     load_model_weights(target, saved)
+
+
+def load_inference_model(path, device, stage=None, budget=2):
+    """Restore the saved architecture, with optional inference-stage/budget overrides."""
+    saved = read_checkpoint(path)
+    config = saved["run_config"]
+    model = GroundingModel(stage=stage or config.get("stage", "router"), budget=budget,
+                           tiny=config.get("tiny", False), crop_size=config.get("crop_size", 336))
+    load_model_weights(model, saved)
+    return model.to(device).eval(), config

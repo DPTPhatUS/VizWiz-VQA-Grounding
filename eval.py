@@ -4,8 +4,7 @@ import json
 from pathlib import Path
 import torch
 from dataset import VizWizGroundingDataset, make_loader
-from models.model import GroundingModel
-from utils import read_checkpoint, load_model_weights
+from utils import load_inference_model
 from metrics import evaluate
 
 
@@ -23,18 +22,14 @@ def eval_main(argv=None):
     args = parser.parse_args(argv)
     if args.batch_size <= 0 or args.num_workers < 0:
         raise ValueError("Invalid batch size or worker count")
-    saved = read_checkpoint(args.checkpoint)
-    config = saved["run_config"]
-    model = GroundingModel(stage=args.stage or config.get("stage", "router"),
-                           budget=args.budget or 2, tiny=config.get("tiny", False),
-                           crop_size=config.get("crop_size", 336))
-    load_model_weights(model, saved)
+    device = torch.device(args.device)
+    model, config = load_inference_model(args.checkpoint, device, args.stage, args.budget or 2)
     inference = {"policy": model.policy, "budget": model.budget}
-    device = torch.device(args.device); model.to(device)
     dataset = VizWizGroundingDataset(args.data_root,args.dataset,config.get("image_size", 336),
         config.get("detail_size", 672))
     loader = make_loader(dataset,args,args.batch_size)
-    out = Path(args.output_dir); out.mkdir(parents=True,exist_ok=True)
+    out = Path(args.output_dir)
+    out.mkdir(parents=True,exist_ok=True)
     scores = evaluate(model,loader,device,out)
     summary = {"num_samples":len(scores),"mean_iou":sum(scores.values())/len(scores),
                "dataset":args.dataset,"metric_resolution":"original",

@@ -3,10 +3,9 @@ import argparse
 from pathlib import Path
 import torch
 from torch.nn import functional as F
-from torchvision.transforms.functional import to_tensor
-from PIL import Image, ImageOps
-from models.model import GroundingModel
-from utils import read_checkpoint, load_model_weights
+from PIL import Image
+from dataset import load_image, image_inputs
+from utils import load_inference_model, to_device
 
 
 def prediction_parser(description=__doc__):
@@ -22,21 +21,15 @@ def prediction_parser(description=__doc__):
 
 @torch.no_grad()
 def predict_image(checkpoint,image_path,question,device,stage=None):
-    saved=read_checkpoint(checkpoint)
-    config=saved['run_config']
-    model=GroundingModel(stage=stage or config.get("stage","router"),tiny=config.get("tiny",False),
-                         crop_size=config.get("crop_size",336))
-    load_model_weights(model,saved)
-    model.to(device).eval()
-    with Image.open(image_path) as source:
-        image=ImageOps.exif_transpose(source).convert('RGB')
-    question_text=f'Q: {question}'
-    batch={'image':to_tensor(image.resize((config.get("image_size",336),config.get("image_size",336)),Image.Resampling.BICUBIC)).unsqueeze(0).to(device),
-           'question_text':[question_text]}
-    batch['detail_image']=to_tensor(image.resize((config.get("detail_size",672),config.get("detail_size",672)),Image.Resampling.BICUBIC)).unsqueeze(0).to(device)
-    logits=model(batch)['logits'].float()
-    mask=F.interpolate(logits,size=(image.height,image.width),mode='bilinear',align_corners=False)[0,0]>0
-    return image,Image.fromarray(mask.cpu().numpy().astype('uint8')*255)
+    model, config = load_inference_model(checkpoint, device, stage=stage)
+    image = load_image(image_path)
+    inputs = image_inputs(image, config.get("image_size", 336), config.get("detail_size", 672))
+    batch = to_device({key: tensor.unsqueeze(0) for key, tensor in inputs.items()}, device)
+    batch['question_text'] = [f'Q: {question}']
+    logits = model(batch)['logits'].float()
+    mask = F.interpolate(logits, size=(image.height, image.width),
+                         mode='bilinear', align_corners=False)[0, 0] > 0
+    return image, Image.fromarray(mask.cpu().numpy().astype('uint8') * 255)
 
 
 def main(argv=None):

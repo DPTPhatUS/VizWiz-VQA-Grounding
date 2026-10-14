@@ -10,6 +10,21 @@ import numpy as np
 from torchvision.transforms.functional import to_tensor
 
 
+def load_image(path):
+    with Image.open(path) as source:
+        return ImageOps.exif_transpose(source).convert("RGB")
+
+
+def image_inputs(image, image_size, detail_size):
+    """Resize both inputs independently from the original RGB image."""
+    result = {"image": to_tensor(image.resize(
+        (image_size, image_size), Image.Resampling.BICUBIC))}
+    if detail_size:
+        result["detail_image"] = to_tensor(image.resize(
+            (detail_size, detail_size), Image.Resampling.BICUBIC))
+    return result
+
+
 class VizWizGroundingDataset(Dataset):
     def __init__(self, root, split, image_size=336, detail_size=672):
         self.root, self.split = Path(root), split
@@ -29,26 +44,19 @@ class VizWizGroundingDataset(Dataset):
     def __getitem__(self, index):
         name = self.names[index]
         meta = self.records[name]
-        with Image.open(self.root / self.split / name) as source:
-            image = ImageOps.exif_transpose(source).convert("RGB")
+        image = load_image(self.root / self.split / name)
         with Image.open(self.root / "binary_masks_png" / self.split / Path(name).with_suffix(".png")) as source:
             mask = source.convert("L")
         if image.size != mask.size:
             raise ValueError(f"Image/mask dimensions differ for {name}")
         question = str(meta["question"])
         question_text = f"Q: {question}"
-        result = {
-            "image": to_tensor(image.resize((self.image_size, self.image_size), Image.Resampling.BICUBIC)),
-            "question_text": question_text, "filename": name,
-        }
+        result = image_inputs(image, self.image_size, self.detail_size)
+        result.update(question_text=question_text, filename=name)
         if self.split != "train":
             result["original_mask"] = (to_tensor(mask) > .5).float()
-        if self.detail_size:
-            if self.split == "train":
-                result["detail_mask"] = self.mask_tensor(mask, self.detail_size)
-            # Independent resize from the original image: never enlarge the CLIP input.
-            result["detail_image"] = to_tensor(image.resize(
-                (self.detail_size, self.detail_size), Image.Resampling.BICUBIC))
+        if self.detail_size and self.split == "train":
+            result["detail_mask"] = self.mask_tensor(mask, self.detail_size)
         return result
 
 

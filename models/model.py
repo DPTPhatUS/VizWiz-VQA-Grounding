@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from losses import segmentation_loss, per_image_iou
+from losses import segmentation_loss, resize_logits, intersection_union, iou_from_counts
 from models.image_encoder import ImageEncoder, TinyVision
 from models.text_encoder import TextEncoder, masked_mean
 from models.mask_decoder import CompactDecoder
@@ -141,40 +141,49 @@ class GroundingModel(nn.Module):
         self.router.train(mode and self.stage == 'router')
         return self
 
+    @torch.no_grad()
     def features(self, batch):
-        with torch.no_grad():
-            # Never consume answer-bearing text, including during training.
-            output = self.coarse({'image': batch['image'], 'text': batch['question_text']})
-            height, width = batch['detail_image'].shape[-2:]
-            feature_height, feature_width = output['visual'].shape[-2:]
-            boxes = candidate_windows(height, width)
-            logits = F.interpolate(output['logits'], size=(height, width),
-                                   mode='bilinear', align_corners=False)
-            contexts, descriptors = [], []
-            probability = logits.sigmoid() if self.stage == 'router' else None
-            for box in boxes:
-                y0, x0, y1, x1 = box
-                # Floor the start and ceil the end, retaining at least one feature cell.
-                # Pool on the native feature map to avoid upsampling the CLIP features.
-                feature_y0 = y0 * feature_height // height
-                feature_x0 = x0 * feature_width // width
-                feature_y1 = max(feature_y0 + 1, (y1 * feature_height + height - 1) // height)
-                feature_x1 = max(feature_x0 + 1, (x1 * feature_width + width - 1) // width)
-                feature_box = (feature_y0, feature_x0, feature_y1, feature_x1)
-                visual = crop(output['visual'], feature_box).mean((-2, -1))
-                context = torch.cat([visual, output['pooled_text']], dim=1)
-                contexts.append(context)
-                if self.stage == 'router':
-                    crop_probability = crop(probability, box)
-                    mean_probability = crop_probability.mean((1, 2, 3))
-                    uncertainty = (4 * crop_probability * (1 - crop_probability)).mean((1, 2, 3))
-                    foreground_fraction = (crop_probability > .5).float().mean((1, 2, 3))
-                    statistics = torch.stack([mean_probability, uncertainty, foreground_fraction], dim=1)
-                    coordinates = logits.new_tensor([y0 / height, x0 / width, y1 / height, x1 / width])
-                    coordinates = coordinates.expand(len(logits), -1)
-                    descriptors.append(torch.cat([context, statistics, coordinates], dim=1))
-        descriptors = torch.stack(descriptors, 1) if descriptors else None
-        return logits, boxes, torch.stack(contexts, 1), descriptors
+        # Never consume answer-bearing text, including during training.
+        output = self.coarse({'image': batch['image'], 'text': batch['question_text']})
+        height, width = batch['detail_image'].shape[-2:]
+        logits = F.interpolate(output['logits'], size=(height, width),
+                               mode='bilinear', align_corners=False)
+        return logits, candidate_windows(height, width), output['visual'], output['pooled_text']
+
+    @torch.no_grad()
+    def window_context(self, visual, text, box, canvas_size):
+        height, width = canvas_size
+        feature_height, feature_width = visual.shape[-2:]
+        y0, x0, y1, x1 = box
+        # Floor the start and ceil the end, retaining at least one feature cell.
+        # Pool on the native feature map to avoid upsampling the CLIP features.
+        feature_y0 = y0 * feature_height // height
+        feature_x0 = x0 * feature_width // width
+        feature_y1 = max(feature_y0 + 1, (y1 * feature_height + height - 1) // height)
+        feature_x1 = max(feature_x0 + 1, (x1 * feature_width + width - 1) // width)
+        feature_box = (feature_y0, feature_x0, feature_y1, feature_x1)
+        pooled_visual = crop(visual, feature_box).mean((-2, -1))
+        return torch.cat([pooled_visual, text], dim=1)
+
+    @torch.no_grad()
+    def router_features(self, coarse, boxes, visual, text):
+        """The router compares every candidate, so it needs all window contexts."""
+        height, width = coarse.shape[-2:]
+        probability = coarse.sigmoid()
+        contexts, descriptors = [], []
+        for box in boxes:
+            context = self.window_context(visual, text, box, (height, width))
+            contexts.append(context)
+            crop_probability = crop(probability, box)
+            mean_probability = crop_probability.mean((1, 2, 3))
+            uncertainty = (4 * crop_probability * (1 - crop_probability)).mean((1, 2, 3))
+            foreground_fraction = (crop_probability > .5).float().mean((1, 2, 3))
+            statistics = torch.stack([mean_probability, uncertainty, foreground_fraction], dim=1)
+            y0, x0, y1, x1 = box
+            coordinates = coarse.new_tensor([y0 / height, x0 / width, y1 / height, x1 / width])
+            coordinates = coordinates.expand(len(coarse), -1)
+            descriptors.append(torch.cat([context, statistics, coordinates], dim=1))
+        return torch.stack(contexts, 1), torch.stack(descriptors, 1)
 
     def residual(self, batch, coarse, box, context):
         rgb = crop(batch['detail_image'], box)
@@ -185,14 +194,15 @@ class GroundingModel(nn.Module):
                                mode='bilinear', align_corners=False)
         return self.refiner(rgb, logits, context)
 
-    def _refiner_loss(self, batch, coarse, boxes, contexts):
+    def _refiner_loss(self, batch, coarse, boxes, visual, text):
         losses = []
         for image_index in range(len(coarse)):
             window_index = torch.randint(len(boxes), ()).item()
             box = boxes[window_index]
             local = {'detail_image': batch['detail_image'][image_index:image_index + 1]}
             local_coarse = coarse[image_index:image_index + 1]
-            context = contexts[image_index:image_index + 1, window_index]
+            context = self.window_context(visual[image_index:image_index + 1],
+                                          text[image_index:image_index + 1], box, coarse.shape[-2:])
             residual = self.residual(local, local_coarse, box, context)
             # Supervise the sampled crop directly.
             coarse_crop = crop(local_coarse, box)
@@ -204,39 +214,59 @@ class GroundingModel(nn.Module):
 
     def _router_loss(self, batch, coarse, boxes, contexts, scores):
         with torch.no_grad():
-            # Stream candidates to avoid retaining 13 detail-resolution predictions.
-            baseline = per_image_iou(coarse, batch['detail_mask'])
+            prediction = coarse > 0
+            truth = batch['detail_mask'] > .5
+            intersection, union = intersection_union(prediction, truth)
+            baseline = iou_from_counts(intersection, union)
             gains = []
             for window_index, box in enumerate(boxes):
                 residual = self.residual(batch, coarse, box, contexts[:, window_index])
-                prediction = blend_residuals(coarse, [residual], [box])
-                gains.append(per_image_iou(prediction, batch['detail_mask']) - baseline)
+                coarse_crop = crop(coarse, box)
+                corrected_crop = coarse_crop + resize_logits(residual, coarse_crop)
+                crop_truth = crop(truth, box)
+                old_intersection, old_union = intersection_union(crop(prediction, box), crop_truth)
+                new_intersection, new_union = intersection_union(corrected_crop > 0, crop_truth)
+                # Only this crop changes; replace its counts in the whole-image IoU.
+                corrected_iou = iou_from_counts(intersection - old_intersection + new_intersection,
+                                                union - old_union + new_union)
+                gains.append(corrected_iou - baseline)
             targets = torch.stack(gains, dim=1)
         return {'logits': coarse, 'loss': F.mse_loss(scores.float(), targets),
                 'gain_targets': targets, 'gain_scores': scores}
 
-    def _predict(self, batch, coarse, boxes, contexts, scores):
-        chosen = select_windows(scores, boxes, self.budget,
-                                self.skip_nonpositive and self.policy == 'gain', self.diversity_iou)
+    def _predict(self, batch, coarse, boxes, visual, text, chosen, scores, contexts=None):
         predictions = []
         for image_index, indices in enumerate(chosen):
             local = {'detail_image': batch['detail_image'][image_index:image_index + 1]}
             local_coarse = coarse[image_index:image_index + 1]
-            residuals = [self.residual(local, local_coarse, boxes[index],
-                                      contexts[image_index:image_index + 1, index]) for index in indices]
+            residuals = []
+            for index in indices:
+                if contexts is None:
+                    context = self.window_context(visual[image_index:image_index + 1],
+                                                  text[image_index:image_index + 1],
+                                                  boxes[index], coarse.shape[-2:])
+                else:
+                    context = contexts[image_index:image_index + 1, index]
+                residuals.append(self.residual(local, local_coarse, boxes[index], context))
             predictions.append(blend_residuals(local_coarse, residuals, [boxes[index] for index in indices]))
         return {'logits': torch.cat(predictions), 'gain_scores': scores,
                 'crop_counts': torch.tensor([len(indices) for indices in chosen], device=coarse.device)}
 
     def forward(self, batch, compute_loss=False):
-        coarse, boxes, contexts, descriptors = self.features(batch)
-        if compute_loss and self.stage == 'refiner':
-            return self._refiner_loss(batch, coarse, boxes, contexts)
+        coarse, boxes, visual, text = self.features(batch)
         if self.stage == 'refiner':
+            if compute_loss:
+                return self._refiner_loss(batch, coarse, boxes, visual, text)
+            # The first four windows are disjoint 2x2 tiles in fixed coverage order.
+            chosen = [list(range(self.budget)) for _ in range(len(coarse))]
+            # Preserve the fixed ordering in the returned gain_scores field.
             scores = -torch.arange(len(boxes), device=coarse.device, dtype=coarse.dtype)
             scores = scores.expand(len(coarse), -1)
-        else:
-            scores = self.router(descriptors).squeeze(-1)
+            return self._predict(batch, coarse, boxes, visual, text, chosen, scores)
+        contexts, descriptors = self.router_features(coarse, boxes, visual, text)
+        scores = self.router(descriptors).squeeze(-1)
         if compute_loss:
             return self._router_loss(batch, coarse, boxes, contexts, scores)
-        return self._predict(batch, coarse, boxes, contexts, scores)
+        chosen = select_windows(scores, boxes, self.budget,
+                                self.skip_nonpositive and self.policy == 'gain', self.diversity_iou)
+        return self._predict(batch, coarse, boxes, visual, text, chosen, scores, contexts)
