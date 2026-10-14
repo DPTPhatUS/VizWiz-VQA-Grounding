@@ -14,3 +14,4 @@ docs/
 tests/*
 !tests/test_latent_distillation.py
 !tests/test_latent_diagnostic.py
+!tests/test_latent_training_recipes.py

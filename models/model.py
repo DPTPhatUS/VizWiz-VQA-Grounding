@@ -61,7 +61,8 @@ class CompactGroundingModel(nn.Module):
         attn_map = attn_weights.view(B, 1, H_p, W_p)  # (B, 1, H_p, W_p)
         return latent, attn_map
 
-    def decode(self, features, texts, answer_vec=None, *, projected_skips=None, question_vec=None, question_only=False, answer_available=None):
+    def decode(self, features, texts, answer_vec=None, *, projected_skips=None, question_vec=None,
+               question_only=False, answer_available=None, detach_predicted_answer=False):
         s1, s2, s3, vision = features  # each (B, D_v, H_p, W_p)
         text = texts if hasattr(texts, "tokens") else self.text_encoder(texts)
         q = question_vec if question_vec is not None else masked_mean(text.tokens, text.valid_mask)  # (B, D_t)
@@ -74,6 +75,9 @@ class CompactGroundingModel(nn.Module):
                 latent, attn_map = self.infer_latent_answer(vision, q)
             else:
                 latent, attn_map = answer_vec.to(text.tokens.dtype), None
+            inferred_latent = latent
+            if detach_predicted_answer and answer_vec is None:
+                latent = latent.detach()  # cut grounding gradients, retain the vector for alignment
             ans_token = latent.to(text.tokens.dtype).unsqueeze(1)
             ans_mask = torch.ones(ans_token.shape[:2], dtype=torch.bool, device=ans_token.device)
             if answer_available is not None:
@@ -91,6 +95,8 @@ class CompactGroundingModel(nn.Module):
         fused = query + self.residual_scale.to(query.dtype) * attended  # (B, N, D_v)
         fused = fused.transpose(1, 2).reshape_as(vision).contiguous()  # (B, D_v, H_p, W_p)
         logits = self._decode_mask(fused, s3, s2, s1, q, latent, projected_skips=projected_skips)  # (B, 1, 16*H_p, 16*W_p)
+        if detach_predicted_answer and not question_only and answer_vec is None:
+            latent = inferred_latent
         return {"logits": logits, "latent_answer": latent, "answer_attn": attn_map, "question_vec": q.detach()}
 
     def forward(self, batch):
@@ -100,9 +106,11 @@ class CompactGroundingModel(nn.Module):
         q = masked_mean(text.tokens, text.valid_mask)  # (B, D_t)
         has_answer = self.training and batch.get("encode_answer_target", True) and ("answer_only_text" in batch or "answer_text" in batch)
         self_distill = has_answer and batch.get("self_distill", True)
+        needs_oracle = self_distill or (has_answer and batch.get("oracle_supervision", False))
         s1, s2, s3, _ = features
-        proj_skips = self.decoder.project_skips(s3, s2, s1) if self_distill and hasattr(self.decoder, "project_skips") else None
-        student = self.decode(features, text, projected_skips=proj_skips, question_vec=q)
+        proj_skips = self.decoder.project_skips(s3, s2, s1) if needs_oracle and hasattr(self.decoder, "project_skips") else None
+        student = self.decode(features, text, projected_skips=proj_skips, question_vec=q,
+                              detach_predicted_answer=self.training and batch.get("detach_predicted_answer", False))
         if has_answer:
             ans_texts = batch.get("answer_only_text") or [
                 f"A: {t.split(' A: ', 1)[1]}" if " A: " in t else t for t in batch["answer_text"]
@@ -115,14 +123,13 @@ class CompactGroundingModel(nn.Module):
                 question_logits = self.decode(
                     features, text, projected_skips=proj_skips, question_vec=q, question_only=True
                 )["logits"]
+                student["question_logits"] = question_logits
+            if needs_oracle:
                 teacher_logits = self.decode(
                     features, text, target_answer, projected_skips=proj_skips, question_vec=q,
                     answer_available=batch.get("answer_available")
                 )["logits"]
-                student.update(
-                    teacher_logits=teacher_logits,
-                    question_logits=question_logits,
-                )
+                student["teacher_logits"] = teacher_logits
         return student
 
     @classmethod

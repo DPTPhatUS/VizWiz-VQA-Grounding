@@ -156,3 +156,153 @@ Run `python -m unittest discover -s tests -p 'test_latent*.py' -v` for offline
 checks covering no real-answer leakage, prediction equivalence, checkpoint
 loading, missing answers, native mask sizes and CLI/gallery output. These are
 tiny-model CPU checks, not real-data diagnostic findings.
+
+## Step 3: matched training recipes
+
+This adds training choices, **not architecture choices**. Parameter names,
+counts, shapes, default inference, eval.py and diagnose.py are unchanged.
+Complete existing latent weights remain loadable without retraining.
+
+| `--training-recipe` | Training objective |
+|---|---|
+| `full` (fresh default) | Existing inferred-answer segmentation + oracle/Q-reference segmentation + gain-weighted KD + answer alignment + attention guidance |
+| `grounding-only` | Inferred-answer segmentation only; same as the old `--supervised-only` alias |
+| `alignment` | Inferred-answer segmentation + answer-vector alignment, without oracle/Q-reference/KD/attention losses |
+| `warmup` | Answer alignment throughout; grounding begins with real answers, then gradually shifts to inferred answers |
+
+All recipes use image/Q at inference. `grounding-only` still has the latent
+predictor and is not a separately trained architecture without that predictor.
+Keep CLIP input at 336, segmentation loss, epochs, batch, LR and seed matched.
+NaFlex flags from other branches do not apply to this branch.
+
+Fresh runs without new flags retain **`full + legacy` (`latent-gain-v2`)**.
+`--loss-version stable` explicitly selects the audited calculations below;
+use the same loss version across a new ablation suite. Full/stable records
+`latent-gain-v3`, alignment/stable records `latent-alignment-v2`, and
+warmup/stable records `latent-warmup-v2`. Detachment appends `-detached`.
+Grounding-only's segmentation formula does not depend on loss version.
+
+Example 20-epoch warm-up experiment on two GPUs:
+
+```bash
+uv run torchrun --nproc_per_node=2 train.py \
+    --data-root /kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz \
+    --num-epochs 20 \
+    --batch-size 4 \
+    --num-workers 2 \
+    --lr 0.00001 \
+    --seed 42 \
+    --save-every 10 \
+    --training-recipe warmup \
+    --loss-version stable \
+    --dice-weight 0.5 \
+    --latent-weight 0.5 \
+    --warmup-epochs 5 \
+    --answer-transition-epochs 5 \
+    --output-dir outputs/latent_warmup_stable_seed42
+```
+
+For the other runs, replace the recipe and output directory and omit warm-up
+flags. Omit `--latent-weight` for grounding-only. Full-only weights have defaults:
+`--oracle-weight 0.5 --question-weight 0.5 --kd-weight 1 --attn-weight 0.2
+--gain-mix 0.75`. Full-only weight flags are rejected for other recipes.
+Start each comparison from the same pretrained initialization, with its own
+output directory; do not resume one recipe into another and call it a fresh result.
+
+For 5 warm-up + 5 transition epochs, oracle/predicted segmentation weights are:
+
+- Epochs 1–5: 100% oracle, 0% predicted, on answer-available samples.
+- Epochs 6–10: predicted fraction 0.2, 0.4, 0.6, 0.8, 1.0.
+- Epochs 11–20: 100% predicted.
+
+The mixture is between **per-image losses**, not between A/A′ vectors.
+Missing-answer samples always use predicted grounding. Alignment remains active
+throughout. Set transition epochs to 0 for an abrupt switch. Training must reach
+the predicted-only phase. These schedule lengths are starting hypotheses, not
+validated optimal settings.
+
+`--detach-predicted-answer` is an optional additional ablation, default off.
+It prevents grounding/KD gradients passing directly through A′ into the answer
+predictor, while retaining answer-alignment gradients. In full mode, attention
+guidance also still trains the predictor. Shared vision/text encoders still
+receive grounding gradients through their other paths; this is not total
+independence between tasks. Detachment is rejected for grounding-only, or if
+no predictor-supervision term remains. Test warm-up vs alignment with the same
+detachment setting, then change detachment separately.
+
+Recipe, loss version, weights, detachment and schedule are saved in periodic
+checkpoint `run_config.training_config` and history records. Resume restores
+these settings and rejects conflicting explicit flags or objective versions.
+The epoch counter is absolute, so resume does not restart warm-up. Continue to
+repeat the original batch, seed and LR. Relocated external-teacher runs must
+point to the same teacher weights; external teachers apply only to full mode.
+Raw final weights remain plain state dictionaries and cannot record a recipe
+or resume optimizer state. Prefer periodic checkpoints for provenance and resume.
+Use `--init-checkpoint` for intentional mixed-objective warm starts, and label
+them separately. New training outcomes require new runs; diagnostic of old
+weights does not change them into stable-loss results.
+
+## Loss audit and opt-in stable version
+
+**Correct existing mechanics:**
+
+- Segmentation uses BCEWithLogits + per-image soft Dice (default weight 0.5).
+  Logits are resized before loss; GT masks remain binary. BCE is an ordinary
+  pixel mean, not foreground-balanced. Dice supplies an additional overlap term.
+- Mask KD is Bernoulli `KL(p_oracle || p_student)` at each pixel:
+  `BCEWithLogits(student, p_oracle) - H(p_oracle)`. Its gradient is the same
+  as soft-target BCE. It is not a softmax distribution over all image pixels.
+- Oracle targets, entropy and gain/confidence/correctness weights are detached.
+  Oracle segmentation and Q-reference segmentation keep their own gradients.
+- Patch-attention guidance uses forward KL from the normalized gain/foreground
+  target to the predictor's spatial attention, not the reverse direction.
+
+**`--loss-version stable` changes only training calculations:**
+
+1. Mask KL uses stable log-sigmoid probabilities for foreground/background.
+   Equal logits give exactly zero, and extreme logits remain finite. Very small
+   negative values from float rounding can still occur near equality; they do
+   not indicate a mathematically negative KL. The loss is not arbitrarily clamped.
+2. Attention adds a small epsilon and renormalizes the predicted distribution
+   before log/KL. The legacy floor did not renormalize and cut gradients below
+   the floor. The stable target-entropy term handles `0 log 0` explicitly.
+3. Answer alignment and attention losses average over valid targets, rather than
+   adding zero losses for missing-answer samples to the denominator. With DDP,
+   counts are global and compensate for DDP's gradient averaging; ranks with no
+   valid answers do not dilute another rank's supervision.
+4. Full-recipe oracle segmentation is masked to answer-available samples.
+   Legacy mode also applied oracle segmentation to the missing-answer Q fallback,
+   effectively adding another Q loss there. Student/Q-reference segmentation
+   still covers every image. No-valid-target batches have differentiable zero
+   privileged losses.
+
+These are explicitly versioned because their gradient scales differ. The legacy
+default is preserved for old experiments. Do not compare total train_loss across
+recipes as an accuracy measure: full contains more losses. Weighted loss components
+and answer-availability fraction are logged; epoch components are means of batch
+objectives, not separate dataset-wide valid-target statistics. Use diagnostic
+and native validation mIoU for model comparison.
+
+**Remaining design limitations, not silently changed:**
+
+- The answer target is stop-gradient, but uses the same trainable CLIP text
+  encoder. Its representation can drift as Q encoding is optimized; it is not
+  a frozen teacher. No duplicate text tower was added.
+- Target pooling includes the `A:` prefix and compresses answer tokens into one
+  vector. High cosine is not answer correctness or evidence of useful grounding.
+- Gain/confidence weights intentionally shrink KD when oracle and Q-only are
+  similar or uncertain. Tiny `mean_kd_weight_mass` means weak effective KD;
+  increasing KD weight automatically would also amplify unreliable targets.
+- Foreground attention guidance and alignment are hypotheses, not guarantees
+  of improved masks. The new recipes allow their contribution to be ablated.
+- Warm-up does not eliminate incorrect A′ at inference; it only lets the decoder
+  adapt to predicted representations before deployment.
+
+Checks cover mathematical KL direction/gradients, zero/extreme probabilities,
+missing-answer masks, explicit detachment, schedule endpoints, full training
+resume equivalence and two-process CPU/Gloo DDP with uneven valid-answer counts.
+Pre-change tiny-model snapshots match all three diagnostic logits, legacy loss
+and gradients exactly. CUDA/NCCL/full pretrained accuracy have not been tested.
+
+Formula references: [PyTorch KLDivLoss](https://docs.pytorch.org/docs/stable/generated/torch.nn.KLDivLoss.html)
+and [BCEWithLogitsLoss](https://docs.pytorch.org/docs/stable/generated/torch.nn.modules.loss.BCEWithLogitsLoss.html).
