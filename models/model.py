@@ -175,16 +175,18 @@ class GroundingModel(nn.Module):
     def forward(self,batch,compute_loss=False):
         coarse,boxes,contexts,descriptors=self.features(batch)
         if compute_loss and self.stage=='refiner':
-            losses=[]; predictions=[]
+            losses=[]
             for i in range(len(coarse)):
                 j=torch.randint(len(boxes),()).item()
                 local={'detail_image':batch['detail_image'][i:i+1]}
                 residual=self.residual(local,coarse[i:i+1],boxes[j],contexts[i:i+1,j])
-                prediction=blend_residuals(coarse[i:i+1],[residual],[boxes[j]])
-                losses.append(segmentation_loss(crop(prediction,boxes[j]),
+                # Supervise the sampled crop directly.
+                coarse_crop=crop(coarse[i:i+1],boxes[j])
+                prediction=coarse_crop+F.interpolate(residual,size=coarse_crop.shape[-2:],
+                                                     mode='bilinear',align_corners=False)
+                losses.append(segmentation_loss(prediction,
                               crop(batch['detail_mask'][i:i+1],boxes[j]),self.dice_weight))
-                predictions.append(prediction)
-            return {'logits':torch.cat(predictions),'loss':torch.stack(losses).mean()}
+            return {'loss':torch.stack(losses).mean()}
         scores=self.router(descriptors).squeeze(-1)
         if compute_loss:
             with torch.no_grad():
