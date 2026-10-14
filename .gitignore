@@ -13,3 +13,4 @@ yolo*.pt
 docs/
 tests/*
 !tests/test_baseline_protocol.py
+!tests/test_naflex_baseline.py

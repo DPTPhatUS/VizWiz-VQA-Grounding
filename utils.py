@@ -2,7 +2,31 @@ import torch
 
 
 def to_device(batch, device):
-    return {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()}
+    if torch.is_tensor(batch):
+        return batch.to(device, non_blocking=True)
+    if isinstance(batch, dict):
+        return {k: to_device(v, device) for k, v in batch.items()}
+    if isinstance(batch, list):
+        return [to_device(v, device) for v in batch]
+    if isinstance(batch, tuple):
+        return tuple(to_device(v, device) for v in batch)
+    return batch
+
+
+def grounding_loss(predictions, masks, loss_fn):
+    """Equal image weighting, preserving baseline BCE for fixed-size batches."""
+    if torch.is_tensor(predictions):
+        predictions = torch.nn.functional.interpolate(
+            predictions, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+        return loss_fn(predictions, masks)
+    if len(predictions) != len(masks) or not predictions:
+        raise ValueError("Prediction/mask batch sizes differ or are empty")
+    losses = []
+    for prediction, mask in zip(predictions, masks):
+        prediction = torch.nn.functional.interpolate(
+            prediction, size=mask.shape[-2:], mode="bilinear", align_corners=False)
+        losses.append(loss_fn(prediction, mask.unsqueeze(0)))
+    return torch.stack(losses).mean()
 
 
 def align_state_dict(state_dict, model):

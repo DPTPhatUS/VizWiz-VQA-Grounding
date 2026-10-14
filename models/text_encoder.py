@@ -1,11 +1,12 @@
 from torch import nn
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer
 
 
 class TextEncoder(nn.Module):
-    def __init__(self, model_name="openai/clip-vit-large-patch14-336"):
+    def __init__(self, model_name="openai/clip-vit-large-patch14-336", pretrained=True, config=None):
         super().__init__()
-        self.model = CLIPTextModel.from_pretrained(model_name)
+        self.model = (CLIPTextModel.from_pretrained(model_name) if pretrained else
+                      CLIPTextModel(CLIPTextConfig(**config) if config is not None else CLIPTextConfig.from_pretrained(model_name)))
         self.tokenizer = CLIPTokenizer.from_pretrained(model_name)
         self.output_dim = self.model.config.hidden_size  # 768
 

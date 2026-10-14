@@ -16,9 +16,9 @@ from torch.utils.data import DataLoader
 from torchvision.transforms.functional import to_pil_image
 
 from dataset import VizWizGroundingDataset, collate_eval_samples
-from models import GroundingModel
+from models import GroundingModel, build_grounding_model, make_naflex_processor
 from metrics import compute_iou_per_sample
-from utils import align_state_dict
+from utils import align_state_dict, to_device
 
 
 def main(argv=None):
@@ -30,7 +30,8 @@ def main(argv=None):
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir", type=str, default=None)
-    parser.add_argument("--text-mode", choices=["qa", "question"], default="qa")
+    parser.add_argument("--text-mode", choices=["qa", "question"], default=None,
+                        help="Default: checkpoint text mode, or qa for legacy checkpoints")
     parser.add_argument("--metric-resolution", choices=["original", "resized"], default="original",
                         help="Native GT scoring (default); resized reproduces the legacy 336-pixel protocol")
     args = parser.parse_args(argv)
@@ -43,6 +44,22 @@ def main(argv=None):
 
     device = torch.device(args.device)
     image_size = (336, 336)
+
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    model_config = checkpoint.get("model_config") if isinstance(checkpoint, dict) else None
+    args.text_mode = args.text_mode or (checkpoint.get("text_mode", "qa") if isinstance(checkpoint, dict) else "qa")
+    model = build_grounding_model(model_config, pretrained=False) if model_config else GroundingModel()
+    processor = make_naflex_processor(model_config) if model_config else None
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = align_state_dict(checkpoint["model_state_dict"], model)
+        model.load_state_dict(state_dict)
+        print(f"Loaded checkpoint (epoch {checkpoint.get('epoch', '?')})")
+    else:
+        state_dict = align_state_dict(checkpoint, model)
+        model.load_state_dict(state_dict)
+        print("Loaded raw state dict")
+    del state_dict, checkpoint
+    model = model.to(device).eval()
 
     # --- Dataset paths ---
     if args.dataset == "val":
@@ -62,7 +79,8 @@ def main(argv=None):
         image_size=image_size,
         is_test=True,  # disable augmentation
         text_mode=args.text_mode,
-        return_original_mask=args.metric_resolution == "original",
+        return_original_mask=args.metric_resolution == "original" or processor is not None,
+        naflex_processor=processor,
     )
     loader = DataLoader(
         dataset,
@@ -74,22 +92,6 @@ def main(argv=None):
         collate_fn=collate_eval_samples,
     )
 
-    # --- Model ---
-    model = GroundingModel()
-
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        state_dict = align_state_dict(checkpoint["model_state_dict"], model)
-        model.load_state_dict(state_dict)
-        print(f"Loaded checkpoint (epoch {checkpoint.get('epoch', '?')})")
-    else:
-        state_dict = align_state_dict(checkpoint, model)
-        model.load_state_dict(state_dict)
-        print("Loaded raw state dict")
-    del checkpoint
-    model = model.to(device).eval()
-
     # --- Inference ---
     per_sample_iou = {}
 
@@ -99,16 +101,21 @@ def main(argv=None):
     loop = tqdm(loader, desc=f"Eval ({args.dataset})", dynamic_ncols=True)
     with torch.no_grad():
         for batch in loop:
-            images = batch["image"].to(device, non_blocking=True)  # (B, 3, H, W)
+            images = to_device(batch["image"], device)
             texts = batch["text"]
-            masks = batch["mask"].to(device, non_blocking=True)  # (B, 1, H, W)
+            masks = batch["mask"]
             filenames = batch["filename"]
 
             pred = model(images, texts)  # (B, 1, 16*H_p, 16*W_p)
             for i, fname in enumerate(filenames):
-                truth = (batch["original_mask"][i].unsqueeze(0).to(device)
-                         if args.metric_resolution == "original" else masks[i:i+1])
-                logits = F.interpolate(pred[i:i+1].float(), size=truth.shape[-2:],
+                if args.metric_resolution == "original" or processor is not None:
+                    truth = batch["original_mask"][i].unsqueeze(0).to(device)
+                    if args.metric_resolution == "resized":
+                        truth = F.interpolate(truth, size=image_size, mode="nearest")
+                else:
+                    truth = masks[i:i+1].to(device)
+                sample_pred = pred[i] if isinstance(pred, list) else pred[i:i+1]
+                logits = F.interpolate(sample_pred.float(), size=truth.shape[-2:],
                                        mode="bilinear", align_corners=False)
                 prediction = (logits > 0).float()
                 score = compute_iou_per_sample(prediction, truth,
@@ -132,6 +139,8 @@ def main(argv=None):
             "dataset": args.dataset,
             "text_mode": args.text_mode,
             "metric_resolution": args.metric_resolution,
+            "vision_model": model_config["vision_model"] if model_config else "openai/clip-vit-large-patch14-336",
+            "max_num_patches": model_config["max_num_patches"] if model_config else 576,
             "empty_union_score": 1.0 if args.metric_resolution == "original" else 0.0,
             "num_samples": len(per_sample_iou),
             "mean_iou": round(sum(iou_values) / len(iou_values), 6),

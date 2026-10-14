@@ -21,6 +21,7 @@ class VizWizGroundingDataset(Dataset):
         use_aug=False,
         text_mode="qa",
         return_original_mask=False,
+        naflex_processor=None,
     ):
         if text_mode not in {"qa", "question"}:
             raise ValueError("text_mode must be qa or question")
@@ -35,6 +36,7 @@ class VizWizGroundingDataset(Dataset):
         self.use_aug = use_aug
         self.text_mode = text_mode
         self.return_original_mask = return_original_mask
+        self.naflex_processor = naflex_processor
         self.image_size = (
             (image_size, image_size)
             if isinstance(image_size, int)
@@ -68,7 +70,7 @@ class VizWizGroundingDataset(Dataset):
                 with Image.open(mask_path) as m:
                     mask = m.convert("L")
             else:
-                if self.return_original_mask:
+                if self.return_original_mask or self.naflex_processor is not None:
                     raise FileNotFoundError(f"Evaluation mask is missing: {mask_path}")
                 mask = Image.new("L", image.size, 0)
         else:
@@ -76,11 +78,29 @@ class VizWizGroundingDataset(Dataset):
                 raise ValueError("Original-mask evaluation requires mask_root")
             mask = Image.new("L", image.size, 0)
 
+        if self.naflex_processor is not None and image.size != mask.size:
+            raise ValueError(f"NaFlex image/mask dimensions differ for {filename}; check orientation")
         original_mask = None
         if self.return_original_mask:
             if image.size != mask.size:
                 raise ValueError(f"Image/mask dimensions differ for {filename}")
             original_mask = (TF.to_tensor(mask) > 0.5).float()
+
+        if self.naflex_processor is not None:
+            if not self.is_test and self.use_aug:
+                angle = (0, 90, 180, 270)[int(torch.randint(0, 4, (1,)).item())]
+                image, mask = image.rotate(angle, expand=True), mask.rotate(angle, expand=True)
+                if torch.rand(1).item() > 0.5:
+                    image, mask = TF.hflip(image), TF.hflip(mask)
+            inputs = self.naflex_processor(images=image, return_tensors="pt")
+            h, w = inputs["spatial_shapes"][0].tolist()
+            size = (h * self.naflex_processor.patch_size, w * self.naflex_processor.patch_size)
+            mask = TF.resize(mask, size, interpolation=T.InterpolationMode.NEAREST)
+            sample = {"image": {k: v[0] for k, v in inputs.items()}, "text": text,
+                      "mask": (TF.to_tensor(mask) > 0.5).float(), "filename": filename}
+            if original_mask is not None:
+                sample["original_mask"] = original_mask
+            return sample
 
         # 4. Resize: BICUBIC for RGB image (CLIP standard), NEAREST for binary mask
         image = TF.resize(
@@ -123,9 +143,13 @@ class VizWizGroundingDataset(Dataset):
 
 
 def collate_eval_samples(samples):
-    """Stack CLIP inputs while retaining variable-size native masks as a list."""
-    batch = default_collate([{k: v for k, v in sample.items() if k != "original_mask"}
+    """Stack CLIP tensors or NaFlex patches; keep variable-size masks as lists."""
+    variable_grid = isinstance(samples[0]["image"], dict)
+    excluded = {"original_mask", "mask"} if variable_grid else {"original_mask"}
+    batch = default_collate([{k: v for k, v in sample.items() if k not in excluded}
                              for sample in samples])
+    if variable_grid:
+        batch["mask"] = [sample["mask"] for sample in samples]
     if "original_mask" in samples[0]:
         batch["original_mask"] = [sample["original_mask"] for sample in samples]
     return batch

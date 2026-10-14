@@ -24,15 +24,15 @@ transform = T.Compose([
 
 with Image.open(image_path) as img:
     orig_image = ImageOps.exif_transpose(img).convert("RGB")
-image = transform(orig_image).unsqueeze(0).to(device)  # (1, 3, H, W)
-
-# predict
-with torch.no_grad():
-    logits = model(image, text_input)  # (1, 1, 16*H_p, 16*W_p)
-    logits = torch.nn.functional.interpolate(
-        logits.float(), size=(orig_image.height, orig_image.width), mode="bilinear", align_corners=False
-    )  # (1, 1, H_orig, W_orig)
-    mask = torch.sigmoid(logits)[0, 0].cpu()  # (H_orig, W_orig)
+if getattr(model, "model_config", None):
+    mask = model.predict(orig_image, question=question)["prob_map"]
+else:
+    image = transform(orig_image).unsqueeze(0).to(device)
+    with torch.no_grad():
+        logits = model(image, text_input)
+        logits = torch.nn.functional.interpolate(
+            logits.float(), size=(orig_image.height, orig_image.width), mode="bilinear", align_corners=False)
+        mask = torch.sigmoid(logits)[0, 0].cpu()
 
 # visualize and save
 plt.figure(figsize=(10, 5))

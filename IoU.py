@@ -38,6 +38,12 @@ for filename, meta in val_data.items():
     if not os.path.exists(image_path) or not os.path.exists(mask_path):
         continue
 
+    if getattr(model, "model_config", None):
+        result = model.predict(image_path, question=meta.get("question", ""),
+                               answer=meta.get("most_common_answer", ""), gt_mask=mask_path)
+        ious.append(result["iou"])
+        continue
+
     with Image.open(image_path) as img:
         image = image_transform(ImageOps.exif_transpose(img).convert("RGB")).unsqueeze(0).to(device)  # (1, 3, H, W)
     with Image.open(mask_path) as m:

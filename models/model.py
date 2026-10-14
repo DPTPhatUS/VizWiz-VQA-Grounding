@@ -58,8 +58,15 @@ class GroundingModel(nn.Module):
     @classmethod
     def from_checkpoint(cls, checkpoint_path, device=None, **kwargs):
         device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        model = cls(**kwargs)
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        config = ckpt.get("model_config") if isinstance(ckpt, dict) else None
+        if config:
+            if kwargs:
+                raise ValueError("NaFlex architecture is restored from checkpoint metadata; do not override it")
+            from .naflex import build_grounding_model
+            model = build_grounding_model(config, pretrained=False)
+        else:
+            model = cls(**kwargs)
         state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
         state_dict = align_state_dict(state_dict, model)
         model.load_state_dict(state_dict)

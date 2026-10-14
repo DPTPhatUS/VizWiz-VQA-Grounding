@@ -11,9 +11,10 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from dataset import VizWizGroundingDataset
-from utils import align_state_dict, to_device
-from models import GroundingModel
+from dataset import VizWizGroundingDataset, collate_eval_samples
+from utils import align_state_dict, to_device, grounding_loss
+from models import GroundingModel, NaFlexGroundingModel, build_grounding_model, make_naflex_processor
+from models.naflex import BASE_NAFLEX, CLIP_BASELINE, VISION_MODELS
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +56,7 @@ def cleanup_distributed():
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", type=str, default="data/vizwiz")
     parser.add_argument("--num-epochs", type=int, default=100)
@@ -67,9 +68,17 @@ def main():
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--text-mode", choices=["qa", "question"], default="qa",
+    parser.add_argument("--text-mode", choices=["qa", "question"], default=None,
                         help="QA baseline (default) or a separately trained question-only control")
-    args = parser.parse_args()
+    parser.add_argument("--vision-model", choices=VISION_MODELS, default=None,
+                        help="Fresh runs default to Base NaFlex; resumes restore checkpoint architecture")
+    parser.add_argument("--max-num-patches", type=int, default=None,
+                        help="NaFlex patch budget (fresh default: 512); not a fixed image size")
+    args = parser.parse_args(argv)
+    if args.num_epochs <= 0 or args.num_workers < 0 or args.batch_size <= 0:
+        parser.error("Epochs/batch size must be positive and workers nonnegative")
+    if args.max_num_patches is not None and args.max_num_patches <= 0:
+        parser.error("--max-num-patches must be positive")
 
     if args.resume_checkpoint is not None and not os.path.isfile(args.resume_checkpoint):
         parser.error(f"Resume checkpoint is not a file: {args.resume_checkpoint}")
@@ -92,6 +101,36 @@ def main():
 
     image_size = (336, 336)
 
+    checkpoint = (torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False)
+                  if args.resume_checkpoint else None)
+    saved_config = checkpoint.get("model_config") if isinstance(checkpoint, dict) else None
+    if checkpoint is not None:
+        saved_vision = saved_config["vision_model"] if saved_config else CLIP_BASELINE
+        if args.vision_model is not None and args.vision_model != saved_vision:
+            parser.error("Resume backbone differs from checkpoint; start a fresh run to change backbone")
+        if args.max_num_patches is not None and (not saved_config or args.max_num_patches != saved_config["max_num_patches"]):
+            parser.error("Resume patch budget differs from checkpoint; start a fresh run for this comparison")
+        saved_text_mode = checkpoint.get("text_mode", "qa") if isinstance(checkpoint, dict) else "qa"
+        if args.text_mode is not None and args.text_mode != saved_text_mode:
+            parser.error("Resume text mode differs from checkpoint; start a separate control run")
+        args.text_mode = saved_text_mode
+        model = build_grounding_model(saved_config, pretrained=False)
+    else:
+        args.text_mode = args.text_mode or "qa"
+        vision_model = args.vision_model or BASE_NAFLEX
+        if vision_model == CLIP_BASELINE:
+            if args.max_num_patches is not None:
+                parser.error("--max-num-patches applies only to NaFlex")
+            model = GroundingModel()
+        else:
+            model = NaFlexGroundingModel(vision_model=vision_model,
+                                        max_num_patches=args.max_num_patches or 512)
+    model_config = getattr(model, "model_config", None)
+    processor = make_naflex_processor(model_config) if model_config else None
+    if rank == 0:
+        print(f"Vision: {model_config['vision_model'] if model_config else CLIP_BASELINE}; "
+              f"patch budget: {model_config['max_num_patches'] if model_config else 576}; text mode: {args.text_mode}")
+
     # Per-GPU batch size  (keeps effective batch size == args.batch_size)
     per_gpu_bs = args.batch_size // world_size
 
@@ -102,6 +141,7 @@ def main():
         mask_root=os.path.join(args.data_root, "binary_masks_png", "train"),
         image_size=image_size,
         text_mode=args.text_mode,
+        naflex_processor=processor,
     )
     val_set = VizWizGroundingDataset(
         json_path=os.path.join(args.data_root, "val_grounding.json"),
@@ -110,6 +150,7 @@ def main():
         image_size=image_size,
         is_test=True,  # validation must not use random training augmentation
         text_mode=args.text_mode,
+        naflex_processor=processor,
     )
 
     # --- Samplers & Loaders ---
@@ -130,6 +171,7 @@ def main():
         prefetch_factor=2 if args.num_workers > 0 else None,
         worker_init_fn=seed_worker,
         generator=loader_generator,
+        collate_fn=collate_eval_samples,
     )
 
     # Validation: run on EVERY rank with DistributedSampler so the union
@@ -147,14 +189,17 @@ def main():
         pin_memory=(device.type == "cuda"),
         prefetch_factor=2 if args.num_workers > 0 else None,
         worker_init_fn=seed_worker,
+        collate_fn=collate_eval_samples,
     )
 
     # --- Model ---
-    model = GroundingModel().to(device)
+    model = model.to(device)
 
     # SyncBatchNorm: makes per-GPU BatchNorm stats identical to single-GPU
-    if is_dist:
+    if is_dist and not model_config:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    elif is_dist and rank == 0:
+        print("NaFlex uses local decoder BatchNorm: aspect-ratio groups can differ across ranks")
 
     # Wrap with DDP  (after SyncBN conversion)
     if is_dist:
@@ -171,7 +216,6 @@ def main():
     start_epoch = 0
 
     if args.resume_checkpoint is not None:
-        checkpoint = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False)
         # Always load into the *unwrapped* model so state-dict keys match
         # regardless of DDP / SyncBN wrapping.
         underlying_model = model.module if is_dist else model
@@ -179,7 +223,10 @@ def main():
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
             state_dict = align_state_dict(checkpoint["model_state_dict"], underlying_model)
             underlying_model.load_state_dict(state_dict)
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if "optimizer_state_dict" in checkpoint:
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            elif rank == 0:
+                print("Checkpoint has weights/metadata only; optimizer starts fresh")
             for group in optimizer.param_groups:
                 group["lr"] = args.lr
             if "scaler_state_dict" in checkpoint and checkpoint["scaler_state_dict"]:
@@ -197,7 +244,7 @@ def main():
             except Exception:
                 start_epoch = 0
 
-        del checkpoint
+        del state_dict, checkpoint
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -235,10 +282,7 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 with autocast(device.type, enabled=use_amp):
                     pred = model(images, texts)  # (B, 1, 16*H_p, 16*W_p)
-                    pred = nn.functional.interpolate(
-                        pred, size=masks.shape[-2:], mode="bilinear", align_corners=False
-                    )  # (B, 1, H, W)
-                    loss = loss_fn(pred, masks)  # ()
+                    loss = grounding_loss(pred, masks, loss_fn)
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -269,10 +313,7 @@ def main():
 
                         with autocast(device.type, enabled=use_amp):
                             pred = model(images, texts)  # (B, 1, 16*H_p, 16*W_p)
-                            pred = nn.functional.interpolate(
-                                pred, size=masks.shape[-2:], mode="bilinear", align_corners=False
-                            )  # (B, 1, H, W)
-                            loss = loss_fn(pred, masks)  # ()
+                            loss = grounding_loss(pred, masks, loss_fn)
                         val_loss_sum += loss.detach().to(torch.float64)
 
                 if is_dist:
@@ -294,6 +335,9 @@ def main():
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scaler_state_dict": scaler.state_dict(),
                     "loss": avg_train_loss,
+                    "model_config": model_config,
+                    "text_mode": args.text_mode,
+                    "training_args": vars(args),
                 }
                 torch.save(ckpt, ckpt_path, _use_new_zipfile_serialization=False)
                 print(f"✅ Checkpoint saved at {ckpt_path}")
@@ -302,7 +346,12 @@ def main():
         if rank == 0:
             underlying_model = model.module if is_dist else model
             final_path = os.path.join(args.output_dir, f"model_final_epoch{args.num_epochs}.pt")
-            torch.save(underlying_model.state_dict(), final_path, _use_new_zipfile_serialization=False)
+            final_state = underlying_model.state_dict()
+            if model_config:
+                final_state = {"model_state_dict": final_state, "model_config": model_config,
+                               "text_mode": args.text_mode, "epoch": args.num_epochs,
+                               "training_args": vars(args)}
+            torch.save(final_state, final_path, _use_new_zipfile_serialization=False)
             print(f"🔚 Final model saved → {final_path}")
     finally:
         if log_file is not None:
