@@ -2,7 +2,7 @@ import os
 import matplotlib.pyplot as plt
 from models import GroundingModel
 
-checkpoint = "outputs/naflex_base_clip_512/checkpoint_epoch20.pt"
+checkpoint = "outputs/naflex_so400m_clip_512/checkpoint_epoch20.pt"
 image_path = "data/vizwiz/test/VizWiz_test_00000006.jpg"
 question = "What does it say on here?"
 result = GroundingModel.from_checkpoint(checkpoint).predict(image_path, question=question)

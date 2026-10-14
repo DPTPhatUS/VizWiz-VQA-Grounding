@@ -1,10 +1,10 @@
-"""Fixed SigLIP 2 Base NaFlex vision encoder for this experiment branch."""
+"""Fixed SigLIP 2 So400m NaFlex vision encoder for this experiment branch."""
 from collections import defaultdict
 
 from torch import nn
 from transformers import Siglip2ImageProcessor, Siglip2VisionConfig, Siglip2VisionModel
 
-VISION_MODEL = "google/siglip2-base-patch16-naflex"
+VISION_MODEL = "google/siglip2-so400m-patch16-naflex"
 
 
 def make_naflex_processor(config):

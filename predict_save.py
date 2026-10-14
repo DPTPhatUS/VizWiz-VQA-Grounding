@@ -6,7 +6,7 @@ from models import GroundingModel
 # ===== Settings =====
 image_path = "data/vizwiz/test/VizWiz_test_00000006.jpg"
 question = "What does it say on here?"
-checkpoint_path = "outputs/naflex_base_clip_512/checkpoint_epoch20.pt"
+checkpoint_path = "outputs/naflex_so400m_clip_512/checkpoint_epoch20.pt"
 save_path = "results/preview/VizWiz_test_00000006_pred_mask.png"
 device = torch.device("cpu")
 # ===== Model load =====

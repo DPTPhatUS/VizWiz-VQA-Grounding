@@ -1,9 +1,10 @@
-# VizWiz VQA Grounding — fixed SigLIP 2 Base NaFlex
+# VizWiz VQA Grounding — fixed SigLIP 2 So400m NaFlex
 
-Branch `exp/siglip2-naflex-baseline`, derived from `exp/baseline-fixes`.
-Vision is fixed to **`google/siglip2-base-patch16-naflex`** (768 channels,
-12 transformer layers). The separate `exp/siglip2-so400m-naflex-baseline`
-branch fixes vision to So400m (1152 channels, 27 layers).
+Branch `exp/siglip2-so400m-naflex-baseline`, derived from the fixed Base branch
+`exp/siglip2-naflex-baseline` and ultimately `exp/baseline-fixes`.
+Vision is fixed to **`google/siglip2-so400m-patch16-naflex`** (1152 channels,
+27 transformer layers). The separate `exp/siglip2-naflex-baseline` branch
+fixes vision to Base (768 channels, 12 layers).
 There is no vision-backbone switch in either branch.
 
 `models/image_encoder.py` owns the vision encoder and patch grids;
@@ -33,7 +34,7 @@ rescales by `1/255`, then normalizes with RGB mean/std `[0.5,0.5,0.5]`:
 normalization. Saved processor metadata is validated on restoration.
 GT masks remain binary labels and use nearest resize to the processed grid.
 Padding is removed before CNN decoding and loss computation.
-[Official Base processor](https://huggingface.co/google/siglip2-base-patch16-naflex/blob/main/preprocessor_config.json)
+[Official So400m processor](https://huggingface.co/google/siglip2-so400m-patch16-naflex/blob/main/preprocessor_config.json)
 
 NaFlex still resizes images. The default patch budget here is 512, compared
 with the upstream processor's 256. Test 1024 separately with a new output
@@ -70,7 +71,7 @@ uv run torchrun --nproc_per_node=2 train.py \
     --validate-every 1 \
     --save-every 10 \
     --seed 42 \
-    --output-dir outputs/naflex_base_clip_512
+    --output-dir outputs/naflex_so400m_clip_512
 ```
 
 `--batch-size` is the **global micro-batch**, so this uses one image per GPU.
@@ -102,8 +103,8 @@ set's mIoU without sampler duplication.
 ## Checkpoints, evaluation and resume
 
 ```bash
-uv run eval.py --checkpoint outputs/naflex_base_clip_512/checkpoint_epoch20.pt --dataset val --data-root /kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz --output-dir outputs/eval_naflex_base_clip_512
-uv run train.py --data-root data/vizwiz --resume-checkpoint outputs/naflex_base_clip_512/checkpoint_epoch20.pt --num-epochs 30 --output-dir outputs/naflex_base_clip_512
+uv run eval.py --checkpoint outputs/naflex_so400m_clip_512/checkpoint_epoch20.pt --dataset val --data-root /kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz --output-dir outputs/eval_naflex_so400m_clip_512
+uv run train.py --data-root data/vizwiz --resume-checkpoint outputs/naflex_so400m_clip_512/checkpoint_epoch20.pt --num-epochs 30 --output-dir outputs/naflex_so400m_clip_512
 ```
 
 Checkpoints save architecture, encoder configurations, preprocessing, patch
@@ -128,7 +129,7 @@ Q-only-trained baseline. Metadata records the selected protocol.
 
 ```python
 from models import GroundingModel
-model = GroundingModel.from_checkpoint('outputs/naflex_base_clip_512/checkpoint_epoch20.pt')
+model = GroundingModel.from_checkpoint('outputs/naflex_so400m_clip_512/checkpoint_epoch20.pt')
 result = model.predict('image.jpg', question='What does this label say?', answer='example')
 result['pred_pil'].save('mask.png')  # original image dimensions
 ```
