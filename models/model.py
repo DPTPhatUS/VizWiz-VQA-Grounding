@@ -11,6 +11,7 @@ from models.mask_decoder import CompactDecoder
 from utils import load_model_weights, is_tiny_state, read_checkpoint
 
 class CompactGroundingModel(nn.Module):
+    """Shared encoders, latent answer predictor and conditioned mask decoder."""
     architecture = "compact"
 
     def __init__(self, tiny=False):
@@ -48,7 +49,23 @@ class CompactGroundingModel(nn.Module):
     def encode_image(self, image):
         return self.image_encoder((image - self.image_mean) / self.image_std)  # 4 x (B, D_v, H_p, W_p)
 
+    def encode_question(self, texts, question_vec=None):
+        """Accept raw text or cached token features and return their pooled question."""
+        text = texts if hasattr(texts, "tokens") else self.text_encoder(texts)
+        q = question_vec if question_vec is not None else masked_mean(text.tokens, text.valid_mask)  # (B, D_t)
+        return text, q
+
+    @torch.no_grad()
+    def encode_answer_target(self, batch):
+        """Encode real answers for privileged supervision, without target gradients."""
+        answers = batch.get("answer_only_text") or [
+            f"A: {t.split(' A: ', 1)[1]}" if " A: " in t else t for t in batch["answer_text"]
+        ]
+        text = self.text_encoder(answers)
+        return masked_mean(text.tokens, text.valid_mask)  # (B, D_t)
+
     def infer_latent_answer(self, vision, question_vec):
+        """Predict A′ by attending to image patches with the pooled question."""
         B, _, H_p, W_p = vision.shape
         patches = vision.flatten(2).transpose(1, 2)  # (B, N, D_v), N = H_p * W_p
         visual_kv = self.visual_to_text(patches)  # (B, N, D_t)
@@ -61,76 +78,105 @@ class CompactGroundingModel(nn.Module):
         attn_map = attn_weights.view(B, 1, H_p, W_p)  # (B, 1, H_p, W_p)
         return latent, attn_map
 
-    def decode(self, features, texts, answer_vec=None, *, projected_skips=None, question_vec=None,
-               question_only=False, answer_available=None, detach_predicted_answer=False):
+    def _answer_conditioning(self, text, question_vec, answer_vec, available):
+        """Append an answer token; missing answers use Q-only attention and skips."""
+        token = answer_vec.to(text.tokens.dtype).unsqueeze(1)  # (B, 1, D_t)
+        mask = torch.ones(token.shape[:2], dtype=torch.bool, device=token.device)
+        if available is not None:
+            mask = torch.as_tensor(available, device=token.device, dtype=torch.bool).view(-1, 1)
+            answer_vec = torch.where(mask, answer_vec, question_vec.to(answer_vec.dtype))
+            token = torch.where(mask.unsqueeze(-1), token, torch.zeros_like(token))
+        return (torch.cat([text.tokens, token], dim=1),
+                torch.cat([text.attention_mask, mask], dim=1), answer_vec)
+
+    def _grounding_logits(self, features, tokens, attention_mask, question_vec, answer_vec,
+                         projected_skips=None):
+        """The same visual/text fusion and mask decoder for every conditioning view."""
         s1, s2, s3, vision = features  # each (B, D_v, H_p, W_p)
-        text = texts if hasattr(texts, "tokens") else self.text_encoder(texts)
-        q = question_vec if question_vec is not None else masked_mean(text.tokens, text.valid_mask)  # (B, D_t)
-        if question_only:
-            # A real Q-only counterfactual: no answer token and Q-only skip conditioning.
-            latent, attn_map = None, None
-            kv_tokens, kv_mask = text.tokens, text.attention_mask
-        else:
-            if answer_vec is None:
-                latent, attn_map = self.infer_latent_answer(vision, q)
-            else:
-                latent, attn_map = answer_vec.to(text.tokens.dtype), None
-            inferred_latent = latent
-            if detach_predicted_answer and answer_vec is None:
-                latent = latent.detach()  # cut grounding gradients, retain the vector for alignment
-            ans_token = latent.to(text.tokens.dtype).unsqueeze(1)
-            ans_mask = torch.ones(ans_token.shape[:2], dtype=torch.bool, device=ans_token.device)
-            if answer_available is not None:
-                ans_mask = torch.as_tensor(answer_available, device=ans_token.device, dtype=torch.bool).view(-1, 1)
-                # Missing-answer examples use the same Q-only skip condition as the reference.
-                latent = torch.where(ans_mask, latent, q.to(latent.dtype))
-                ans_token = torch.where(ans_mask.unsqueeze(-1), ans_token, torch.zeros_like(ans_token))
-            kv_tokens = torch.cat([text.tokens, ans_token], dim=1)
-            kv_mask = torch.cat([text.attention_mask, ans_mask], dim=1)
         query = vision.flatten(2).transpose(1, 2)  # (B, N, D_v)
-        projected = self.text_proj(kv_tokens)  # (B, L + 1, D_v)
+        projected = self.text_proj(tokens)  # (B, L or L + 1, D_v)
         query = query.to(projected.dtype)
         attended, _ = self.cross_attn(query, projected, projected,
-            key_padding_mask=~kv_mask, need_weights=False)  # (B, N, D_v)
+            key_padding_mask=~attention_mask, need_weights=False)  # (B, N, D_v)
         fused = query + self.residual_scale.to(query.dtype) * attended  # (B, N, D_v)
         fused = fused.transpose(1, 2).reshape_as(vision).contiguous()  # (B, D_v, H_p, W_p)
-        logits = self._decode_mask(fused, s3, s2, s1, q, latent, projected_skips=projected_skips)  # (B, 1, 16*H_p, 16*W_p)
-        if detach_predicted_answer and not question_only and answer_vec is None:
-            latent = inferred_latent
-        return {"logits": logits, "latent_answer": latent, "answer_attn": attn_map, "question_vec": q.detach()}
+        return self._decode_mask(fused, s3, s2, s1, question_vec, answer_vec,
+                                 projected_skips=projected_skips)  # (B, 1, 16*H_p, 16*W_p)
+
+    def decode_question(self, features, text, question_vec, *, projected_skips=None):
+        """Q-only reference: no answer token and Q-only skip conditioning."""
+        logits = self._grounding_logits(features, text.tokens, text.attention_mask,
+                                       question_vec, None, projected_skips)
+        return {"logits": logits, "latent_answer": None, "answer_attn": None,
+                "question_vec": question_vec.detach()}
+
+    def decode_answer(self, features, text, question_vec, answer_vec, *,
+                      answer_available=None, projected_skips=None):
+        """Ground with a supplied answer vector (real A or a diagnostic intervention)."""
+        tokens, mask, answer = self._answer_conditioning(
+            text, question_vec, answer_vec.to(text.tokens.dtype), answer_available)
+        logits = self._grounding_logits(features, tokens, mask, question_vec, answer, projected_skips)
+        return {"logits": logits, "latent_answer": answer, "answer_attn": None,
+                "question_vec": question_vec.detach()}
+
+    def decode_predicted(self, features, text, question_vec, *, detach_predicted_answer=False,
+                         answer_available=None, projected_skips=None):
+        """Ground with A′, optionally cutting only its direct mask-loss gradient."""
+        latent, attn_map = self.infer_latent_answer(features[-1], question_vec)
+        conditioning = latent.detach() if detach_predicted_answer else latent
+        tokens, mask, answer = self._answer_conditioning(text, question_vec, conditioning, answer_available)
+        logits = self._grounding_logits(features, tokens, mask, question_vec, answer, projected_skips)
+        # Alignment still needs the original A′ graph when grounding uses detached A′.
+        return {"logits": logits, "latent_answer": latent if detach_predicted_answer else answer,
+                "answer_attn": attn_map, "question_vec": question_vec.detach()}
+
+    def decode(self, features, texts, answer_vec=None, *, projected_skips=None, question_vec=None,
+               question_only=False, answer_available=None, detach_predicted_answer=False):
+        """Compatibility entry point for existing prediction and diagnostic callers."""
+        text, q = self.encode_question(texts, question_vec)
+        if question_only:
+            return self.decode_question(features, text, q, projected_skips=projected_skips)
+        if answer_vec is not None:
+            return self.decode_answer(features, text, q, answer_vec,
+                                      answer_available=answer_available, projected_skips=projected_skips)
+        return self.decode_predicted(features, text, q, detach_predicted_answer=detach_predicted_answer,
+                                     answer_available=answer_available, projected_skips=projected_skips)
 
     def forward(self, batch):
+        """Encode once, predict the mask, then add only the requested training views.
+
+        Existing objectives select views through the batch controls below. All
+        views share this model's weights and stay inside one DDP forward call.
+        """
         features = self.encode_image(batch["image"])  # 4 x (B, D_v, H_p, W_p)
-        questions = batch.get("question_text", batch["text"])
-        text = self.text_encoder(questions)
-        q = masked_mean(text.tokens, text.valid_mask)  # (B, D_t)
-        has_answer = self.training and batch.get("encode_answer_target", True) and ("answer_only_text" in batch or "answer_text" in batch)
-        self_distill = has_answer and batch.get("self_distill", True)
-        needs_oracle = self_distill or (has_answer and batch.get("oracle_supervision", False))
+        text, q = self.encode_question(batch.get("question_text", batch["text"]))
+
+        # Resolve the recipe's view requests at the forward boundary.
+        has_target = (self.training and batch.get("encode_answer_target", True)
+                      and ("answer_only_text" in batch or "answer_text" in batch))
+        needs_question = has_target and batch.get("self_distill", True)
+        needs_oracle = needs_question or (has_target and batch.get("oracle_supervision", False))
         s1, s2, s3, _ = features
-        proj_skips = self.decoder.project_skips(s3, s2, s1) if needs_oracle and hasattr(self.decoder, "project_skips") else None
-        student = self.decode(features, text, projected_skips=proj_skips, question_vec=q,
-                              detach_predicted_answer=self.training and batch.get("detach_predicted_answer", False))
-        if has_answer:
-            ans_texts = batch.get("answer_only_text") or [
-                f"A: {t.split(' A: ', 1)[1]}" if " A: " in t else t for t in batch["answer_text"]
-            ]
-            with torch.no_grad():
-                ans_feat = self.text_encoder(ans_texts)
-                target_answer = masked_mean(ans_feat.tokens, ans_feat.valid_mask)  # (B, D_t)
-            student["target_answer"] = target_answer
-            if self_distill:
-                question_logits = self.decode(
-                    features, text, projected_skips=proj_skips, question_vec=q, question_only=True
-                )["logits"]
-                student["question_logits"] = question_logits
-            if needs_oracle:
-                teacher_logits = self.decode(
-                    features, text, target_answer, projected_skips=proj_skips, question_vec=q,
-                    answer_available=batch.get("answer_available")
-                )["logits"]
-                student["teacher_logits"] = teacher_logits
-        return student
+        projected_skips = None
+        if needs_oracle and hasattr(self.decoder, "project_skips"):
+            projected_skips = self.decoder.project_skips(s3, s2, s1)
+
+        output = self.decode_predicted(features, text, q, projected_skips=projected_skips,
+                                      detach_predicted_answer=self.training and batch.get("detach_predicted_answer", False))
+        if not has_target:
+            return output
+
+        target_answer = self.encode_answer_target(batch)
+        output["target_answer"] = target_answer
+        if needs_question:
+            output["question_logits"] = self.decode_question(
+                features, text, q, projected_skips=projected_skips)["logits"]
+        if needs_oracle:
+            # Historical output name: this is the shared model's oracle view.
+            output["teacher_logits"] = self.decode_answer(
+                features, text, q, target_answer, answer_available=batch.get("answer_available"),
+                projected_skips=projected_skips)["logits"]
+        return output
 
     @classmethod
     def from_checkpoint(cls, checkpoint_path, device=None, **kwargs):
