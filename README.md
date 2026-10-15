@@ -105,3 +105,27 @@ matching parameter names/shapes and load for inference. Student predictions do
 not use ground-truth answers. `predict_save.py` and `visualize_predictions.py`
 provide single-image prediction and overlays. Historical standalone teacher
 checkpoint formats are detected automatically; no `--teacher` flag is needed.
+
+## Diagnostics
+
+Both diagnostic tools are included at the repository root. `diagnose.py`
+compares Q-only, predicted-answer and real-answer masks. For Q/A interventions,
+embedding retrieval and conditioning traces, run:
+
+```bash
+uv run python probe_latent_conditioning.py \
+    --checkpoint outputs/checkpoint_epoch20.pt \
+    --data-root /path/to/vizwiz \
+    --dataset val \
+    --batch-size 4 \
+    --num-workers 2 \
+    --device cuda \
+    --output-dir outputs/probe_val_ep20
+```
+
+Use one process, without torchrun, and a new or empty output directory. The
+probe leaves weights and annotations unchanged. It exports summaries, per-image
+measurements, embeddings and a gallery. Intervention scores use the original
+GT and measure sensitivity; they are not accuracy for a newly posed question.
+The pretrained text reference runs on CPU; `--skip-pretrained-reference` omits
+that comparison when needed. Reports, data and local tests remain untracked.
