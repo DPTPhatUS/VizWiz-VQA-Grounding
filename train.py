@@ -147,7 +147,7 @@ def unwrap(model):
     return model.module if hasattr(model, "module") else model
 
 
-def training_parser(teacher_training=False):
+def training_parser(teacher_training=False, *, advanced=False):
     parser = argparse.ArgumentParser(description="Train answer-dropout teacher" if teacher_training else __doc__)
     parser.add_argument("--data-root", default="data/vizwiz")
     parser.add_argument("--output-dir", default="outputs")
@@ -161,17 +161,27 @@ def training_parser(teacher_training=False):
     parser.add_argument("--resume-checkpoint", help="Resume a full checkpoint; raw weights use --init-checkpoint")
     parser.add_argument("--init-checkpoint", help="Optional compact control weights; starts a new run")
     if not teacher_training:
-        parser.add_argument("--teacher-checkpoint", default=None, help="Optional fully trained latent-architecture teacher; omit for single-stage self-distillation")
-        parser.add_argument("--supervised-only", action="store_true", default=None, help="Alias for grounding-only recipe")
-        parser.add_argument("--training-recipe", choices=["full", "grounding-only", "alignment", "warmup"], default=None,
-                            help="Fresh default full; resume restores the saved recipe")
-        parser.add_argument("--loss-version", choices=["legacy", "stable"], default=None,
-                            help="Fresh default legacy preserves latent-gain-v2; stable opts into corrected reductions/KL")
-        parser.add_argument("--detach-predicted-answer", action=argparse.BooleanOptionalAction, default=None)
-        parser.add_argument("--warmup-epochs", type=int, default=None)
-        parser.add_argument("--answer-transition-epochs", type=int, default=None)
+        parser.add_argument("--help-advanced", action="store_true", help="Show loss weights, warm-up schedule and compatibility options")
+        recipes = parser.add_argument_group("training recipe", "Choose one recipe; defaults restore automatically on resume.")
+        recipes.add_argument("--training-recipe", choices=["full", "grounding-only", "alignment", "warmup"], default=None,
+                            help="full: all losses, no warm-up (legacy default); grounding-only: mask loss; alignment: mask + answer alignment; warmup: oracle-to-predicted schedule")
+        recipes.add_argument("--loss-version", choices=["legacy", "stable"], default=None,
+                            help="Use stable for new comparisons; legacy preserves old training (fresh default)")
+        tuning = parser.add_argument_group("advanced training options" if advanced else argparse.SUPPRESS)
+        tuning.add_argument("--teacher-checkpoint", default=None, help="Optional fully trained latent teacher, full recipe only" if advanced else argparse.SUPPRESS)
+        tuning.add_argument("--supervised-only", action="store_true", default=None,
+                            help="Compatibility alias for --training-recipe grounding-only" if advanced else argparse.SUPPRESS)
+        tuning.add_argument("--detach-predicted-answer", action=argparse.BooleanOptionalAction, default=None,
+                            help="Cut the direct grounding gradient through A'; default off" if advanced else argparse.SUPPRESS)
+        tuning.add_argument("--warmup-epochs", type=int, default=None,
+                            help="Oracle-only epochs for warmup recipe; fresh default 5" if advanced else argparse.SUPPRESS)
+        tuning.add_argument("--answer-transition-epochs", type=int, default=None,
+                            help="Oracle-to-predicted transition for warmup recipe; fresh default 5" if advanced else argparse.SUPPRESS)
         for flag in ("dice-weight", "latent-weight", "oracle-weight", "question-weight", "kd-weight", "attn-weight", "gain-mix"):
-            parser.add_argument(f"--{flag}", type=float, default=None)
+            default = TRAINING_DEFAULTS[flag.replace("-", "_")]
+            scope = "Full recipe only; " if flag in ("oracle-weight", "question-weight", "kd-weight", "attn-weight", "gain-mix") else ""
+            tuning.add_argument(f"--{flag}", type=float, default=None,
+                                help=f"{scope}fresh default {default:g}" if advanced else argparse.SUPPRESS)
     return parser
 
 
@@ -194,6 +204,11 @@ def check_arguments(args):
 
 def train_main(argv=None, teacher_training=False):
     args = training_parser(teacher_training).parse_args(argv)
+    if not teacher_training:
+        if args.help_advanced:
+            training_parser(advanced=True).print_help()
+            return
+        del args.help_advanced
     args.teacher_training = teacher_training
     args.device = "cuda" if torch.cuda.is_available() else "cpu"
     check_arguments(args)

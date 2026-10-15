@@ -163,6 +163,18 @@ This adds training choices, **not architecture choices**. Parameter names,
 counts, shapes, default inference, eval.py and diagnose.py are unchanged.
 Complete existing latent weights remain loadable without retraining.
 
+For a new controlled comparison, choose a recipe and use `--loss-version stable`.
+The ordinary `--help` shows these choices alongside data/optimizer settings;
+`--help-advanced` also shows loss weights, detachment, warm-up schedule and old
+aliases. Every existing flag is still accepted. This is a help/documentation
+cleanup, not a change to training defaults or checkpoint settings.
+
+Start with `grounding-only` versus `alignment`. Add `warmup` to test the effect
+of oracle-first training; use `full` to compare the complete existing objective.
+`full` does **not** include warm-up. More active losses do not imply better masks.
+The literature comparison and conditional next steps are in
+[LATENT_RELATED_WORK.md](LATENT_RELATED_WORK.md).
+
 | `--training-recipe` | Training objective |
 |---|---|
 | `full` (fresh default) | Existing inferred-answer segmentation + oracle/Q-reference segmentation + gain-weighted KD + answer alignment + attention guidance |
@@ -195,15 +207,12 @@ uv run torchrun --nproc_per_node=2 train.py \
     --save-every 10 \
     --training-recipe warmup \
     --loss-version stable \
-    --dice-weight 0.5 \
-    --latent-weight 0.5 \
-    --warmup-epochs 5 \
-    --answer-transition-epochs 5 \
     --output-dir outputs/latent_warmup_stable_seed42
 ```
 
-For the other runs, replace the recipe and output directory and omit warm-up
-flags. Omit `--latent-weight` for grounding-only. Full-only weights have defaults:
+This uses the default 5 warm-up + 5 transition epochs and default loss weights.
+For the other runs, replace the recipe and output directory. No per-loss flags
+are needed for the initial comparison. Full-only weights have defaults:
 `--oracle-weight 0.5 --question-weight 0.5 --kd-weight 1 --attn-weight 0.2
 --gain-mix 0.75`. Full-only weight flags are rejected for other recipes.
 Start each comparison from the same pretrained initialization, with its own
