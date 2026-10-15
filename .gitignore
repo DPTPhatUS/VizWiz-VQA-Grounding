@@ -10,8 +10,9 @@ models/__pycache__/
 !.omo/rules/
 !.omo/rules/**
 yolo*.pt
-docs/
-tests/*
-!tests/test_latent_distillation.py
-!tests/test_latent_diagnostic.py
-!tests/test_latent_training_recipes.py
+# Personal research notes, datasets, diagnostics and local checks.
+/personal/
+/docs/
+/tests/
+*.md
+!/README.md
