@@ -18,7 +18,6 @@ def eval_main(argv=None):
     parser.add_argument("--num-workers",type=int,default=4)
     parser.add_argument("--device",default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir",required=True)
-    parser.add_argument("--teacher", action="store_true", help="Evaluate a fully trained latent-architecture teacher instead of the student")
     args = parser.parse_args(argv)
     if args.batch_size <= 0 or args.num_workers < 0:
         raise ValueError("Invalid batch size or worker count")
@@ -26,8 +25,7 @@ def eval_main(argv=None):
     config = saved["run_config"]
     state = saved["model_state_dict"]
     is_teacher = (
-        args.teacher
-        or config.get("teacher_training", False)
+        config.get("teacher_training", False)
         or (bool(state) and not any(k.startswith("coarse.") for k in state))
     )
     model_type = TeacherModel if is_teacher else GroundingModel

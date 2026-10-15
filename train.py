@@ -12,30 +12,9 @@ from torch import nn
 from torch.utils.data import DistributedSampler
 from tqdm.auto import tqdm
 from dataset import VizWizGroundingDataset, make_loader
-from utils import to_device, read_checkpoint, load_model_weights, initialize_weights, is_tiny_state, LATENT_ANSWER_KEYS
+from utils import to_device, read_checkpoint, load_model_weights, initialize_weights, is_tiny_state
 from models.model import GroundingModel
 from losses import SupervisedObjective, DistillationObjective, AnswerAlignmentObjective
-from models.model import CompactGroundingModel, TeacherModel
-
-
-def load_teacher(path, device):
-    saved = read_checkpoint(path)
-    config, run = saved.get("experiment_config") or {}, saved["run_config"]
-    state = saved["model_state_dict"]
-    if (
-        (config and config.get("experiment") != "controls")
-        or (run and (run.get("text_mode") != "dropout" or not 0 < run.get("answer_dropout", 0) < 1))
-        or any(k.startswith("coarse.") for k in state)
-    ):
-        raise ValueError("Teacher must be a corrected model trained with answer dropout")
-    if run.get("image_size", IMAGE_SIZE) != IMAGE_SIZE:
-        raise ValueError("Teacher/student image sizes must match")
-    if not LATENT_ANSWER_KEYS <= set(state):
-        raise ValueError("Frozen teacher lacks trained latent-answer tensors; compact checkpoints may only initialize a student via --init-checkpoint")
-    tiny = config.get("tiny", run.get("tiny", is_tiny_state(state)))
-    teacher = TeacherModel(tiny=tiny)
-    load_model_weights(teacher, saved)
-    return teacher.to(device)
 
 
 IMAGE_SIZE = 336
@@ -49,8 +28,6 @@ TRAINING_DEFAULTS = {
 
 
 def objective_version(args):
-    if args.teacher_training:
-        return "supervised-teacher-v1"
     versions = {"full": "latent-gain-v2" if args.loss_version == "legacy" else "latent-gain-v3",
                 "grounding-only": "latent-supervised-v1",
                 "alignment": "latent-alignment-v1" if args.loss_version == "legacy" else "latent-alignment-v2",
@@ -60,17 +37,26 @@ def objective_version(args):
 
 def resolve_training_arguments(args, saved=None):
     """Restore recipe settings on resume; never silently switch objective or schedule."""
-    if args.teacher_training:
-        return
-    requested = {key: getattr(args, key) for key in TRAINING_DEFAULTS}
-    if args.supervised_only:
-        if requested["training_recipe"] not in (None, "grounding-only"):
-            raise ValueError("--supervised-only is an alias for --training-recipe grounding-only")
-        requested["training_recipe"] = "grounding-only"
+    requested = {}
+    if args.config:
+        requested = json.loads(Path(args.config).read_text(encoding="utf-8-sig"))
+        if not isinstance(requested, dict) or set(requested) - TRAINING_DEFAULTS.keys():
+            raise ValueError("Config must be a JSON object containing only keys from TRAINING_DEFAULTS")
+        for key, value in requested.items():
+            default = TRAINING_DEFAULTS[key]
+            numeric = type(default) is float and type(value) in (int, float)
+            if not numeric and type(value) is not type(default):
+                raise ValueError(f"Config {key} has the wrong value type")
+    for key in ("training_recipe", "loss_version"):
+        value = getattr(args, key)
+        if value is not None:
+            if key in requested and requested[key] != value:
+                raise ValueError(f"Explicit {key} conflicts with config")
+            requested[key] = value
     if saved is not None:
         run = saved["run_config"]
-        if run.get("teacher_training"):
-            raise ValueError("A teacher checkpoint cannot resume student training")
+        if run.get("teacher_training") or run.get("teacher_checkpoint"):
+            raise ValueError("Historical teacher runs must resume with personal/legacy/latent_training.py or latent_teacher.py; the main trainer is single-stage")
         settings = dict(TRAINING_DEFAULTS)
         settings.update(run.get("loss_config", {}))
         settings.update({k: run[k] for k in TRAINING_DEFAULTS if k in run})
@@ -78,18 +64,14 @@ def resolve_training_arguments(args, saved=None):
         if "training_recipe" not in run and "training_config" not in run:
             settings["training_recipe"] = "grounding-only" if run.get("supervised_only") else "full"
         for key in TRAINING_DEFAULTS:
-            if requested[key] is not None and requested[key] != settings[key]:
+            if key in requested and requested[key] != settings[key]:
                 raise ValueError(f"Resume {key} differs from checkpoint; use --init-checkpoint for a new experiment")
-        if args.teacher_checkpoint is None:
-            args.teacher_checkpoint = run.get("teacher_checkpoint")
-        elif not run.get("teacher_checkpoint"):
-            raise ValueError("Resume cannot add an external teacher; use --init-checkpoint")
     else:
         settings = dict(TRAINING_DEFAULTS)
-        settings.update({k: v for k, v in requested.items() if v is not None})
+        settings.update(requested)
         if settings["training_recipe"] == "warmup":
             for key in ("warmup_epochs", "answer_transition_epochs"):
-                if requested[key] is None:
+                if key not in requested:
                     settings[key] = 5
     for key in TRAINING_DEFAULTS:
         setattr(args, key, settings[key])
@@ -100,11 +82,9 @@ def resolve_training_arguments(args, saved=None):
         recorded_version = saved["run_config"].get("objective_version")
         if recorded_version and recorded_version != objective_version(args):
             raise ValueError("Saved objective version differs; use --init-checkpoint for mixed-objective continuation")
-    if args.training_recipe != "full" and args.teacher_checkpoint:
-        raise ValueError("External teachers are supported only by the full recipe")
-    if args.training_recipe != "full" and any(requested[k] is not None for k in
+    if args.training_recipe != "full" and any(k in requested for k in
             ("oracle_weight", "question_weight", "kd_weight", "attn_weight", "gain_mix")):
-        raise ValueError("Oracle/Q-reference/KD/attention weight flags apply only to the full recipe")
+        raise ValueError("Oracle/Q-reference/KD/attention config weights apply only to the full recipe")
     for key in ("dice_weight", "latent_weight", "oracle_weight", "question_weight", "kd_weight", "attn_weight"):
         if not math.isfinite(getattr(args, key)) or getattr(args, key) < 0:
             raise ValueError(f"{key} must be finite and nonnegative")
@@ -116,20 +96,18 @@ def resolve_training_arguments(args, saved=None):
         if args.warmup_epochs < 1 or args.num_epochs < args.warmup_epochs + max(args.answer_transition_epochs, 1):
             raise ValueError("Warmup needs positive warm-up epochs and enough epochs to reach predicted-only training")
     elif args.warmup_epochs or args.answer_transition_epochs:
-        raise ValueError("Warm-up/transition flags require --training-recipe warmup")
+        raise ValueError("Warm-up/transition settings require --training-recipe warmup")
     if args.detach_predicted_answer and (args.training_recipe == "grounding-only" or
             (args.latent_weight == 0 and (args.training_recipe != "full" or args.attn_weight == 0))):
         raise ValueError("Detaching A′ requires a predictor supervision loss; grounding-only must not detach")
 
 
-def build_objective(args, teacher=None):
-    if args.teacher_training:
-        return SupervisedObjective()
+def build_objective(args):
     if args.training_recipe == "grounding-only":
         return SupervisedObjective(args.dice_weight)
     common = {k: getattr(args, k) for k in ("dice_weight", "latent_weight", "loss_version", "detach_predicted_answer")}
     if args.training_recipe == "full":
-        return DistillationObjective(teacher, **common, **{k: getattr(args, k) for k in
+        return DistillationObjective(**common, **{k: getattr(args, k) for k in
             ("oracle_weight", "question_weight", "kd_weight", "attn_weight", "gain_mix")})
     return AnswerAlignmentObjective(**common, warmup_epochs=args.warmup_epochs,
                                     transition_epochs=args.answer_transition_epochs)
@@ -147,8 +125,8 @@ def unwrap(model):
     return model.module if hasattr(model, "module") else model
 
 
-def training_parser(teacher_training=False, *, advanced=False):
-    parser = argparse.ArgumentParser(description="Train answer-dropout teacher" if teacher_training else __doc__)
+def training_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", default="data/vizwiz")
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--num-epochs", type=int, default=100)
@@ -160,28 +138,11 @@ def training_parser(teacher_training=False, *, advanced=False):
                         help="Save a resumable checkpoint every N epochs; 0 disables periodic saves")
     parser.add_argument("--resume-checkpoint", help="Resume a full checkpoint; raw weights use --init-checkpoint")
     parser.add_argument("--init-checkpoint", help="Optional compact control weights; starts a new run")
-    if not teacher_training:
-        parser.add_argument("--help-advanced", action="store_true", help="Show loss weights, warm-up schedule and compatibility options")
-        recipes = parser.add_argument_group("training recipe", "Choose one recipe; defaults restore automatically on resume.")
-        recipes.add_argument("--training-recipe", choices=["full", "grounding-only", "alignment", "warmup"], default=None,
-                            help="full: all losses, no warm-up (legacy default); grounding-only: mask loss; alignment: mask + answer alignment; warmup: oracle-to-predicted schedule")
-        recipes.add_argument("--loss-version", choices=["legacy", "stable"], default=None,
-                            help="Use stable for new comparisons; legacy preserves old training (fresh default)")
-        tuning = parser.add_argument_group("advanced training options" if advanced else argparse.SUPPRESS)
-        tuning.add_argument("--teacher-checkpoint", default=None, help="Optional fully trained latent teacher, full recipe only" if advanced else argparse.SUPPRESS)
-        tuning.add_argument("--supervised-only", action="store_true", default=None,
-                            help="Compatibility alias for --training-recipe grounding-only" if advanced else argparse.SUPPRESS)
-        tuning.add_argument("--detach-predicted-answer", action=argparse.BooleanOptionalAction, default=None,
-                            help="Cut the direct grounding gradient through A'; default off" if advanced else argparse.SUPPRESS)
-        tuning.add_argument("--warmup-epochs", type=int, default=None,
-                            help="Oracle-only epochs for warmup recipe; fresh default 5" if advanced else argparse.SUPPRESS)
-        tuning.add_argument("--answer-transition-epochs", type=int, default=None,
-                            help="Oracle-to-predicted transition for warmup recipe; fresh default 5" if advanced else argparse.SUPPRESS)
-        for flag in ("dice-weight", "latent-weight", "oracle-weight", "question-weight", "kd-weight", "attn-weight", "gain-mix"):
-            default = TRAINING_DEFAULTS[flag.replace("-", "_")]
-            scope = "Full recipe only; " if flag in ("oracle-weight", "question-weight", "kd-weight", "attn-weight", "gain-mix") else ""
-            tuning.add_argument(f"--{flag}", type=float, default=None,
-                                help=f"{scope}fresh default {default:g}" if advanced else argparse.SUPPRESS)
+    parser.add_argument("--training-recipe", choices=["full", "grounding-only", "alignment", "warmup"], default=None,
+                        help="Fresh default full (no warm-up); resume restores saved settings")
+    parser.add_argument("--loss-version", choices=["legacy", "stable"], default=None,
+                        help="Fresh default legacy; stable selects audited loss calculations")
+    parser.add_argument("--config", help="Optional JSON for loss weights, detachment or warm-up schedule; no file needed for normal runs")
     return parser
 
 
@@ -194,22 +155,14 @@ def check_arguments(args):
         raise ValueError("Workers cannot be negative; learning rate must be positive")
     if args.resume_checkpoint and getattr(args, "init_checkpoint", None):
         raise ValueError("Use either resume or weight initialization, not both")
-    if getattr(args, "supervised_only", False) and getattr(args, "teacher_checkpoint", None):
-        raise ValueError("A supervised-only control must not use an external teacher")
-    for name in ('resume_checkpoint', 'init_checkpoint', 'teacher_checkpoint'):
+    for name in ('resume_checkpoint', 'init_checkpoint', 'config'):
         path = getattr(args, name, None)
         if path and not Path(path).is_file():
             raise ValueError(f"{name} does not exist: {path}")
 
 
-def train_main(argv=None, teacher_training=False):
-    args = training_parser(teacher_training).parse_args(argv)
-    if not teacher_training:
-        if args.help_advanced:
-            training_parser(advanced=True).print_help()
-            return
-        del args.help_advanced
-    args.teacher_training = teacher_training
+def train_main(argv=None):
+    args = training_parser().parse_args(argv)
     args.device = "cuda" if torch.cuda.is_available() else "cpu"
     check_arguments(args)
     rank, world, local = (int(os.environ.get(k,default)) for k,default in (
@@ -235,29 +188,25 @@ def train_main(argv=None, teacher_training=False):
 def _train(args, rank, world, distributed, device):
     checkpoint = read_checkpoint(args.resume_checkpoint) if args.resume_checkpoint else None
     resolve_training_arguments(args, checkpoint)
-    check_arguments(args)  # validate a teacher path restored from checkpoint metadata
     seed_everything(args.seed)
     run_config = vars(args).copy()
     run_config.update(world_size=world, image_size=IMAGE_SIZE,
-                      text_mode="dropout" if args.teacher_training else "question", answer_dropout=.5)
+                      teacher_training=False, text_mode="question", answer_dropout=.5)
     version = objective_version(args)
     run_config["objective_version"] = version
-    if not args.teacher_training:
-        run_config["training_config"] = {k: getattr(args, k) for k in TRAINING_DEFAULTS}
+    run_config["training_config"] = {k: getattr(args, k) for k in TRAINING_DEFAULTS}
     out = Path(args.output_dir)
     if rank == 0:
         out.mkdir(parents=True, exist_ok=True)
     if distributed:
         dist.barrier()
-    train_set = VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE,
-                text_mode="dropout" if args.teacher_training else "question")
+    train_set = VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE, text_mode="question")
     tiny = checkpoint["run_config"].get("tiny", is_tiny_state(checkpoint["model_state_dict"])) if checkpoint else False
-    model = TeacherModel(tiny=tiny) if args.teacher_training else GroundingModel(tiny=tiny)
+    model = GroundingModel(tiny=tiny)
     if getattr(args, "init_checkpoint", None):
         initialize_weights(args.init_checkpoint, model)
     model = model.to(device)
-    teacher = load_teacher(args.teacher_checkpoint, device) if getattr(args, "teacher_checkpoint", None) else None
-    objective = build_objective(args, teacher)
+    objective = build_objective(args)
     if isinstance(objective, DistillationObjective):
         run_config["loss_config"] = {name: getattr(objective, name) for name in
                                    ("dice_weight", "oracle_weight", "question_weight", "latent_weight", "attn_weight", "gain_mix")}
@@ -336,8 +285,7 @@ def _train(args, rank, world, distributed, device):
             raise FloatingPointError("Nonfinite training loss")
         values = (stats / stats[1]).tolist()
         record = {"epoch":epoch+1,"train_loss":values[0],"objective_version":version}
-        if not args.teacher_training:
-            record["training_config"] = run_config["training_config"]
+        record["training_config"] = run_config["training_config"]
         for name, val in zip(names, values[2:]):
             record[name] = val
         if rank == 0:

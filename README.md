@@ -29,8 +29,8 @@ uv run torchrun --nproc_per_node=2 train.py \
 
 Batch size is **global across GPUs**: 4 on two GPUs means 2 per GPU. Training
 chooses CUDA automatically, uses AMP on CUDA, and does not run validation.
-No separate teacher training is required for the default single-stage method.
-An external teacher is optional and must have the complete latent architecture.
+Training is single-stage: real answers supervise the same model's oracle view.
+There is no external teacher checkpoint or separate teacher-training command.
 
 | `--training-recipe` | Objective |
 |---|---|
@@ -50,10 +50,28 @@ Warmup defaults to 5 real-answer epochs followed by a 5-epoch transition. For a
 samples always use predicted grounding. The schedule mixes per-image losses,
 not answer vectors. Full has no warm-up.
 
-`--help` shows data/optimizer controls, recipe, and loss version.
-`--help-advanced` also shows loss weights, detachment, schedule overrides, and
-compatibility aliases. Existing flags remain accepted. `--supervised-only` is
-an alias for grounding-only. Changing help visibility does not change training.
+`--help` lists the complete CLI. Normal runs need no configuration file.
+For an advanced experiment, `--config /path/to/settings.json` accepts a flat JSON
+object with only the settings to override, for example:
+
+```json
+{
+    "latent_weight": 0.3,
+    "detach_predicted_answer": true
+}
+```
+
+Supported keys are `training_recipe`, `loss_version`, `dice_weight`,
+`latent_weight`, `detach_predicted_answer`, `warmup_epochs`,
+`answer_transition_epochs`, and the full-recipe weights `oracle_weight`,
+`question_weight`, `kd_weight`, `attn_weight`, `gain_mix`. Schedule settings
+require the warmup recipe. Explicit recipe/loss flags must agree with the file.
+Resolved settings are recorded in checkpoints and training history.
+
+The former individual loss/schedule/detachment flags, `--help-advanced`,
+`--teacher-checkpoint`, and the duplicate `--supervised-only` alias are removed.
+Use `--training-recipe grounding-only` for the latter. Unsupported flags fail
+explicitly; they are never silently ignored.
 
 ## Checkpoints and evaluation
 
@@ -64,6 +82,8 @@ contain model tensors only.
 
 Use `--resume-checkpoint` for a periodic checkpoint. Recipe, loss weights,
 detachment and schedule are restored; conflicting overrides are rejected.
+The original JSON file is not needed when resuming. Historical external-teacher
+training runs require their original runner rather than this single-stage trainer.
 Repeat the original batch size, LR and seed. `--num-epochs` is the final total
 count on resume. Use `--init-checkpoint` for a new run initialized from weights,
 with a new optimizer and epoch counter. Keep different experiments in separate
@@ -83,4 +103,5 @@ Evaluation scores and exports masks at native resolution by default. Use
 validation for checkpoint selection. Complete existing latent checkpoints retain
 matching parameter names/shapes and load for inference. Student predictions do
 not use ground-truth answers. `predict_save.py` and `visualize_predictions.py`
-provide single-image prediction and overlays.
+provide single-image prediction and overlays. Historical standalone teacher
+checkpoint formats are detected automatically; no `--teacher` flag is needed.

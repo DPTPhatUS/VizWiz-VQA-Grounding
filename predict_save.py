@@ -16,7 +16,6 @@ def prediction_parser(description=__doc__):
     parser.add_argument('--question',required=True,help='Question text without a Q: prefix')
     parser.add_argument('--output',required=True)
     parser.add_argument('--device',default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument("--teacher",action="store_true",help="Use standalone teacher weights")
     return parser
 
 
@@ -46,7 +45,7 @@ def predict_image(checkpoint,image_path,question,device,teacher=False):
 
 def main(argv=None):
     args=prediction_parser().parse_args(argv)
-    _,mask=predict_image(args.checkpoint,args.image,args.question,args.device,teacher=args.teacher)
+    _,mask=predict_image(args.checkpoint,args.image,args.question,args.device)
     output=Path(args.output)
     output.parent.mkdir(parents=True,exist_ok=True)
     mask.save(output)
