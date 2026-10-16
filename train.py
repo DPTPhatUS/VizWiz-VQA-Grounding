@@ -24,6 +24,7 @@ TRAINING_DEFAULTS = {
     "dice_weight": .5, "latent_weight": .5, "oracle_weight": .5, "question_weight": .5,
     "kd_weight": 1., "attn_weight": .2, "gain_mix": .75,
     "warmup_epochs": 0, "answer_transition_epochs": 0,
+    "freeze_text_encoder": False,
 }
 
 
@@ -142,7 +143,7 @@ def training_parser():
                         help="Fresh default full (no warm-up); resume restores saved settings")
     parser.add_argument("--loss-version", choices=["legacy", "stable"], default=None,
                         help="Fresh default legacy; stable selects audited loss calculations")
-    parser.add_argument("--config", help="Optional JSON for loss weights, detachment or warm-up schedule; no file needed for normal runs")
+    parser.add_argument("--config", help="Optional JSON for loss weights, detachment, warm-up or freezing text; no file needed for normal runs")
     return parser
 
 
@@ -206,6 +207,8 @@ def _train(args, rank, world, distributed, device):
     if getattr(args, "init_checkpoint", None):
         initialize_weights(args.init_checkpoint, model)
     model = model.to(device)
+    if args.freeze_text_encoder:
+        model.coarse.set_text_encoder_frozen()
     objective = build_objective(args)
     if isinstance(objective, DistillationObjective):
         run_config["loss_config"] = {name: getattr(objective, name) for name in

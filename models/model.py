@@ -43,6 +43,18 @@ class CompactGroundingModel(nn.Module):
     def _init_decoder(self, tiny):
         self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128)
 
+    def set_text_encoder_frozen(self, frozen=True):
+        """Freeze the shared Q/A encoder; keep projections and answer predictor trainable."""
+        self._text_encoder_frozen = frozen
+        self.text_encoder.requires_grad_(not frozen)
+        self.text_encoder.train(self.training and not frozen)
+
+    def train(self, mode=True):
+        super().train(mode)
+        if getattr(self, "_text_encoder_frozen", False):
+            self.text_encoder.eval()
+        return self
+
     def _decode_mask(self, fused, s3, s2, s1, text, answer_vec=None, *, projected_skips=None):
         return self.decoder(fused, s3, s2, s1, text, answer_vec=answer_vec, projected_skips=projected_skips)
 

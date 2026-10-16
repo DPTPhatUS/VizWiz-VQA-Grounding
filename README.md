@@ -62,11 +62,17 @@ object with only the settings to override, for example:
 ```
 
 Supported keys are `training_recipe`, `loss_version`, `dice_weight`,
-`latent_weight`, `detach_predicted_answer`, `warmup_epochs`,
+`latent_weight`, `detach_predicted_answer`, `freeze_text_encoder`, `warmup_epochs`,
 `answer_transition_epochs`, and the full-recipe weights `oracle_weight`,
 `question_weight`, `kd_weight`, `attn_weight`, `gain_mix`. Schedule settings
 require the warmup recipe. Explicit recipe/loss flags must agree with the file.
 Resolved settings are recorded in checkpoints and training history.
+
+For frozen-text controls, use `{"freeze_text_encoder": true}` in the JSON.
+This freezes the shared CLIP question/answer encoder and keeps it in eval mode
+during training. Vision, text projection, latent predictor and decoder still
+train. The default is false, preserving previous runs. Resume restores the
+saved policy before constructing the optimizer; conflicting overrides fail.
 
 The former individual loss/schedule/detachment flags, `--help-advanced`,
 `--teacher-checkpoint`, and the duplicate `--supervised-only` alias are removed.
