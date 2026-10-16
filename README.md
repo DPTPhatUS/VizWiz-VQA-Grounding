@@ -114,7 +114,7 @@ checkpoint formats are detected automatically; no `--teacher` flag is needed.
 
 ## Diagnostics
 
-Both diagnostic tools are included at the repository root. `diagnose.py`
+All diagnostic tools are included at the repository root. `diagnose.py`
 compares Q-only, predicted-answer and real-answer masks. For Q/A interventions,
 embedding retrieval and conditioning traces, run:
 
@@ -135,3 +135,27 @@ measurements, embeddings and a gallery. Intervention scores use the original
 GT and measure sensitivity; they are not accuracy for a newly posed question.
 The pretrained text reference runs on CPU; `--skip-pretrained-reference` omits
 that comparison when needed. Reports, data and local tests remain untracked.
+
+To test predicted-answer content directly, use `probe_predicted_answer.py`:
+
+```bash
+uv run python probe_predicted_answer.py \
+    --checkpoint outputs/alignment_frozen/checkpoint_epoch20.pt \
+    --data-root /path/to/vizwiz \
+    --batch-size 4 \
+    --num-workers 2 \
+    --device cuda \
+    --seed 42 \
+    --output-dir outputs/latent_alignment_frozen_ep20
+```
+
+This validation-only probe caches predicted vectors in a first pass, then keeps
+each image/question fixed while replaying, swapping, averaging or zeroing the
+answer vector. Replacements preserve the answer-token slot and affect both
+attention and skip conditioning; a separate Q-only view removes the slot.
+It exports JSON/CSV summaries, donor mappings and a gallery without creating PT
+files or changing weights. Check cached-replay differences before interpreting
+effects. The mean uses the label-free validation cache as a diagnostic control;
+it is not a deployable learned constant. Distinct-answer donors are selected by
+annotation strings, not verified semantic negatives. Use the original GT to
+measure sensitivity, not accuracy for the donor question/answer.
