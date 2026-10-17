@@ -29,7 +29,15 @@ class GroundingModel(nn.Module):
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=self.hidden_dim, num_heads=n_heads, batch_first=True
         )
+        self.fuse_proj = nn.Linear(self.hidden_dim * 2, self.hidden_dim)
+        # Identity initialization: at initialization, fused = img_tokens (preserves pretrained CLIP features)
+        with torch.no_grad():
+            self.fuse_proj.weight[:, :self.hidden_dim] = torch.eye(self.hidden_dim)
+            self.fuse_proj.weight[:, self.hidden_dim:] = 0.0
+            nn.init.zeros_(self.fuse_proj.bias)
+
         self.decoder = UNetDecoder(in_channels=self.hidden_dim)
+        self.experiment_config = {"architecture": "concat-fusion"}
 
     def forward(self, image, text):
         enc_feat1, enc_feat2, enc_feat3, bottleneck = self.image_encoder(image)  # each (B, D_v, H_p, W_p)
@@ -50,7 +58,8 @@ class GroundingModel(nn.Module):
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )  # (B, N, D_v)
-        fused = attn_output.view(B, H, W, D).permute(0, 3, 1, 2).contiguous()  # (B, D_v, H_p, W_p)
+        fused_tokens = self.fuse_proj(torch.cat([img_tokens, attn_output], dim=-1))  # (B, N, D_v)
+        fused = fused_tokens.view(B, H, W, D).permute(0, 3, 1, 2).contiguous()  # (B, D_v, H_p, W_p)
 
         output = self.decoder(fused, enc_feat3, enc_feat2, enc_feat1)  # (B, 1, 16*H_p, 16*W_p)
         return output
