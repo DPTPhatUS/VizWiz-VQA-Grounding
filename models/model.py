@@ -163,6 +163,9 @@ class CompactGroundingModel(nn.Module):
         features = self.encode_image(batch["image"])  # 4 x (B, D_v, H_p, W_p)
         text, q = self.encode_question(batch.get("question_text", batch["text"]))
 
+        if getattr(self, "question_only", False):
+            return self.decode_question(features, text, q)
+
         # Resolve the recipe's view requests at the forward boundary.
         has_target = (self.training and batch.get("encode_answer_target", True)
                       and ("answer_only_text" in batch or "answer_text" in batch))

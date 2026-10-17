@@ -39,6 +39,7 @@ def eval_main(argv=None):
     summary = {"num_samples":len(scores),"mean_iou":sum(scores.values())/len(scores),
                "dataset":args.dataset,"metric_resolution":"original",
                "text_mode":"question","checkpoint":str(args.checkpoint),
+               "grounding_mode":"question" if getattr(getattr(model, "coarse", model), "question_only", False) else "predicted_answer",
                "experiment_config":model.experiment_config}
     (out/"metrics.json").write_text(json.dumps({"summary":summary,"per_sample":scores},indent=2))
     print(json.dumps(summary),flush=True)

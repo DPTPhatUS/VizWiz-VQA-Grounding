@@ -49,6 +49,11 @@ def load_model_weights(model, saved, *, allow_latent_initialization=False):
         model.load_state_dict(state, strict=False)
     else:
         model.load_state_dict(state, strict=True)
+    # Full checkpoints retain the Q-only control's inference path. Old/raw
+    # checkpoints keep the historical predicted-answer default.
+    run = saved.get("run_config", {})
+    core = model.coarse if hasattr(model, "coarse") else model
+    core.question_only = run.get("training_config", {}).get("question_only", run.get("question_only", False))
 
 
 def initialize_weights(path, model):

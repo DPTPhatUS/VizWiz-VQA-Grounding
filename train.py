@@ -24,11 +24,13 @@ TRAINING_DEFAULTS = {
     "dice_weight": .5, "latent_weight": .5, "oracle_weight": .5, "question_weight": .5,
     "kd_weight": 1., "attn_weight": .2, "gain_mix": .75,
     "warmup_epochs": 0, "answer_transition_epochs": 0,
-    "freeze_text_encoder": False,
+    "freeze_text_encoder": False, "question_only": False,
 }
 
 
 def objective_version(args):
+    if args.question_only:
+        return "question-supervised-v1"
     versions = {"full": "latent-gain-v2" if args.loss_version == "legacy" else "latent-gain-v3",
                 "grounding-only": "latent-supervised-v1",
                 "alignment": "latent-alignment-v1" if args.loss_version == "legacy" else "latent-alignment-v2",
@@ -79,6 +81,8 @@ def resolve_training_arguments(args, saved=None):
     if args.training_recipe not in ("full", "grounding-only", "alignment", "warmup") or args.loss_version not in ("legacy", "stable"):
         raise ValueError("Checkpoint contains an unsupported training recipe or loss version")
     args.supervised_only = args.training_recipe == "grounding-only"
+    if args.question_only and args.training_recipe != "grounding-only":
+        raise ValueError("question_only requires the grounding-only recipe")
     if saved is not None:
         recorded_version = saved["run_config"].get("objective_version")
         if recorded_version and recorded_version != objective_version(args):
@@ -207,6 +211,7 @@ def _train(args, rank, world, distributed, device):
     if getattr(args, "init_checkpoint", None):
         initialize_weights(args.init_checkpoint, model)
     model = model.to(device)
+    model.coarse.question_only = args.question_only
     if args.freeze_text_encoder:
         model.coarse.set_text_encoder_frozen()
     objective = build_objective(args)
