@@ -16,3 +16,5 @@ yolo*.pt
 /tests/
 *.md
 !/README.md
+.agent
+.agents
