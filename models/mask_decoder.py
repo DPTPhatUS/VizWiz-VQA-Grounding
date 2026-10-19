@@ -144,12 +144,125 @@ def resolve_spatial_upsample_stages(stages):
     return tuple(sorted(stages))
 
 
+def resolve_detail_upsample_stages(stages):
+    if stages is None:
+        return ()
+    if isinstance(stages, bool):
+        raise ValueError("Detail stages must be integer IDs, not booleans")
+    if isinstance(stages, Integral):
+        if not 0 <= stages <= len(UPSAMPLE_STAGE_CHANNELS):
+            raise ValueError("Detail stage count must be between 0 and 4")
+        stages = tuple(range(len(UPSAMPLE_STAGE_CHANNELS) - stages, len(UPSAMPLE_STAGE_CHANNELS)))
+    try:
+        stages = tuple(stages)
+    except TypeError as error:
+        raise ValueError("Detail stages must be a sequence of integer IDs") from error
+    if any(isinstance(s, bool) or not isinstance(s, Integral) for s in stages):
+        raise ValueError("Detail stages must contain only integer IDs")
+    stages = tuple(int(s) for s in stages)
+    for s in stages:
+        if s < 0 or s >= len(UPSAMPLE_STAGE_CHANNELS):
+            raise ValueError(f"Invalid detail upsample stage: {s}. Must be in range(0, {len(UPSAMPLE_STAGE_CHANNELS)})")
+    if len(set(stages)) != len(stages):
+        raise ValueError(f"Duplicate detail upsample stages: {stages}")
+    return tuple(sorted(stages))
+
+
+class PixelDetailStem(nn.Module):
+    """Shallow convolutional stem extracting high-frequency spatial edge and texture details.
+
+    Inspired by DDVT (Dual-level Vision Transformer, Zhang et al., 2026).
+    Preserves fine pixel-level boundaries directly from RGB input that are otherwise
+    blurred by ViT 14x14 patch tokenization.
+    """
+    def __init__(self, in_channels=3, detail_dim=16):
+        super().__init__()
+        self.in_channels = in_channels
+        self.detail_dim = detail_dim
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, detail_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(4, detail_dim),
+            nn.GELU(),
+            nn.Conv2d(detail_dim, detail_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(4, detail_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, image):
+        """Extract dense detail representation (B, detail_dim, H_img, W_img)."""
+        return self.stem(image)
+
+
+class RegionPixelFuser(nn.Module):
+    """Semantic-guided region-pixel detail fusion (adapted CMA from DDVT).
+
+    Uses semantic visual features (which already integrate latent answer evidence)
+    to generate a continuous 2D spatial guidance mask M_guide in (0, 1). This mask
+    selectively gates high-frequency pixel details D, filtering out background clutter
+    and preserving sharp edges only within the target semantic region:
+        M_guide = sigmoid(guide_scale * Conv_1x1(X_sem) + guide_bias)
+        D_tilde = D * M_guide
+        Delta_X = SeparableRefine([X_sem, D_tilde])
+        X_out = X_sem + residual_scale * Delta_X
+
+    Properties:
+    1. residual_scale is initialized to 0 -> strictly identity mapping at step 0.
+    2. When detail_feat is None, returns visual_feat untouched.
+    3. Seamlessly handles resolution alignment via bilinear interpolation.
+    """
+    def __init__(self, visual_channels, detail_dim=16):
+        super().__init__()
+        self.visual_channels = visual_channels
+        self.detail_dim = detail_dim
+        self.guide_proj = nn.Conv2d(visual_channels, 1, kernel_size=1)
+        self.guide_scale = nn.Parameter(torch.tensor(1.0))
+        self.guide_bias = nn.Parameter(torch.zeros(1))
+
+        in_fused = visual_channels + detail_dim
+        num_groups = 4 if visual_channels % 4 == 0 else 1
+        self.refine = nn.Sequential(
+            nn.Conv2d(in_fused, in_fused, kernel_size=3, padding=1, groups=in_fused, bias=False),
+            nn.Conv2d(in_fused, visual_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups, visual_channels),
+            nn.GELU(),
+        )
+        self.residual_scale = nn.Parameter(torch.zeros(1))
+        self.last_guide_mask = None
+
+    def compute_guide_mask(self, visual_feat):
+        """Compute continuous 2D semantic guidance mask in (0, 1)."""
+        logits = self.guide_scale.to(visual_feat.dtype) * self.guide_proj(visual_feat) + self.guide_bias.to(visual_feat.dtype)
+        return torch.sigmoid(logits)
+
+    def forward(self, visual_feat, detail_feat=None):
+        if detail_feat is None:
+            self.last_guide_mask = None
+            return visual_feat
+
+        if detail_feat.shape[-2:] != visual_feat.shape[-2:]:
+            detail_feat = F.interpolate(detail_feat, size=visual_feat.shape[-2:],
+                                        mode="bilinear", align_corners=False)
+
+        guide_mask = self.compute_guide_mask(visual_feat).to(visual_feat.dtype)
+        self.last_guide_mask = guide_mask.detach()
+
+        gated_detail = detail_feat.to(visual_feat.dtype) * guide_mask
+        fused = torch.cat([visual_feat, gated_detail], dim=1)
+        delta = self.refine(fused)
+        return visual_feat + self.residual_scale.to(delta.dtype) * delta
+
+
 class CompactDecoder(nn.Module):
-    def __init__(self, in_channels=1024, text_dim=768, width=128, spatial_evidence=True,
-                 spatial_upsample_stages=(0, 1)):
+    def __init__(self, in_channels=1024, text_dim=768, width=128,
+                 spatial_evidence=True, spatial_upsample_stages=(0, 1),
+                 spatial_detail=True, detail_upsample_stages=(2, 3), detail_dim=16):
         super().__init__()
         self.spatial_evidence_enabled = spatial_evidence
         self.spatial_upsample_stages = resolve_spatial_upsample_stages(spatial_upsample_stages) if spatial_evidence else ()
+        self.spatial_detail_enabled = spatial_detail
+        self.detail_upsample_stages = resolve_detail_upsample_stages(detail_upsample_stages) if spatial_detail else ()
+        self.detail_dim = detail_dim
+
         self.projections = nn.ModuleList([nn.Conv2d(in_channels, width, 1) for _ in range(4)])
         self.conditioner = SkipConditioner(text_dim, width)
         self.fusion = nn.ModuleList([separable(width, width) for _ in range(3)])
@@ -160,6 +273,8 @@ class CompactDecoder(nn.Module):
         self.output = nn.Conv2d(16, 1, 1)
         self.register_buffer("spatial_stage_ids", torch.tensor(self.spatial_upsample_stages, dtype=torch.long)
                              if spatial_evidence else None)
+        self.register_buffer("detail_stage_ids", torch.tensor(self.detail_upsample_stages, dtype=torch.long)
+                             if spatial_detail else None)
 
         if spatial_evidence and self.spatial_upsample_stages:
             self.spatial_bottleneck = SpatialEvidenceInteraction(width, text_dim)
@@ -173,6 +288,17 @@ class CompactDecoder(nn.Module):
         else:
             self.spatial_bottleneck = None
             self.spatial_upsample = None
+
+        if spatial_detail and self.detail_upsample_stages:
+            self.detail_stem = PixelDetailStem(in_channels=3, detail_dim=detail_dim)
+            self.detail_upsample = nn.ModuleDict({
+                str(i): RegionPixelFuser(UPSAMPLE_STAGE_CHANNELS[i], detail_dim=detail_dim)
+                for i in self.detail_upsample_stages
+            })
+        else:
+            self.detail_stem = None
+            self.detail_upsample = None
+
 
     def project_skips(self, skip3, skip2, skip1):
         return [proj(feat) for proj, feat in zip(self.projections[1:], (skip3, skip2, skip1))]  # 3 x (B, C, H_p, W_p)
@@ -190,7 +316,18 @@ class CompactDecoder(nn.Module):
                     gates.append(module.last_gate)
         return gates
 
-    def forward(self, bottleneck, skip3, skip2, skip1, text, answer_vec=None, *, projected_skips=None):
+    def get_detail_guide_masks(self):
+        """Retrieve recent semantic guidance masks from region-pixel detail fusion."""
+        if not self.spatial_detail_enabled or self.detail_upsample is None:
+            return []
+        masks = []
+        for module in self.detail_upsample.values():
+            if module.last_guide_mask is not None:
+                masks.append(module.last_guide_mask)
+        return masks
+
+    def forward(self, bottleneck, skip3, skip2, skip1, text, answer_vec=None, *,
+                projected_skips=None, image=None, detail_features=None):
         x = self.projections[0](bottleneck)  # (B, C, H_p, W_p)
         skips = projected_skips if projected_skips is not None else self.project_skips(skip3, skip2, skip1)  # 3 x (B, C, H_p, W_p)
         skips = self.conditioner(skips, text, answer_vec=answer_vec)  # 3 x (B, C, H_p, W_p)
@@ -203,13 +340,20 @@ class CompactDecoder(nn.Module):
         if self.spatial_bottleneck is not None:
             x = self.spatial_bottleneck(x, answer_vec)
 
-        # Progressive upsampling with multi-level spatial evidence guidance
+        # Extract detail features from image if not already provided
+        if detail_features is None and image is not None and self.detail_stem is not None:
+            detail_features = self.detail_stem(image)
+
+        # Progressive upsampling with multi-level spatial evidence and detail fusion
         for i, block in enumerate(self.upsample):
             x = block(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False))  # 2x spatial per stage
             if self.spatial_upsample is not None and i in self.spatial_upsample_stages:
                 x = self.spatial_upsample[str(i)](x, answer_vec)
+            if self.detail_upsample is not None and i in self.detail_upsample_stages and detail_features is not None:
+                x = self.detail_upsample[str(i)](x, detail_features)
 
         return self.output(x)  # (B, 1, 16*H_p, 16*W_p)
+
 
 
 class UNetDecoder(nn.Module):
