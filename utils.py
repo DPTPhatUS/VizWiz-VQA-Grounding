@@ -16,38 +16,32 @@ BASE_LATENT_ANSWER_KEYS = {
     "decoder.conditioner.qa_gate.weight", "decoder.conditioner.qa_gate.bias",
 }
 
-SPATIAL_EVIDENCE_KEYS = {
-    "decoder.spatial_bottleneck.visual_proj.weight",
-    "decoder.spatial_bottleneck.evidence_proj.weight",
-    "decoder.spatial_bottleneck.gate_scale",
-    "decoder.spatial_bottleneck.gate_bias",
-    "decoder.spatial_bottleneck.refine.0.weight",
-    "decoder.spatial_bottleneck.refine.1.weight",
-    "decoder.spatial_bottleneck.refine.2.weight",
-    "decoder.spatial_bottleneck.refine.2.bias",
-    "decoder.spatial_bottleneck.residual_scale",
-    "decoder.spatial_upsample.0.visual_proj.weight",
-    "decoder.spatial_upsample.0.evidence_proj.weight",
-    "decoder.spatial_upsample.0.gate_scale",
-    "decoder.spatial_upsample.0.gate_bias",
-    "decoder.spatial_upsample.0.refine.0.weight",
-    "decoder.spatial_upsample.0.refine.1.weight",
-    "decoder.spatial_upsample.0.refine.2.weight",
-    "decoder.spatial_upsample.0.refine.2.bias",
-    "decoder.spatial_upsample.0.residual_scale",
-    "decoder.spatial_upsample.1.visual_proj.weight",
-    "decoder.spatial_upsample.1.evidence_proj.weight",
-    "decoder.spatial_upsample.1.gate_scale",
-    "decoder.spatial_upsample.1.gate_bias",
-    "decoder.spatial_upsample.1.refine.0.weight",
-    "decoder.spatial_upsample.1.refine.1.weight",
-    "decoder.spatial_upsample.1.refine.2.weight",
-    "decoder.spatial_upsample.1.refine.2.bias",
-    "decoder.spatial_upsample.1.residual_scale",
-}
+def _spatial_module_keys(prefix):
+    return {
+        f"{prefix}.visual_proj.weight",
+        f"{prefix}.evidence_proj.weight",
+        f"{prefix}.gate_scale",
+        f"{prefix}.gate_bias",
+        f"{prefix}.refine.0.weight",
+        f"{prefix}.refine.1.weight",
+        f"{prefix}.refine.2.weight",
+        f"{prefix}.refine.2.bias",
+        f"{prefix}.residual_scale",
+    }
 
+
+def spatial_evidence_keys(stages=(0, 1)):
+    keys = _spatial_module_keys("decoder.spatial_bottleneck")
+    if stages:
+        for idx in range(len(stages)):
+            keys.update(_spatial_module_keys(f"decoder.spatial_upsample.{idx}"))
+    return keys
+
+
+SPATIAL_EVIDENCE_KEYS = spatial_evidence_keys((0, 1))
 LATENT_ANSWER_KEYS = BASE_LATENT_ANSWER_KEYS | SPATIAL_EVIDENCE_KEYS
 COARSENED_LATENT_ANSWER_KEYS = {f"coarse.{k}" for k in LATENT_ANSWER_KEYS}
+
 
 
 def to_device(batch, device):
@@ -80,7 +74,24 @@ def checkpoint_model_kwargs(saved):
     for config in (saved.get("experiment_config", {}), run.get("experiment_config", {}), run):
         if "spatial_evidence" in config and config["spatial_evidence"] != spatial:
             raise ValueError("Checkpoint spatial_evidence metadata disagrees with model tensors")
-    return {"tiny": run.get("tiny", is_tiny_state(state)), "spatial_evidence": spatial}
+    kwargs = {"tiny": run.get("tiny", is_tiny_state(state)), "spatial_evidence": spatial}
+    if spatial:
+        stages = None
+        for config in (saved.get("experiment_config", {}), run.get("experiment_config", {}), run):
+            if "spatial_upsample_stages" in config:
+                stages = tuple(config["spatial_upsample_stages"])
+                break
+        if stages is None:
+            upsample_indices = sorted({
+                int(k.split("decoder.spatial_upsample.")[1].split(".")[0])
+                for k in state if "decoder.spatial_upsample." in k
+            })
+            if upsample_indices:
+                stages = tuple(range(max(upsample_indices) + 1))
+            else:
+                stages = ()
+        kwargs["spatial_upsample_stages"] = stages
+    return kwargs
 
 
 def save_checkpoint(saved, path):
@@ -99,7 +110,16 @@ def load_model_weights(model, saved, *, allow_latent_initialization=False):
     state = saved.get("model_state_dict", saved)
     target_keys = set(model.state_dict())
     missing = target_keys - set(state)
-    allowed = (BASE_LATENT_ANSWER_KEYS, SPATIAL_EVIDENCE_KEYS, LATENT_ANSWER_KEYS)
+    model_spatial = {k[7:] if k.startswith("coarse.") else k for k in target_keys if "decoder.spatial_" in k}
+    model_latent = BASE_LATENT_ANSWER_KEYS | model_spatial
+    allowed_groups = {
+        frozenset(BASE_LATENT_ANSWER_KEYS),
+        frozenset(SPATIAL_EVIDENCE_KEYS),
+        frozenset(LATENT_ANSWER_KEYS),
+        frozenset(model_spatial),
+        frozenset(model_latent),
+    }
+    allowed = tuple(set(g) for g in allowed_groups if g)
     allowed += tuple({f"coarse.{k}" for k in group} for group in allowed)
     partial = allow_latent_initialization and set(state) < target_keys and missing in allowed
     config = saved.get("experiment_config")
@@ -107,9 +127,21 @@ def load_model_weights(model, saved, *, allow_latent_initialization=False):
         config = dict(config)
         config.setdefault("spatial_evidence", any("decoder.spatial_" in k for k in state))
         expected = dict(model.experiment_config)
+        if "spatial_upsample_stages" in config:
+            config["spatial_upsample_stages"] = list(config["spatial_upsample_stages"])
+        if "spatial_upsample_stages" in expected:
+            expected["spatial_upsample_stages"] = list(expected["spatial_upsample_stages"])
         if partial:
             # Explicit weight initialization can add whole modules, never arbitrary tensors.
-            config["spatial_evidence"] = expected["spatial_evidence"]
+            config["spatial_evidence"] = expected.get("spatial_evidence", False)
+            if "spatial_upsample_stages" in expected:
+                config["spatial_upsample_stages"] = expected["spatial_upsample_stages"]
+        else:
+            if "spatial_upsample_stages" not in config and "spatial_upsample_stages" in expected:
+                if any(k.startswith(("decoder.spatial_upsample.", "coarse.decoder.spatial_upsample.")) for k in state):
+                    config["spatial_upsample_stages"] = [0, 1]
+                else:
+                    config["spatial_upsample_stages"] = []
         if config != expected:
             raise ValueError("Checkpoint configuration does not match model configuration")
     if partial:
@@ -122,6 +154,7 @@ def load_model_weights(model, saved, *, allow_latent_initialization=False):
     run = saved.get("run_config", {})
     core = model.coarse if hasattr(model, "coarse") else model
     core.question_only = run.get("training_config", {}).get("question_only", run.get("question_only", False))
+
 
 
 def initialize_weights(path, model):

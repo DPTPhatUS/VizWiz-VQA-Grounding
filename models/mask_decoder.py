@@ -65,6 +65,8 @@ class SpatialEvidenceInteraction(nn.Module):
     """
     def __init__(self, visual_channels, text_dim, hidden_dim=None):
         super().__init__()
+        self.visual_channels = visual_channels
+        self.text_dim = text_dim
         hidden_dim = hidden_dim or visual_channels
         self.visual_proj = nn.Conv2d(visual_channels, hidden_dim, kernel_size=1, bias=False)
         self.evidence_proj = nn.Linear(text_dim, hidden_dim, bias=False)
@@ -114,10 +116,29 @@ class SpatialEvidenceInteraction(nn.Module):
         return visual_feat + self.residual_scale.to(delta.dtype) * delta
 
 
+UPSAMPLE_STAGE_CHANNELS = (64, 32, 16, 16)
+
+
+def resolve_spatial_upsample_stages(stages):
+    if stages is None or stages is False:
+        return ()
+    if isinstance(stages, int):
+        stages = range(stages)
+    stages = tuple(int(s) for s in stages)
+    for s in stages:
+        if s < 0 or s >= len(UPSAMPLE_STAGE_CHANNELS):
+            raise ValueError(f"Invalid spatial upsample stage: {s}. Must be in range(0, {len(UPSAMPLE_STAGE_CHANNELS)})")
+    if len(set(stages)) != len(stages):
+        raise ValueError(f"Duplicate spatial upsample stages: {stages}")
+    return tuple(sorted(stages))
+
+
 class CompactDecoder(nn.Module):
-    def __init__(self, in_channels=1024, text_dim=768, width=128, spatial_evidence=True):
+    def __init__(self, in_channels=1024, text_dim=768, width=128, spatial_evidence=True,
+                 spatial_upsample_stages=(0, 1)):
         super().__init__()
         self.spatial_evidence_enabled = spatial_evidence
+        self.spatial_upsample_stages = resolve_spatial_upsample_stages(spatial_upsample_stages) if spatial_evidence else ()
         self.projections = nn.ModuleList([nn.Conv2d(in_channels, width, 1) for _ in range(4)])
         self.conditioner = SkipConditioner(text_dim, width)
         self.fusion = nn.ModuleList([separable(width, width) for _ in range(3)])
@@ -127,12 +148,15 @@ class CompactDecoder(nn.Module):
         ])
         self.output = nn.Conv2d(16, 1, 1)
 
-        if spatial_evidence:
+        if spatial_evidence and self.spatial_upsample_stages:
             self.spatial_bottleneck = SpatialEvidenceInteraction(width, text_dim)
             self.spatial_upsample = nn.ModuleList([
-                SpatialEvidenceInteraction(64, text_dim),
-                SpatialEvidenceInteraction(32, text_dim),
+                SpatialEvidenceInteraction(UPSAMPLE_STAGE_CHANNELS[i], text_dim)
+                for i in self.spatial_upsample_stages
             ])
+        elif spatial_evidence:
+            self.spatial_bottleneck = SpatialEvidenceInteraction(width, text_dim)
+            self.spatial_upsample = None
         else:
             self.spatial_bottleneck = None
             self.spatial_upsample = None
@@ -169,8 +193,9 @@ class CompactDecoder(nn.Module):
         # Progressive upsampling with multi-level spatial evidence guidance
         for i, block in enumerate(self.upsample):
             x = block(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False))  # 2x spatial per stage
-            if self.spatial_upsample is not None and i < len(self.spatial_upsample):
-                x = self.spatial_upsample[i](x, answer_vec)
+            if self.spatial_upsample is not None and i in self.spatial_upsample_stages:
+                idx = self.spatial_upsample_stages.index(i)
+                x = self.spatial_upsample[idx](x, answer_vec)
 
         return self.output(x)  # (B, 1, 16*H_p, 16*W_p)
 

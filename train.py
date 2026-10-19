@@ -149,6 +149,8 @@ def training_parser():
     parser.add_argument("--loss-version", choices=["legacy", "stable"], default=None,
                         help="Fresh default legacy; stable selects audited loss calculations")
     parser.add_argument("--config", help="Optional JSON for loss weights, detachment, warm-up or freezing text; no file needed for normal runs")
+    parser.add_argument("--spatial-upsample-stages", type=int, nargs="*", default=None,
+                        help="Upsampling stages to apply spatial evidence interaction (default: 0 1)")
     return parser
 
 
@@ -214,7 +216,12 @@ def _train(args, rank, world, distributed, device):
     if distributed:
         dist.barrier()
     train_set = VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE, text_mode="question")
-    model = GroundingModel(**checkpoint_model_kwargs(checkpoint)) if checkpoint else GroundingModel()
+    if checkpoint:
+        model = GroundingModel(**checkpoint_model_kwargs(checkpoint))
+    elif args.spatial_upsample_stages is not None:
+        model = GroundingModel(spatial_upsample_stages=tuple(args.spatial_upsample_stages))
+    else:
+        model = GroundingModel()
     if getattr(args, "init_checkpoint", None):
         initialize_weights(args.init_checkpoint, model)
     model = model.to(device)
@@ -260,6 +267,7 @@ def _train(args, rank, world, distributed, device):
     train_loader = make_loader(train_set,args,args.batch_size//world,sampler,sampler is None,generator)
     run_config["experiment_config"] = unwrap(model).experiment_config
     run_config["spatial_evidence"] = unwrap(model).coarse.decoder.spatial_evidence_enabled
+    run_config["spatial_upsample_stages"] = list(unwrap(model).coarse.decoder.spatial_upsample_stages)
     run_config["tiny"] = getattr(unwrap(model), "coarse", unwrap(model)).experiment_config.get("tiny", False)
     if rank == 0:
         print(json.dumps({"parameters":sum(p.numel() for p in unwrap(model).parameters()),

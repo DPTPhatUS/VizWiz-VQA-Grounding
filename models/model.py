@@ -7,14 +7,14 @@ from torchvision.transforms.functional import to_pil_image, to_tensor
 from losses import per_image_iou
 from models.image_encoder import ImageEncoder, TinyVision
 from models.text_encoder import TextEncoder, masked_mean
-from models.mask_decoder import CompactDecoder
+from models.mask_decoder import CompactDecoder, resolve_spatial_upsample_stages
 from utils import load_model_weights, checkpoint_model_kwargs, read_checkpoint
 
 class CompactGroundingModel(nn.Module):
     """Shared encoders, latent answer predictor and conditioned mask decoder."""
     architecture = "compact"
 
-    def __init__(self, tiny=False, spatial_evidence=True):
+    def __init__(self, tiny=False, spatial_evidence=True, spatial_upsample_stages=(0, 1)):
         super().__init__()
         self.image_encoder = TinyVision() if tiny else ImageEncoder()
         self.text_encoder = TextEncoder(tiny)
@@ -34,15 +34,19 @@ class CompactGroundingModel(nn.Module):
         )
         nn.init.zeros_(self.answer_mlp[-1].weight)
         nn.init.zeros_(self.answer_mlp[-1].bias)
-        self._init_decoder(tiny, spatial_evidence=spatial_evidence)
+        self._init_decoder(tiny, spatial_evidence=spatial_evidence,
+                           spatial_upsample_stages=spatial_upsample_stages)
         self.register_buffer("image_mean", torch.tensor([.48145466, .4578275, .40821073]).view(1,3,1,1))  # (1, 3, 1, 1)
         self.register_buffer("image_std", torch.tensor([.26862954, .26130258, .27577711]).view(1,3,1,1))  # (1, 3, 1, 1)
+        stages = list(resolve_spatial_upsample_stages(spatial_upsample_stages)) if spatial_evidence else []
         self.experiment_config = {"experiment": "controls", "architecture": self.architecture, "tiny": tiny,
-                                  "protocol": "normalized-masked-question-v1", "spatial_evidence": spatial_evidence}
+                                  "protocol": "normalized-masked-question-v1", "spatial_evidence": spatial_evidence,
+                                  "spatial_upsample_stages": stages}
 
-    def _init_decoder(self, tiny, spatial_evidence=True):
+    def _init_decoder(self, tiny, spatial_evidence=True, spatial_upsample_stages=(0, 1)):
         self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128,
-                                      spatial_evidence=spatial_evidence)
+                                      spatial_evidence=spatial_evidence,
+                                      spatial_upsample_stages=spatial_upsample_stages)
 
     def set_text_encoder_frozen(self, frozen=True):
         """Freeze the shared Q/A encoder; keep projections and answer predictor trainable."""
@@ -288,9 +292,10 @@ EXPERIMENT = 'latent-answer-distillation'
 
 
 class GroundingModel(nn.Module):
-    def __init__(self, tiny=False, spatial_evidence=True):
+    def __init__(self, tiny=False, spatial_evidence=True, spatial_upsample_stages=(0, 1)):
         super().__init__()
-        self.coarse = CompactGroundingModel(tiny=tiny, spatial_evidence=spatial_evidence)
+        self.coarse = CompactGroundingModel(tiny=tiny, spatial_evidence=spatial_evidence,
+                                            spatial_upsample_stages=spatial_upsample_stages)
         self.experiment_config = dict(self.coarse.experiment_config, experiment=EXPERIMENT)
 
     def forward(self, batch):
