@@ -7,16 +7,19 @@ from torchvision.transforms.functional import to_pil_image, to_tensor
 from losses import per_image_iou
 from models.image_encoder import ImageEncoder, TinyVision
 from models.text_encoder import TextEncoder, masked_mean
-from models.mask_decoder import CompactDecoder, resolve_spatial_upsample_stages
+from models.mask_decoder import (CompactDecoder, resolve_spatial_upsample_stages,
+                                resolve_detail_upsample_stages)
 from utils import load_model_weights, checkpoint_model_kwargs, read_checkpoint
 
 class CompactGroundingModel(nn.Module):
     """Shared encoders, latent answer predictor and conditioned mask decoder."""
     architecture = "compact"
 
-    def __init__(self, tiny=False, spatial_evidence=True, spatial_upsample_stages=(0, 1)):
+    def __init__(self, tiny=False, spatial_evidence=True, spatial_upsample_stages=(0, 1),
+                 spatial_detail=True, detail_upsample_stages=(2, 3), detail_dim=16):
         super().__init__()
         spatial_upsample_stages = resolve_spatial_upsample_stages(spatial_upsample_stages)
+        detail_upsample_stages = resolve_detail_upsample_stages(detail_upsample_stages)
         self.image_encoder = TinyVision() if tiny else ImageEncoder()
         self.text_encoder = TextEncoder(tiny)
         self.visual_dim = self.image_encoder.out_channels
@@ -35,19 +38,33 @@ class CompactGroundingModel(nn.Module):
         )
         nn.init.zeros_(self.answer_mlp[-1].weight)
         nn.init.zeros_(self.answer_mlp[-1].bias)
+        self.spatial_evidence_enabled = spatial_evidence
+        self.spatial_detail_enabled = spatial_detail
+        self.detail_upsample_stages = detail_upsample_stages if spatial_detail else ()
         self._init_decoder(tiny, spatial_evidence=spatial_evidence,
-                           spatial_upsample_stages=spatial_upsample_stages)
+                           spatial_upsample_stages=spatial_upsample_stages,
+                           spatial_detail=spatial_detail,
+                           detail_upsample_stages=detail_upsample_stages,
+                           detail_dim=detail_dim)
         self.register_buffer("image_mean", torch.tensor([.48145466, .4578275, .40821073]).view(1,3,1,1))  # (1, 3, 1, 1)
         self.register_buffer("image_std", torch.tensor([.26862954, .26130258, .27577711]).view(1,3,1,1))  # (1, 3, 1, 1)
-        stages = list(resolve_spatial_upsample_stages(spatial_upsample_stages)) if spatial_evidence else []
+        stages = list(spatial_upsample_stages) if spatial_evidence else []
+        detail_stages = list(detail_upsample_stages) if spatial_detail else []
         self.experiment_config = {"experiment": "controls", "architecture": self.architecture, "tiny": tiny,
-                                  "protocol": "normalized-masked-question-v1", "spatial_evidence": spatial_evidence,
-                                  "spatial_upsample_stages": stages}
+                                  "protocol": "normalized-masked-question-v1",
+                                  "spatial_evidence": spatial_evidence,
+                                  "spatial_upsample_stages": stages,
+                                  "spatial_detail": spatial_detail,
+                                  "detail_upsample_stages": detail_stages}
 
-    def _init_decoder(self, tiny, spatial_evidence=True, spatial_upsample_stages=(0, 1)):
+    def _init_decoder(self, tiny, spatial_evidence=True, spatial_upsample_stages=(0, 1),
+                      spatial_detail=True, detail_upsample_stages=(2, 3), detail_dim=16):
         self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128,
                                       spatial_evidence=spatial_evidence,
-                                      spatial_upsample_stages=spatial_upsample_stages)
+                                      spatial_upsample_stages=spatial_upsample_stages,
+                                      spatial_detail=spatial_detail,
+                                      detail_upsample_stages=detail_upsample_stages,
+                                      detail_dim=detail_dim)
 
     def set_text_encoder_frozen(self, frozen=True):
         """Freeze the shared Q/A encoder; keep projections and answer predictor trainable."""
@@ -61,11 +78,18 @@ class CompactGroundingModel(nn.Module):
             self.text_encoder.eval()
         return self
 
-    def _decode_mask(self, fused, s3, s2, s1, text, answer_vec=None, *, projected_skips=None):
-        return self.decoder(fused, s3, s2, s1, text, answer_vec=answer_vec, projected_skips=projected_skips)
+    def _decode_mask(self, fused, s3, s2, s1, text, answer_vec=None, *, projected_skips=None, detail_features=None):
+        if detail_features is None and self.spatial_detail_enabled:
+            detail_features = getattr(self, "_cached_detail_features", None)
+        return self.decoder(fused, s3, s2, s1, text, answer_vec=answer_vec,
+                            projected_skips=projected_skips, detail_features=detail_features)
 
     def encode_image(self, image):
-        return self.image_encoder((image - self.image_mean) / self.image_std)  # 4 x (B, D_v, H_p, W_p)
+        norm_img = (image - self.image_mean) / self.image_std
+        if self.spatial_detail_enabled and hasattr(self.decoder, "detail_stem") and self.decoder.detail_stem is not None:
+            self._cached_detail_features = self.decoder.detail_stem(norm_img)
+        return self.image_encoder(norm_img)  # 4 x (B, D_v, H_p, W_p)
+
 
     def encode_question(self, texts, question_vec=None):
         """Accept raw text or cached token features and return their pooled question."""
@@ -108,7 +132,7 @@ class CompactGroundingModel(nn.Module):
                 torch.cat([text.attention_mask, mask], dim=1), answer_vec)
 
     def _grounding_logits(self, features, tokens, attention_mask, question_vec, answer_vec,
-                         projected_skips=None):
+                         projected_skips=None, detail_features=None):
         """The same visual/text fusion and mask decoder for every conditioning view."""
         s1, s2, s3, vision = features  # each (B, D_v, H_p, W_p)
         query = vision.flatten(2).transpose(1, 2)  # (B, N, D_v)
@@ -119,46 +143,53 @@ class CompactGroundingModel(nn.Module):
         fused = query + self.residual_scale.to(query.dtype) * attended  # (B, N, D_v)
         fused = fused.transpose(1, 2).reshape_as(vision).contiguous()  # (B, D_v, H_p, W_p)
         return self._decode_mask(fused, s3, s2, s1, question_vec, answer_vec,
-                                 projected_skips=projected_skips)  # (B, 1, 16*H_p, 16*W_p)
+                                 projected_skips=projected_skips, detail_features=detail_features)  # (B, 1, 16*H_p, 16*W_p)
 
-    def decode_question(self, features, text, question_vec, *, projected_skips=None):
+    def decode_question(self, features, text, question_vec, *, projected_skips=None, detail_features=None):
         """Q-only reference: no answer token and Q-only skip conditioning."""
         logits = self._grounding_logits(features, text.tokens, text.attention_mask,
-                                       question_vec, None, projected_skips)
+                                       question_vec, None, projected_skips, detail_features=detail_features)
         return {"logits": logits, "latent_answer": None, "answer_attn": None,
                 "question_vec": question_vec.detach()}
 
     def decode_answer(self, features, text, question_vec, answer_vec, *,
-                      answer_available=None, projected_skips=None):
+                      answer_available=None, projected_skips=None, detail_features=None):
         """Ground with a supplied answer vector (real A or a diagnostic intervention)."""
         tokens, mask, answer = self._answer_conditioning(
             text, question_vec, answer_vec.to(text.tokens.dtype), answer_available)
-        logits = self._grounding_logits(features, tokens, mask, question_vec, answer, projected_skips)
+        logits = self._grounding_logits(features, tokens, mask, question_vec, answer, projected_skips,
+                                        detail_features=detail_features)
         return {"logits": logits, "latent_answer": answer, "answer_attn": None,
                 "question_vec": question_vec.detach()}
 
     def decode_predicted(self, features, text, question_vec, *, detach_predicted_answer=False,
-                         answer_available=None, projected_skips=None):
+                         answer_available=None, projected_skips=None, detail_features=None):
         """Ground with A′, optionally cutting only its direct mask-loss gradient."""
         latent, attn_map = self.infer_latent_answer(features[-1], question_vec)
         conditioning = latent.detach() if detach_predicted_answer else latent
         tokens, mask, answer = self._answer_conditioning(text, question_vec, conditioning, answer_available)
-        logits = self._grounding_logits(features, tokens, mask, question_vec, answer, projected_skips)
+        logits = self._grounding_logits(features, tokens, mask, question_vec, answer, projected_skips,
+                                        detail_features=detail_features)
         # Alignment still needs the original A′ graph when grounding uses detached A′.
         return {"logits": logits, "latent_answer": latent if detach_predicted_answer else answer,
                 "answer_attn": attn_map, "question_vec": question_vec.detach()}
 
     def decode(self, features, texts, answer_vec=None, *, projected_skips=None, question_vec=None,
-               question_only=False, answer_available=None, detach_predicted_answer=False):
+               question_only=False, answer_available=None, detach_predicted_answer=False,
+               detail_features=None):
         """Compatibility entry point for existing prediction and diagnostic callers."""
         text, q = self.encode_question(texts, question_vec)
         if question_only:
-            return self.decode_question(features, text, q, projected_skips=projected_skips)
+            return self.decode_question(features, text, q, projected_skips=projected_skips,
+                                       detail_features=detail_features)
         if answer_vec is not None:
             return self.decode_answer(features, text, q, answer_vec,
-                                      answer_available=answer_available, projected_skips=projected_skips)
+                                      answer_available=answer_available, projected_skips=projected_skips,
+                                      detail_features=detail_features)
         return self.decode_predicted(features, text, q, detach_predicted_answer=detach_predicted_answer,
-                                     answer_available=answer_available, projected_skips=projected_skips)
+                                     answer_available=answer_available, projected_skips=projected_skips,
+                                     detail_features=detail_features)
+
 
     def forward(self, batch):
         """Encode once, predict the mask, then add only the requested training views.
@@ -293,11 +324,19 @@ EXPERIMENT = 'latent-answer-distillation'
 
 
 class GroundingModel(nn.Module):
-    def __init__(self, tiny=False, spatial_evidence=True, spatial_upsample_stages=(0, 1)):
+    def __init__(self, tiny=False, spatial_evidence=True, spatial_upsample_stages=(0, 1),
+                 spatial_detail=True, detail_upsample_stages=(2, 3), detail_dim=16):
         super().__init__()
-        self.coarse = CompactGroundingModel(tiny=tiny, spatial_evidence=spatial_evidence,
-                                            spatial_upsample_stages=spatial_upsample_stages)
+        self.coarse = CompactGroundingModel(
+            tiny=tiny,
+            spatial_evidence=spatial_evidence,
+            spatial_upsample_stages=spatial_upsample_stages,
+            spatial_detail=spatial_detail,
+            detail_upsample_stages=detail_upsample_stages,
+            detail_dim=detail_dim,
+        )
         self.experiment_config = dict(self.coarse.experiment_config, experiment=EXPERIMENT)
+
 
     def forward(self, batch):
         return self.coarse(batch)

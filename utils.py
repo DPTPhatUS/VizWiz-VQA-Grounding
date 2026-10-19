@@ -40,9 +40,45 @@ def spatial_evidence_keys(stages=(0, 1)):
     return keys
 
 
+def _detail_fuser_keys(prefix):
+    return {
+        f"{prefix}.guide_proj.weight",
+        f"{prefix}.guide_proj.bias",
+        f"{prefix}.guide_scale",
+        f"{prefix}.guide_bias",
+        f"{prefix}.refine.0.weight",
+        f"{prefix}.refine.1.weight",
+        f"{prefix}.refine.2.weight",
+        f"{prefix}.refine.2.bias",
+        f"{prefix}.residual_scale",
+    }
+
+
+def _detail_stem_keys(prefix="decoder.detail_stem"):
+    return {
+        f"{prefix}.stem.0.weight",
+        f"{prefix}.stem.1.weight",
+        f"{prefix}.stem.1.bias",
+        f"{prefix}.stem.3.weight",
+        f"{prefix}.stem.4.weight",
+        f"{prefix}.stem.4.bias",
+    }
+
+
+def spatial_detail_keys(stages=(2, 3)):
+    keys = _detail_stem_keys("decoder.detail_stem")
+    keys.add("decoder.detail_stage_ids")
+    if stages:
+        for idx in stages:
+            keys.update(_detail_fuser_keys(f"decoder.detail_upsample.{idx}"))
+    return keys
+
+
 SPATIAL_EVIDENCE_KEYS = spatial_evidence_keys((0, 1))
+SPATIAL_DETAIL_KEYS = spatial_detail_keys((2, 3))
 LATENT_ANSWER_KEYS = BASE_LATENT_ANSWER_KEYS | SPATIAL_EVIDENCE_KEYS
 COARSENED_LATENT_ANSWER_KEYS = {f"coarse.{k}" for k in LATENT_ANSWER_KEYS}
+
 
 
 
@@ -72,13 +108,20 @@ def checkpoint_model_kwargs(saved):
     """Resolve architecture from tensors; verify any recorded spatial setting."""
     state = saved["model_state_dict"]
     spatial = any(k.startswith(("decoder.spatial_", "coarse.decoder.spatial_")) for k in state)
+    detail = any(k.startswith(("decoder.detail_", "coarse.decoder.detail_")) for k in state)
     run = saved.get("run_config", {})
     configs = (saved.get("experiment_config", {}), run.get("experiment_config", {}), run)
     for config in configs:
         if "spatial_evidence" in config and config["spatial_evidence"] != spatial:
             raise ValueError("Checkpoint spatial_evidence metadata disagrees with model tensors")
-    kwargs = {"tiny": run.get("tiny", is_tiny_state(state)), "spatial_evidence": spatial}
-    from models.mask_decoder import resolve_spatial_upsample_stages
+        if "spatial_detail" in config and config["spatial_detail"] != detail:
+            raise ValueError("Checkpoint spatial_detail metadata disagrees with model tensors")
+    kwargs = {
+        "tiny": run.get("tiny", is_tiny_state(state)),
+        "spatial_evidence": spatial,
+        "spatial_detail": detail,
+    }
+    from models.mask_decoder import resolve_spatial_upsample_stages, resolve_detail_upsample_stages
     recorded = []
     for config in configs:
         if "spatial_upsample_stages" in config:
@@ -120,6 +163,40 @@ def checkpoint_model_kwargs(saved):
         kwargs["spatial_upsample_stages"] = stages
     elif recorded and recorded[0]:
         raise ValueError("Non-spatial checkpoint contains spatial stage metadata")
+
+    recorded_detail = []
+    for config in configs:
+        if "detail_upsample_stages" in config:
+            value = config["detail_upsample_stages"]
+            if not isinstance(value, (list, tuple)):
+                raise ValueError("Checkpoint detail stages must be a list of integer IDs")
+            recorded_detail.append(resolve_detail_upsample_stages(value))
+    detail_markers = [v for k, v in state.items() if k.endswith("decoder.detail_stage_ids")]
+    for marker in detail_markers:
+        if marker.ndim != 1 or marker.dtype != torch.long:
+            raise ValueError("Invalid detail stage buffer")
+        d_stages = resolve_detail_upsample_stages(marker.tolist())
+        if list(d_stages) != marker.tolist():
+            raise ValueError("Detail stage buffer must be sorted")
+        recorded_detail.append(d_stages)
+    if recorded_detail and any(value != recorded_detail[0] for value in recorded_detail):
+        raise ValueError("Conflicting checkpoint detail_upsample_stages metadata")
+    detail_indices = sorted({int(k.split("decoder.detail_upsample.")[1].split(".")[0])
+                             for k in state if "decoder.detail_upsample." in k})
+    if detail:
+        if recorded_detail:
+            d_stages = recorded_detail[0]
+        elif not detail_indices:
+            d_stages = ()
+        else:
+            d_stages = tuple(detail_indices)
+        expected_d_indices = list(d_stages)
+        if detail_indices != expected_d_indices:
+            raise ValueError("Checkpoint detail stage IDs disagree with module tensors")
+        kwargs["detail_upsample_stages"] = d_stages
+    elif recorded_detail and recorded_detail[0]:
+        raise ValueError("Non-detail checkpoint contains detail stage metadata")
+
     return kwargs
 
 
@@ -164,13 +241,19 @@ def load_model_weights(model, saved, *, allow_latent_initialization=False):
     target_keys = set(model.state_dict())
     missing = target_keys - set(state)
     model_spatial = {k[7:] if k.startswith("coarse.") else k for k in target_keys if "decoder.spatial_" in k}
+    model_detail = {k[7:] if k.startswith("coarse.") else k for k in target_keys if "decoder.detail_" in k}
     model_latent = BASE_LATENT_ANSWER_KEYS | model_spatial
+    model_all = model_latent | model_detail
     allowed_groups = {
         frozenset(BASE_LATENT_ANSWER_KEYS),
         frozenset(SPATIAL_EVIDENCE_KEYS),
+        frozenset(SPATIAL_DETAIL_KEYS),
         frozenset(LATENT_ANSWER_KEYS),
         frozenset(model_spatial),
+        frozenset(model_detail),
+        frozenset(model_spatial | model_detail),
         frozenset(model_latent),
+        frozenset(model_all),
     }
     allowed = tuple(set(g) for g in allowed_groups if g)
     allowed += tuple({f"coarse.{k}" for k in group} for group in allowed)
@@ -179,19 +262,26 @@ def load_model_weights(model, saved, *, allow_latent_initialization=False):
     if config is not None:
         config = dict(config)
         config.setdefault("spatial_evidence", any("decoder.spatial_" in k for k in state))
+        config.setdefault("spatial_detail", any("decoder.detail_" in k for k in state))
         expected = dict(model.experiment_config)
-        if "spatial_upsample_stages" in config:
-            config["spatial_upsample_stages"] = list(config["spatial_upsample_stages"])
-        if "spatial_upsample_stages" in expected:
-            expected["spatial_upsample_stages"] = list(expected["spatial_upsample_stages"])
+        for stage_key in ("spatial_upsample_stages", "detail_upsample_stages"):
+            if stage_key in config:
+                config[stage_key] = list(config[stage_key])
+            if stage_key in expected:
+                expected[stage_key] = list(expected[stage_key])
         if partial:
             # Explicit weight initialization can add whole modules, never arbitrary tensors.
             config["spatial_evidence"] = expected.get("spatial_evidence", False)
             if "spatial_upsample_stages" in expected:
                 config["spatial_upsample_stages"] = expected["spatial_upsample_stages"]
+            config["spatial_detail"] = expected.get("spatial_detail", False)
+            if "detail_upsample_stages" in expected:
+                config["detail_upsample_stages"] = expected["detail_upsample_stages"]
         else:
             if "spatial_upsample_stages" not in config and "spatial_upsample_stages" in expected:
                 config["spatial_upsample_stages"] = list(options.get("spatial_upsample_stages", ()))
+            if "detail_upsample_stages" not in config and "detail_upsample_stages" in expected:
+                config["detail_upsample_stages"] = list(options.get("detail_upsample_stages", ()))
         if config != expected:
             raise ValueError("Checkpoint configuration does not match model configuration")
     if partial:
@@ -204,6 +294,7 @@ def load_model_weights(model, saved, *, allow_latent_initialization=False):
     run = saved.get("run_config", {})
     core = model.coarse if hasattr(model, "coarse") else model
     core.question_only = run.get("training_config", {}).get("question_only", run.get("question_only", False))
+
 
 
 
