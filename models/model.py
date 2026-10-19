@@ -16,6 +16,7 @@ class CompactGroundingModel(nn.Module):
 
     def __init__(self, tiny=False, spatial_evidence=True, spatial_upsample_stages=(0, 1)):
         super().__init__()
+        spatial_upsample_stages = resolve_spatial_upsample_stages(spatial_upsample_stages)
         self.image_encoder = TinyVision() if tiny else ImageEncoder()
         self.text_encoder = TextEncoder(tiny)
         self.visual_dim = self.image_encoder.out_channels

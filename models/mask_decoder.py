@@ -1,5 +1,6 @@
 """Text-conditioned compact mask decoding."""
 import torch
+from numbers import Integral
 from torch import nn
 from torch.nn import functional as F
 from models.text_encoder import masked_mean
@@ -120,10 +121,20 @@ UPSAMPLE_STAGE_CHANNELS = (64, 32, 16, 16)
 
 
 def resolve_spatial_upsample_stages(stages):
-    if stages is None or stages is False:
+    if stages is None:
         return ()
-    if isinstance(stages, int):
+    if isinstance(stages, bool):
+        raise ValueError("Spatial stages must be integer IDs, not booleans")
+    if isinstance(stages, Integral):
+        if not 0 <= stages <= len(UPSAMPLE_STAGE_CHANNELS):
+            raise ValueError("Spatial stage count must be between 0 and 4")
         stages = range(stages)
+    try:
+        stages = tuple(stages)
+    except TypeError as error:
+        raise ValueError("Spatial stages must be a sequence of integer IDs") from error
+    if any(isinstance(s, bool) or not isinstance(s, Integral) for s in stages):
+        raise ValueError("Spatial stages must contain only integer IDs")
     stages = tuple(int(s) for s in stages)
     for s in stages:
         if s < 0 or s >= len(UPSAMPLE_STAGE_CHANNELS):
@@ -147,13 +158,15 @@ class CompactDecoder(nn.Module):
             separable(32, 16), separable(16, 16),
         ])
         self.output = nn.Conv2d(16, 1, 1)
+        self.register_buffer("spatial_stage_ids", torch.tensor(self.spatial_upsample_stages, dtype=torch.long)
+                             if spatial_evidence else None)
 
         if spatial_evidence and self.spatial_upsample_stages:
             self.spatial_bottleneck = SpatialEvidenceInteraction(width, text_dim)
-            self.spatial_upsample = nn.ModuleList([
-                SpatialEvidenceInteraction(UPSAMPLE_STAGE_CHANNELS[i], text_dim)
+            self.spatial_upsample = nn.ModuleDict({
+                str(i): SpatialEvidenceInteraction(UPSAMPLE_STAGE_CHANNELS[i], text_dim)
                 for i in self.spatial_upsample_stages
-            ])
+            })
         elif spatial_evidence:
             self.spatial_bottleneck = SpatialEvidenceInteraction(width, text_dim)
             self.spatial_upsample = None
@@ -172,7 +185,7 @@ class CompactDecoder(nn.Module):
         if self.spatial_bottleneck.last_gate is not None:
             gates.append(self.spatial_bottleneck.last_gate)
         if self.spatial_upsample is not None:
-            for module in self.spatial_upsample:
+            for module in self.spatial_upsample.values():
                 if module.last_gate is not None:
                     gates.append(module.last_gate)
         return gates
@@ -194,8 +207,7 @@ class CompactDecoder(nn.Module):
         for i, block in enumerate(self.upsample):
             x = block(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False))  # 2x spatial per stage
             if self.spatial_upsample is not None and i in self.spatial_upsample_stages:
-                idx = self.spatial_upsample_stages.index(i)
-                x = self.spatial_upsample[idx](x, answer_vec)
+                x = self.spatial_upsample[str(i)](x, answer_vec)
 
         return self.output(x)  # (B, 1, 16*H_p, 16*W_p)
 

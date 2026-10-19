@@ -155,6 +155,9 @@ def training_parser():
 
 
 def check_arguments(args):
+    from models.mask_decoder import resolve_spatial_upsample_stages
+    if args.spatial_upsample_stages is not None:
+        resolve_spatial_upsample_stages(args.spatial_upsample_stages)
     if min(args.num_epochs, args.batch_size) <= 0:
         raise ValueError("Epochs and batch size must be positive")
     if args.save_every < 0:
@@ -195,6 +198,12 @@ def train_main(argv=None):
 
 def _train(args, rank, world, distributed, device):
     checkpoint = read_checkpoint(args.resume_checkpoint) if args.resume_checkpoint else None
+    model_options = checkpoint_model_kwargs(checkpoint) if checkpoint else {}
+    if checkpoint and args.spatial_upsample_stages is not None:
+        from models.mask_decoder import resolve_spatial_upsample_stages
+        requested = resolve_spatial_upsample_stages(args.spatial_upsample_stages)
+        if requested != model_options.get("spatial_upsample_stages", ()):
+            raise ValueError("Resume spatial stages differ from the checkpoint; start a new experiment instead")
     resolve_training_arguments(args, checkpoint)
     seed_everything(args.seed)
     run_config = vars(args).copy()
@@ -217,7 +226,7 @@ def _train(args, rank, world, distributed, device):
         dist.barrier()
     train_set = VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE, text_mode="question")
     if checkpoint:
-        model = GroundingModel(**checkpoint_model_kwargs(checkpoint))
+        model = GroundingModel(**model_options)
     elif args.spatial_upsample_stages is not None:
         model = GroundingModel(spatial_upsample_stages=tuple(args.spatial_upsample_stages))
     else:

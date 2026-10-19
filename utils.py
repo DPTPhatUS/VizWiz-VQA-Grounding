@@ -1,5 +1,6 @@
 """Batch transfer and plain PyTorch weight loading."""
 import os
+from collections import OrderedDict
 from pathlib import Path
 import warnings
 import torch
@@ -32,8 +33,9 @@ def _spatial_module_keys(prefix):
 
 def spatial_evidence_keys(stages=(0, 1)):
     keys = _spatial_module_keys("decoder.spatial_bottleneck")
+    keys.add("decoder.spatial_stage_ids")
     if stages:
-        for idx in range(len(stages)):
+        for idx in stages:
             keys.update(_spatial_module_keys(f"decoder.spatial_upsample.{idx}"))
     return keys
 
@@ -71,27 +73,77 @@ def checkpoint_model_kwargs(saved):
     state = saved["model_state_dict"]
     spatial = any(k.startswith(("decoder.spatial_", "coarse.decoder.spatial_")) for k in state)
     run = saved.get("run_config", {})
-    for config in (saved.get("experiment_config", {}), run.get("experiment_config", {}), run):
+    configs = (saved.get("experiment_config", {}), run.get("experiment_config", {}), run)
+    for config in configs:
         if "spatial_evidence" in config and config["spatial_evidence"] != spatial:
             raise ValueError("Checkpoint spatial_evidence metadata disagrees with model tensors")
     kwargs = {"tiny": run.get("tiny", is_tiny_state(state)), "spatial_evidence": spatial}
+    from models.mask_decoder import resolve_spatial_upsample_stages
+    recorded = []
+    for config in configs:
+        if "spatial_upsample_stages" in config:
+            value = config["spatial_upsample_stages"]
+            if not isinstance(value, (list, tuple)):
+                raise ValueError("Checkpoint spatial stages must be a list of integer IDs")
+            recorded.append(resolve_spatial_upsample_stages(value))
+    markers = [v for k, v in state.items() if k.endswith("decoder.spatial_stage_ids")]
+    for marker in markers:
+        if marker.ndim != 1 or marker.dtype != torch.long:
+            raise ValueError("Invalid spatial stage buffer")
+        stages = resolve_spatial_upsample_stages(marker.tolist())
+        if list(stages) != marker.tolist():
+            raise ValueError("Spatial stage buffer must be sorted")
+        recorded.append(stages)
+    if recorded and any(value != recorded[0] for value in recorded):
+        raise ValueError("Conflicting checkpoint spatial_upsample_stages metadata")
+    indices = sorted({int(k.split("decoder.spatial_upsample.")[1].split(".")[0])
+                      for k in state if "decoder.spatial_upsample." in k})
     if spatial:
-        stages = None
-        for config in (saved.get("experiment_config", {}), run.get("experiment_config", {}), run):
-            if "spatial_upsample_stages" in config:
-                stages = tuple(config["spatial_upsample_stages"])
-                break
-        if stages is None:
-            upsample_indices = sorted({
-                int(k.split("decoder.spatial_upsample.")[1].split(".")[0])
-                for k in state if "decoder.spatial_upsample." in k
-            })
-            if upsample_indices:
-                stages = tuple(range(max(upsample_indices) + 1))
-            else:
-                stages = ()
+        if recorded:
+            stages = recorded[0]
+        elif not indices:
+            stages = ()
+        else:
+            # Positional legacy weights cannot identify stages 2 versus 3.
+            projections = {int(k.split("decoder.spatial_upsample.")[1].split(".")[0]): v
+                           for k, v in state.items()
+                           if "decoder.spatial_upsample." in k and k.endswith(".visual_proj.weight")}
+            if set(projections) != set(indices):
+                raise ValueError("Incomplete legacy spatial weights: missing visual projection")
+            channels = [projections[i].shape[0] for i in indices]
+            if indices != list(range(len(indices))) or channels not in ([64], [64, 32], [64, 32, 16, 16]):
+                raise ValueError("Ambiguous legacy raw spatial weights; use the full checkpoint with stage metadata")
+            stages = tuple(indices)
+        expected_indices = list(stages) if markers else list(range(len(stages)))
+        if indices != expected_indices:
+            raise ValueError("Checkpoint spatial stage IDs disagree with module tensors")
         kwargs["spatial_upsample_stages"] = stages
+    elif recorded and recorded[0]:
+        raise ValueError("Non-spatial checkpoint contains spatial stage metadata")
     return kwargs
+
+
+def _normalize_spatial_state(saved):
+    """Migrate legacy positional names in memory; never modify checkpoint tensors."""
+    state = saved["model_state_dict"]
+    options = checkpoint_model_kwargs(saved)
+    if not options["spatial_evidence"] or any(k.endswith("decoder.spatial_stage_ids") for k in state):
+        return state, options
+    stages = options["spatial_upsample_stages"]
+    prefix = "coarse.decoder." if any(k.startswith("coarse.decoder.spatial_") for k in state) else "decoder."
+
+    def rename(key):
+        start = prefix + "spatial_upsample."
+        if key.startswith(start):
+            index, dot, tail = key[len(start):].partition(".")
+            return start + str(stages[int(index)]) + dot + tail
+        return key
+
+    migrated = OrderedDict((rename(k), v) for k, v in state.items())
+    migrated[prefix + "spatial_stage_ids"] = torch.tensor(stages, dtype=torch.long)
+    if hasattr(state, "_metadata"):
+        migrated._metadata = OrderedDict((rename(k), v) for k, v in state._metadata.items())
+    return migrated, options
 
 
 def save_checkpoint(saved, path):
@@ -107,7 +159,8 @@ def save_checkpoint(saved, path):
 
 def load_model_weights(model, saved, *, allow_latent_initialization=False):
     """Strict for inference/resume/teachers; only explicit student initialization may omit latent tensors."""
-    state = saved.get("model_state_dict", saved)
+    payload = saved if "model_state_dict" in saved else {"model_state_dict": saved}
+    state, options = _normalize_spatial_state(payload)
     target_keys = set(model.state_dict())
     missing = target_keys - set(state)
     model_spatial = {k[7:] if k.startswith("coarse.") else k for k in target_keys if "decoder.spatial_" in k}
@@ -138,10 +191,7 @@ def load_model_weights(model, saved, *, allow_latent_initialization=False):
                 config["spatial_upsample_stages"] = expected["spatial_upsample_stages"]
         else:
             if "spatial_upsample_stages" not in config and "spatial_upsample_stages" in expected:
-                if any(k.startswith(("decoder.spatial_upsample.", "coarse.decoder.spatial_upsample.")) for k in state):
-                    config["spatial_upsample_stages"] = [0, 1]
-                else:
-                    config["spatial_upsample_stages"] = []
+                config["spatial_upsample_stages"] = list(options.get("spatial_upsample_stages", ()))
         if config != expected:
             raise ValueError("Checkpoint configuration does not match model configuration")
     if partial:
