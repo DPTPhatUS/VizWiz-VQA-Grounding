@@ -121,7 +121,17 @@ def checkpoint_model_kwargs(saved):
         "spatial_evidence": spatial,
         "spatial_detail": detail,
     }
-    from models.mask_decoder import resolve_spatial_upsample_stages, resolve_detail_upsample_stages
+    from models.mask_decoder import (resolve_spatial_upsample_stages, resolve_detail_upsample_stages,
+                                     validate_detail_dim)
+    detail_dims = [validate_detail_dim(config["detail_dim"]) for config in configs if "detail_dim" in config]
+    for key, value in state.items():
+        if key.endswith("decoder.detail_stem.stem.0.weight"):
+            if value.ndim != 4 or value.shape[1:] != (3, 3, 3):
+                raise ValueError("Invalid detail stem input projection")
+            detail_dims.append(validate_detail_dim(value.shape[0]))
+    if detail_dims and any(value != detail_dims[0] for value in detail_dims):
+        raise ValueError("Checkpoint detail_dim metadata disagrees with model tensors")
+    kwargs["detail_dim"] = detail_dims[0] if detail_dims else 16
     recorded = []
     for config in configs:
         if "spatial_upsample_stages" in config:
@@ -263,6 +273,7 @@ def load_model_weights(model, saved, *, allow_latent_initialization=False):
         config = dict(config)
         config.setdefault("spatial_evidence", any("decoder.spatial_" in k for k in state))
         config.setdefault("spatial_detail", any("decoder.detail_" in k for k in state))
+        config.setdefault("detail_dim", options["detail_dim"])
         expected = dict(model.experiment_config)
         for stage_key in ("spatial_upsample_stages", "detail_upsample_stages"):
             if stage_key in config:
@@ -275,6 +286,8 @@ def load_model_weights(model, saved, *, allow_latent_initialization=False):
             if "spatial_upsample_stages" in expected:
                 config["spatial_upsample_stages"] = expected["spatial_upsample_stages"]
             config["spatial_detail"] = expected.get("spatial_detail", False)
+            if not options["spatial_detail"]:
+                config["detail_dim"] = expected["detail_dim"]
             if "detail_upsample_stages" in expected:
                 config["detail_upsample_stages"] = expected["detail_upsample_stages"]
         else:

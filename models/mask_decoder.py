@@ -168,17 +168,23 @@ def resolve_detail_upsample_stages(stages):
     return tuple(sorted(stages))
 
 
+def validate_detail_dim(detail_dim):
+    if isinstance(detail_dim, bool) or not isinstance(detail_dim, Integral) or detail_dim <= 0 or detail_dim % 4:
+        raise ValueError("detail_dim must be a positive integer divisible by 4")
+    return int(detail_dim)
+
+
 class PixelDetailStem(nn.Module):
-    """Shallow convolutional stem extracting high-frequency spatial edge and texture details.
+    """Shallow convolutional stem learning local features from the resized image.
 
     Inspired by DDVT (Dual-level Vision Transformer, Zhang et al., 2026).
-    Preserves fine pixel-level boundaries directly from RGB input that are otherwise
-    blurred by ViT 14x14 patch tokenization.
+    Bypasses ViT patch embedding; cannot recover details lost before the RGB input
+    reaches the model. Edge selectivity is learned, not imposed by a high-pass filter.
     """
     def __init__(self, in_channels=3, detail_dim=16):
         super().__init__()
         self.in_channels = in_channels
-        self.detail_dim = detail_dim
+        self.detail_dim = detail_dim = validate_detail_dim(detail_dim)
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, detail_dim, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(4, detail_dim),
@@ -194,12 +200,11 @@ class PixelDetailStem(nn.Module):
 
 
 class RegionPixelFuser(nn.Module):
-    """Semantic-guided region-pixel detail fusion (adapted CMA from DDVT).
+    """Semantic-guided region-pixel detail fusion, inspired by multi-level fusion.
 
-    Uses semantic visual features (which already integrate latent answer evidence)
-    to generate a continuous 2D spatial guidance mask M_guide in (0, 1). This mask
-    selectively gates high-frequency pixel details D, filtering out background clutter
-    and preserving sharp edges only within the target semantic region:
+    Uses semantic visual features to generate a continuous 2D spatial guidance
+    mask M_guide in (0, 1), which gates learned local features D. The mask is
+    supervised indirectly by the grounding loss:
         M_guide = sigmoid(guide_scale * Conv_1x1(X_sem) + guide_bias)
         D_tilde = D * M_guide
         Delta_X = SeparableRefine([X_sem, D_tilde])
@@ -213,7 +218,7 @@ class RegionPixelFuser(nn.Module):
     def __init__(self, visual_channels, detail_dim=16):
         super().__init__()
         self.visual_channels = visual_channels
-        self.detail_dim = detail_dim
+        self.detail_dim = detail_dim = validate_detail_dim(detail_dim)
         self.guide_proj = nn.Conv2d(visual_channels, 1, kernel_size=1)
         self.guide_scale = nn.Parameter(torch.tensor(1.0))
         self.guide_bias = nn.Parameter(torch.zeros(1))
@@ -261,7 +266,7 @@ class CompactDecoder(nn.Module):
         self.spatial_upsample_stages = resolve_spatial_upsample_stages(spatial_upsample_stages) if spatial_evidence else ()
         self.spatial_detail_enabled = spatial_detail
         self.detail_upsample_stages = resolve_detail_upsample_stages(detail_upsample_stages) if spatial_detail else ()
-        self.detail_dim = detail_dim
+        self.detail_dim = detail_dim = validate_detail_dim(detail_dim)
 
         self.projections = nn.ModuleList([nn.Conv2d(in_channels, width, 1) for _ in range(4)])
         self.conditioner = SkipConditioner(text_dim, width)
@@ -328,6 +333,14 @@ class CompactDecoder(nn.Module):
 
     def forward(self, bottleneck, skip3, skip2, skip1, text, answer_vec=None, *,
                 projected_skips=None, image=None, detail_features=None):
+        if self.detail_stem is not None:
+            if detail_features is None:
+                if image is None:
+                    raise ValueError("Detail fusion requires image or detail_features from the same encoded image")
+                detail_features = self.detail_stem(image)
+            if (detail_features.ndim != 4 or detail_features.shape[0] != bottleneck.shape[0]
+                    or detail_features.shape[1] != self.detail_dim):
+                raise ValueError("detail_features must have shape (batch, detail_dim, height, width)")
         x = self.projections[0](bottleneck)  # (B, C, H_p, W_p)
         skips = projected_skips if projected_skips is not None else self.project_skips(skip3, skip2, skip1)  # 3 x (B, C, H_p, W_p)
         skips = self.conditioner(skips, text, answer_vec=answer_vec)  # 3 x (B, C, H_p, W_p)
@@ -339,10 +352,6 @@ class CompactDecoder(nn.Module):
         # Bottleneck spatial evidence interaction
         if self.spatial_bottleneck is not None:
             x = self.spatial_bottleneck(x, answer_vec)
-
-        # Extract detail features from image if not already provided
-        if detail_features is None and image is not None and self.detail_stem is not None:
-            detail_features = self.detail_stem(image)
 
         # Progressive upsampling with multi-level spatial evidence and detail fusion
         for i, block in enumerate(self.upsample):

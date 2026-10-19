@@ -1,5 +1,6 @@
 """Question-conditioned grounding models."""
 import os
+from dataclasses import dataclass
 import torch
 from torch import nn
 from PIL import Image, ImageOps
@@ -8,8 +9,25 @@ from losses import per_image_iou
 from models.image_encoder import ImageEncoder, TinyVision
 from models.text_encoder import TextEncoder, masked_mean
 from models.mask_decoder import (CompactDecoder, resolve_spatial_upsample_stages,
-                                resolve_detail_upsample_stages)
+                                resolve_detail_upsample_stages, validate_detail_dim)
 from utils import load_model_weights, checkpoint_model_kwargs, read_checkpoint
+
+
+@dataclass(frozen=True)
+class ImageFeatures:
+    """Keep RGB details with their image pyramid; preserve four-feature iteration."""
+    pyramid: tuple[torch.Tensor, ...]
+    detail: torch.Tensor | None = None
+
+    def __iter__(self):
+        return iter(self.pyramid)
+
+    def __len__(self):
+        return len(self.pyramid)
+
+    def __getitem__(self, index):
+        return self.pyramid[index]
+
 
 class CompactGroundingModel(nn.Module):
     """Shared encoders, latent answer predictor and conditioned mask decoder."""
@@ -20,6 +38,7 @@ class CompactGroundingModel(nn.Module):
         super().__init__()
         spatial_upsample_stages = resolve_spatial_upsample_stages(spatial_upsample_stages)
         detail_upsample_stages = resolve_detail_upsample_stages(detail_upsample_stages)
+        detail_dim = validate_detail_dim(detail_dim)
         self.image_encoder = TinyVision() if tiny else ImageEncoder()
         self.text_encoder = TextEncoder(tiny)
         self.visual_dim = self.image_encoder.out_channels
@@ -55,7 +74,8 @@ class CompactGroundingModel(nn.Module):
                                   "spatial_evidence": spatial_evidence,
                                   "spatial_upsample_stages": stages,
                                   "spatial_detail": spatial_detail,
-                                  "detail_upsample_stages": detail_stages}
+                                  "detail_upsample_stages": detail_stages,
+                                  "detail_dim": detail_dim}
 
     def _init_decoder(self, tiny, spatial_evidence=True, spatial_upsample_stages=(0, 1),
                       spatial_detail=True, detail_upsample_stages=(2, 3), detail_dim=16):
@@ -79,16 +99,13 @@ class CompactGroundingModel(nn.Module):
         return self
 
     def _decode_mask(self, fused, s3, s2, s1, text, answer_vec=None, *, projected_skips=None, detail_features=None):
-        if detail_features is None and self.spatial_detail_enabled:
-            detail_features = getattr(self, "_cached_detail_features", None)
         return self.decoder(fused, s3, s2, s1, text, answer_vec=answer_vec,
                             projected_skips=projected_skips, detail_features=detail_features)
 
     def encode_image(self, image):
         norm_img = (image - self.image_mean) / self.image_std
-        if self.spatial_detail_enabled and hasattr(self.decoder, "detail_stem") and self.decoder.detail_stem is not None:
-            self._cached_detail_features = self.decoder.detail_stem(norm_img)
-        return self.image_encoder(norm_img)  # 4 x (B, D_v, H_p, W_p)
+        detail = self.decoder.detail_stem(norm_img) if self.decoder.detail_stem is not None else None
+        return ImageFeatures(tuple(self.image_encoder(norm_img)), detail)  # 4 x (B, D_v, H_p, W_p)
 
 
     def encode_question(self, texts, question_vec=None):
@@ -134,6 +151,8 @@ class CompactGroundingModel(nn.Module):
     def _grounding_logits(self, features, tokens, attention_mask, question_vec, answer_vec,
                          projected_skips=None, detail_features=None):
         """The same visual/text fusion and mask decoder for every conditioning view."""
+        if detail_features is None:
+            detail_features = getattr(features, "detail", None)
         s1, s2, s3, vision = features  # each (B, D_v, H_p, W_p)
         query = vision.flatten(2).transpose(1, 2)  # (B, N, D_v)
         projected = self.text_proj(tokens)  # (B, L or L + 1, D_v)
