@@ -14,7 +14,7 @@ class CompactGroundingModel(nn.Module):
     """Shared encoders, latent answer predictor and conditioned mask decoder."""
     architecture = "compact"
 
-    def __init__(self, tiny=False):
+    def __init__(self, tiny=False, spatial_evidence=True):
         super().__init__()
         self.image_encoder = TinyVision() if tiny else ImageEncoder()
         self.text_encoder = TextEncoder(tiny)
@@ -34,14 +34,15 @@ class CompactGroundingModel(nn.Module):
         )
         nn.init.zeros_(self.answer_mlp[-1].weight)
         nn.init.zeros_(self.answer_mlp[-1].bias)
-        self._init_decoder(tiny)
+        self._init_decoder(tiny, spatial_evidence=spatial_evidence)
         self.register_buffer("image_mean", torch.tensor([.48145466, .4578275, .40821073]).view(1,3,1,1))  # (1, 3, 1, 1)
         self.register_buffer("image_std", torch.tensor([.26862954, .26130258, .27577711]).view(1,3,1,1))  # (1, 3, 1, 1)
         self.experiment_config = {"experiment": "controls", "architecture": self.architecture, "tiny": tiny,
                                   "protocol": "normalized-masked-question-v1"}
 
-    def _init_decoder(self, tiny):
-        self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128)
+    def _init_decoder(self, tiny, spatial_evidence=True):
+        self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128,
+                                      spatial_evidence=spatial_evidence)
 
     def set_text_encoder_frozen(self, frozen=True):
         """Freeze the shared Q/A encoder; keep projections and answer predictor trainable."""
@@ -196,7 +197,9 @@ class CompactGroundingModel(nn.Module):
         saved = read_checkpoint(checkpoint_path)
         default_tiny = saved.get("run_config", {}).get("tiny", is_tiny_state(saved["model_state_dict"]))
         tiny = kwargs.pop("tiny", default_tiny)
-        model = cls(tiny=tiny, **kwargs)
+        default_spatial = any("spatial_bottleneck" in k for k in saved.get("model_state_dict", {}))
+        spatial_evidence = kwargs.pop("spatial_evidence", default_spatial)
+        model = cls(tiny=tiny, spatial_evidence=spatial_evidence, **kwargs)
         load_model_weights(model, saved)
         return model.to(device).eval()
 
@@ -284,9 +287,9 @@ EXPERIMENT = 'latent-answer-distillation'
 
 
 class GroundingModel(nn.Module):
-    def __init__(self, tiny=False):
+    def __init__(self, tiny=False, spatial_evidence=True):
         super().__init__()
-        self.coarse = CompactGroundingModel(tiny=tiny)
+        self.coarse = CompactGroundingModel(tiny=tiny, spatial_evidence=spatial_evidence)
         self.experiment_config = dict(self.coarse.experiment_config, experiment=EXPERIMENT)
 
     def forward(self, batch):

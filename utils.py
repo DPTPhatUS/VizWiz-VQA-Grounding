@@ -2,7 +2,7 @@
 import torch
 
 
-LATENT_ANSWER_KEYS = {
+BASE_LATENT_ANSWER_KEYS = {
     "visual_to_text.weight", "visual_to_text.bias",
     "answer_query",
     "answer_attn.in_proj_weight", "answer_attn.in_proj_bias",
@@ -12,6 +12,38 @@ LATENT_ANSWER_KEYS = {
     "answer_mlp.2.weight", "answer_mlp.2.bias",
     "decoder.conditioner.qa_gate.weight", "decoder.conditioner.qa_gate.bias",
 }
+
+SPATIAL_EVIDENCE_KEYS = {
+    "decoder.spatial_bottleneck.visual_proj.weight",
+    "decoder.spatial_bottleneck.evidence_proj.weight",
+    "decoder.spatial_bottleneck.gate_scale",
+    "decoder.spatial_bottleneck.gate_bias",
+    "decoder.spatial_bottleneck.refine.0.weight",
+    "decoder.spatial_bottleneck.refine.1.weight",
+    "decoder.spatial_bottleneck.refine.2.weight",
+    "decoder.spatial_bottleneck.refine.2.bias",
+    "decoder.spatial_bottleneck.residual_scale",
+    "decoder.spatial_upsample.0.visual_proj.weight",
+    "decoder.spatial_upsample.0.evidence_proj.weight",
+    "decoder.spatial_upsample.0.gate_scale",
+    "decoder.spatial_upsample.0.gate_bias",
+    "decoder.spatial_upsample.0.refine.0.weight",
+    "decoder.spatial_upsample.0.refine.1.weight",
+    "decoder.spatial_upsample.0.refine.2.weight",
+    "decoder.spatial_upsample.0.refine.2.bias",
+    "decoder.spatial_upsample.0.residual_scale",
+    "decoder.spatial_upsample.1.visual_proj.weight",
+    "decoder.spatial_upsample.1.evidence_proj.weight",
+    "decoder.spatial_upsample.1.gate_scale",
+    "decoder.spatial_upsample.1.gate_bias",
+    "decoder.spatial_upsample.1.refine.0.weight",
+    "decoder.spatial_upsample.1.refine.1.weight",
+    "decoder.spatial_upsample.1.refine.2.weight",
+    "decoder.spatial_upsample.1.refine.2.bias",
+    "decoder.spatial_upsample.1.residual_scale",
+}
+
+LATENT_ANSWER_KEYS = BASE_LATENT_ANSWER_KEYS | SPATIAL_EVIDENCE_KEYS
 COARSENED_LATENT_ANSWER_KEYS = {f"coarse.{k}" for k in LATENT_ANSWER_KEYS}
 
 
@@ -45,7 +77,7 @@ def load_model_weights(model, saved, *, allow_latent_initialization=False):
     state = saved.get("model_state_dict", saved)
     target_keys = set(model.state_dict())
     missing = target_keys - set(state)
-    if allow_latent_initialization and set(state) < target_keys and missing in (LATENT_ANSWER_KEYS, COARSENED_LATENT_ANSWER_KEYS):
+    if allow_latent_initialization and set(state) < target_keys and (missing <= LATENT_ANSWER_KEYS or missing <= COARSENED_LATENT_ANSWER_KEYS):
         model.load_state_dict(state, strict=False)
     else:
         model.load_state_dict(state, strict=True)

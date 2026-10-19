@@ -17,7 +17,12 @@ class SkipConditioner(nn.Module):
 
     def forward(self, skips, text, answer_vec=None):
         q = masked_mean(text.tokens, text.valid_mask) if hasattr(text, "tokens") else text  # (B, D_t)
-        a = q if answer_vec is None else answer_vec.to(q.dtype)  # (B, D_t)
+        if answer_vec is None:
+            a = q
+        elif answer_vec.dim() == 3:
+            a = answer_vec.mean(dim=1).to(q.dtype)
+        else:
+            a = answer_vec.to(q.dtype)
         gate = torch.sigmoid(self.qa_gate(torch.cat([q, a], dim=-1)))  # (B, D_t)
         blended = gate * q + (1 - gate) * a  # (B, D_t)
         condition = F.gelu(self.reduction(blended))  # (B, R)
@@ -31,16 +36,88 @@ class SkipConditioner(nn.Module):
 
 
 def separable(in_channels, out_channels):
+    num_groups = 4 if out_channels % 4 == 0 else 1
     return nn.Sequential(
         nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels, bias=False),
         nn.Conv2d(in_channels, out_channels, 1, bias=False),
-        nn.GroupNorm(4, out_channels), nn.GELU(),
+        nn.GroupNorm(num_groups, out_channels), nn.GELU(),
     )
 
 
-class CompactDecoder(nn.Module):
-    def __init__(self, in_channels=1024, text_dim=768, width=128):
+class SpatialEvidenceInteraction(nn.Module):
+    """Spatial evidence-decoder interaction inspired by DaVI (Pan et al., CVPR 2022 Workshop).
+
+    Computes per-location cosine compatibility between visual features and answer evidence,
+    generating a continuous 2D spatial gate without single-key softmax degeneracy:
+        S(b, 1, h, w) = sum_c ( norm(V_proj(b, c, h, w)) * norm(A_proj(b, c)) )
+        Gate(b, 1, h, w) = sigmoid(gate_scale * S + gate_bias)
+
+    Modulated visual features are combined with the spatial gate and refined via
+    depthwise-separable convolution:
+        Delta_V = Refine([V * Gate, Gate])
+        V_out = V + residual_scale * Delta_V
+
+    Properties:
+    1. residual_scale is initialized to 0 -> strictly identity mapping at step 0.
+    2. When answer_vec is None (Q-only view), returns visual_feat untouched.
+    3. Position-wise sigmoid gating avoids softmax collapse over a single answer token.
+    4. Supports single pooled vectors (B, D_t) and multi-token evidence (B, K, D_t).
+    """
+    def __init__(self, visual_channels, text_dim, hidden_dim=None):
         super().__init__()
+        hidden_dim = hidden_dim or visual_channels
+        self.visual_proj = nn.Conv2d(visual_channels, hidden_dim, kernel_size=1, bias=False)
+        self.evidence_proj = nn.Linear(text_dim, hidden_dim, bias=False)
+        self.gate_scale = nn.Parameter(torch.tensor(1.0))
+        self.gate_bias = nn.Parameter(torch.zeros(1))
+
+        num_groups = 4 if visual_channels % 4 == 0 else 1
+        self.refine = nn.Sequential(
+            nn.Conv2d(visual_channels + 1, visual_channels + 1, kernel_size=3, padding=1,
+                      groups=visual_channels + 1, bias=False),
+            nn.Conv2d(visual_channels + 1, visual_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups, visual_channels),
+            nn.GELU(),
+        )
+        self.residual_scale = nn.Parameter(torch.zeros(1))
+        self.last_gate = None
+
+    def compute_gate(self, visual_feat, answer_vec):
+        """Compute continuous 2D spatial evidence gate in (0, 1)."""
+        v_proj = self.visual_proj(visual_feat)  # (B, H_dim, H, W)
+        v_norm = F.normalize(v_proj, p=2, dim=1, eps=1e-6)
+
+        a_proj = self.evidence_proj(answer_vec.to(dtype=visual_feat.dtype, device=visual_feat.device))
+        a_norm = F.normalize(a_proj, p=2, dim=-1, eps=1e-6)
+
+        if a_norm.dim() == 2:
+            sim = (v_norm * a_norm[:, :, None, None]).sum(dim=1, keepdim=True)  # (B, 1, H, W)
+        elif a_norm.dim() == 3:
+            sim = torch.einsum("bchw,bkc->bkhw", v_norm, a_norm).max(dim=1, keepdim=True)[0]  # (B, 1, H, W)
+        else:
+            raise ValueError(f"Expected answer_vec with 2 or 3 dims, got {answer_vec.shape}")
+
+        gate_logits = self.gate_scale.to(sim.dtype) * sim + self.gate_bias.to(sim.dtype)
+        return torch.sigmoid(gate_logits)
+
+    def forward(self, visual_feat, answer_vec=None):
+        if answer_vec is None:
+            self.last_gate = None
+            return visual_feat
+
+        gate = self.compute_gate(visual_feat, answer_vec).to(visual_feat.dtype)
+        self.last_gate = gate.detach()
+
+        gated = visual_feat * gate
+        cat_feat = torch.cat([gated, gate], dim=1)  # (B, C + 1, H, W)
+        delta = self.refine(cat_feat)
+        return visual_feat + self.residual_scale.to(delta.dtype) * delta
+
+
+class CompactDecoder(nn.Module):
+    def __init__(self, in_channels=1024, text_dim=768, width=128, spatial_evidence=True):
+        super().__init__()
+        self.spatial_evidence_enabled = spatial_evidence
         self.projections = nn.ModuleList([nn.Conv2d(in_channels, width, 1) for _ in range(4)])
         self.conditioner = SkipConditioner(text_dim, width)
         self.fusion = nn.ModuleList([separable(width, width) for _ in range(3)])
@@ -50,8 +127,31 @@ class CompactDecoder(nn.Module):
         ])
         self.output = nn.Conv2d(16, 1, 1)
 
+        if spatial_evidence:
+            self.spatial_bottleneck = SpatialEvidenceInteraction(width, text_dim)
+            self.spatial_upsample = nn.ModuleList([
+                SpatialEvidenceInteraction(64, text_dim),
+                SpatialEvidenceInteraction(32, text_dim),
+            ])
+        else:
+            self.spatial_bottleneck = None
+            self.spatial_upsample = None
+
     def project_skips(self, skip3, skip2, skip1):
         return [proj(feat) for proj, feat in zip(self.projections[1:], (skip3, skip2, skip1))]  # 3 x (B, C, H_p, W_p)
+
+    def get_spatial_gates(self):
+        """Retrieve recent spatial evidence gate maps for inspection or visualization."""
+        if not self.spatial_evidence_enabled or self.spatial_bottleneck is None:
+            return []
+        gates = []
+        if self.spatial_bottleneck.last_gate is not None:
+            gates.append(self.spatial_bottleneck.last_gate)
+        if self.spatial_upsample is not None:
+            for module in self.spatial_upsample:
+                if module.last_gate is not None:
+                    gates.append(module.last_gate)
+        return gates
 
     def forward(self, bottleneck, skip3, skip2, skip1, text, answer_vec=None, *, projected_skips=None):
         x = self.projections[0](bottleneck)  # (B, C, H_p, W_p)
@@ -61,8 +161,17 @@ class CompactDecoder(nn.Module):
             if skip.shape[-2:] != x.shape[-2:]:
                 skip = F.interpolate(skip, size=x.shape[-2:], mode="bilinear", align_corners=False)
             x = x + block(x + skip)  # (B, C, H_p, W_p)
-        for block in self.upsample:
+
+        # Bottleneck spatial evidence interaction
+        if self.spatial_bottleneck is not None and answer_vec is not None:
+            x = self.spatial_bottleneck(x, answer_vec)
+
+        # Progressive upsampling with multi-level spatial evidence guidance
+        for i, block in enumerate(self.upsample):
             x = block(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False))  # 2x spatial per stage
+            if self.spatial_upsample is not None and i < len(self.spatial_upsample) and answer_vec is not None:
+                x = self.spatial_upsample[i](x, answer_vec)
+
         return self.output(x)  # (B, 1, 16*H_p, 16*W_p)
 
 
