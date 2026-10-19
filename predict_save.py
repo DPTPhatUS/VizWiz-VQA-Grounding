@@ -6,7 +6,7 @@ from torch.nn import functional as F
 from torchvision.transforms.functional import to_tensor
 from PIL import Image, ImageOps
 from models.model import GroundingModel, TeacherModel
-from utils import read_checkpoint, load_model_weights, is_tiny_state
+from utils import read_checkpoint, load_model_weights, checkpoint_model_kwargs
 
 
 def prediction_parser(description=__doc__):
@@ -30,7 +30,7 @@ def predict_image(checkpoint,image_path,question,device,teacher=False):
         or (bool(state) and not any(k.startswith("coarse.") for k in state))
     )
     model_type=TeacherModel if is_teacher else GroundingModel
-    model=model_type(tiny=config.get("tiny",is_tiny_state(state)))
+    model=model_type(**checkpoint_model_kwargs(saved))
     load_model_weights(model,saved)
     model.to(device).eval()
     with Image.open(image_path) as source:

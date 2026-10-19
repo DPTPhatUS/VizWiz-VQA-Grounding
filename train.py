@@ -12,7 +12,8 @@ from torch import nn
 from torch.utils.data import DistributedSampler
 from tqdm.auto import tqdm
 from dataset import VizWizGroundingDataset, make_loader
-from utils import to_device, read_checkpoint, load_model_weights, initialize_weights, is_tiny_state
+from utils import (to_device, read_checkpoint, load_model_weights, initialize_weights,
+                   checkpoint_model_kwargs, save_checkpoint)
 from models.model import GroundingModel
 from losses import SupervisedObjective, DistillationObjective, AnswerAlignmentObjective
 
@@ -24,11 +25,13 @@ TRAINING_DEFAULTS = {
     "dice_weight": .5, "latent_weight": .5, "oracle_weight": .5, "question_weight": .5,
     "kd_weight": 1., "attn_weight": .2, "gain_mix": .75,
     "warmup_epochs": 0, "answer_transition_epochs": 0,
-    "freeze_text_encoder": False,
+    "freeze_text_encoder": False, "question_only": False,
 }
 
 
 def objective_version(args):
+    if args.question_only:
+        return "question-supervised-v1"
     versions = {"full": "latent-gain-v2" if args.loss_version == "legacy" else "latent-gain-v3",
                 "grounding-only": "latent-supervised-v1",
                 "alignment": "latent-alignment-v1" if args.loss_version == "legacy" else "latent-alignment-v2",
@@ -79,6 +82,8 @@ def resolve_training_arguments(args, saved=None):
     if args.training_recipe not in ("full", "grounding-only", "alignment", "warmup") or args.loss_version not in ("legacy", "stable"):
         raise ValueError("Checkpoint contains an unsupported training recipe or loss version")
     args.supervised_only = args.training_recipe == "grounding-only"
+    if args.question_only and args.training_recipe != "grounding-only":
+        raise ValueError("question_only requires the grounding-only recipe")
     if saved is not None:
         recorded_version = saved["run_config"].get("objective_version")
         if recorded_version and recorded_version != objective_version(args):
@@ -197,16 +202,23 @@ def _train(args, rank, world, distributed, device):
     run_config["objective_version"] = version
     run_config["training_config"] = {k: getattr(args, k) for k in TRAINING_DEFAULTS}
     out = Path(args.output_dir)
+    history_path = out / "history.jsonl"
+    if not checkpoint and (history_path.exists() or any(out.glob("*.pt"))):
+        raise ValueError("Output already contains a run; choose a new directory or resume explicitly")
+    if checkpoint and history_path.exists():
+        records = [json.loads(line) for line in history_path.read_text().splitlines() if line.strip()]
+        if records and records[-1]["epoch"] != checkpoint["epoch"]:
+            raise ValueError("Existing history does not end at the resumed epoch; use a new output directory")
     if rank == 0:
         out.mkdir(parents=True, exist_ok=True)
     if distributed:
         dist.barrier()
     train_set = VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE, text_mode="question")
-    tiny = checkpoint["run_config"].get("tiny", is_tiny_state(checkpoint["model_state_dict"])) if checkpoint else False
-    model = GroundingModel(tiny=tiny)
+    model = GroundingModel(**checkpoint_model_kwargs(checkpoint)) if checkpoint else GroundingModel()
     if getattr(args, "init_checkpoint", None):
         initialize_weights(args.init_checkpoint, model)
     model = model.to(device)
+    model.coarse.question_only = args.question_only
     if args.freeze_text_encoder:
         model.coarse.set_text_encoder_frozen()
     objective = build_objective(args)
@@ -247,6 +259,7 @@ def _train(args, rank, world, distributed, device):
     generator = torch.Generator()
     train_loader = make_loader(train_set,args,args.batch_size//world,sampler,sampler is None,generator)
     run_config["experiment_config"] = unwrap(model).experiment_config
+    run_config["spatial_evidence"] = unwrap(model).coarse.decoder.spatial_evidence_enabled
     run_config["tiny"] = getattr(unwrap(model), "coarse", unwrap(model)).experiment_config.get("tiny", False)
     if rank == 0:
         print(json.dumps({"parameters":sum(p.numel() for p in unwrap(model).parameters()),
@@ -297,16 +310,16 @@ def _train(args, rank, world, distributed, device):
                 handle.write(json.dumps(record)+"\n")
             if args.save_every and (epoch + 1) % args.save_every == 0:
                 checkpoint_path = out / f"checkpoint_epoch{epoch + 1}.pt"
-                torch.save({"epoch": epoch + 1,
+                save_checkpoint({"epoch": epoch + 1,
                             "model_state_dict": unwrap(model).state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
                             "scaler_state_dict": scaler.state_dict(),
                             "experiment_config": unwrap(model).experiment_config,
-                            "run_config": run_config}, checkpoint_path, _use_new_zipfile_serialization=False)
+                            "run_config": run_config}, checkpoint_path)
                 print(f"Checkpoint saved: {checkpoint_path}", flush=True)
     if rank == 0:
         final_path = out / f"model_final_epoch{args.num_epochs}.pt"
-        torch.save(unwrap(model).state_dict(), final_path, _use_new_zipfile_serialization=False)
+        save_checkpoint(unwrap(model).state_dict(), final_path)
         print(f"Final model saved: {final_path}", flush=True)
     if distributed:
         dist.barrier()

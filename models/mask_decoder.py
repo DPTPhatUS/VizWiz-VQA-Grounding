@@ -163,13 +163,13 @@ class CompactDecoder(nn.Module):
             x = x + block(x + skip)  # (B, C, H_p, W_p)
 
         # Bottleneck spatial evidence interaction
-        if self.spatial_bottleneck is not None and answer_vec is not None:
+        if self.spatial_bottleneck is not None:
             x = self.spatial_bottleneck(x, answer_vec)
 
         # Progressive upsampling with multi-level spatial evidence guidance
         for i, block in enumerate(self.upsample):
             x = block(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False))  # 2x spatial per stage
-            if self.spatial_upsample is not None and i < len(self.spatial_upsample) and answer_vec is not None:
+            if self.spatial_upsample is not None and i < len(self.spatial_upsample):
                 x = self.spatial_upsample[i](x, answer_vec)
 
         return self.output(x)  # (B, 1, 16*H_p, 16*W_p)

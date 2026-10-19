@@ -18,7 +18,7 @@ from dataset import VizWizGroundingDataset, make_loader
 from metrics import metric_samples
 from models.model import CompactGroundingModel, GroundingModel
 from models.text_encoder import masked_mean
-from utils import is_tiny_state, load_model_weights, read_checkpoint, to_device
+from utils import checkpoint_model_kwargs, load_model_weights, read_checkpoint, to_device
 
 MODES = ("question", "predicted_answer", "oracle_answer")
 
@@ -29,12 +29,12 @@ def load_diagnostic_model(path, device):
     if config.get("teacher_training"):
         raise ValueError("Use a latent student checkpoint, not an external teacher")
     model_type = GroundingModel if any(k.startswith("coarse.") for k in state) else CompactGroundingModel
-    model = model_type(tiny=config.get("tiny", is_tiny_state(state)))
+    model = model_type(**checkpoint_model_kwargs(saved))
     load_model_weights(model, saved)
     model.to(device=device, dtype=torch.float32).eval()
     metadata = {"checkpoint": str(path), "epoch": saved.get("epoch"),
                 "objective_version": config.get("objective_version", "unknown (not stored)"),
-                "image_size": config.get("image_size", 336)}
+                "image_size": config.get("image_size", 336), "experiment_config": model.experiment_config}
     return model, metadata
 
 

@@ -1,4 +1,7 @@
 """Batch transfer and plain PyTorch weight loading."""
+import os
+from pathlib import Path
+import warnings
 import torch
 
 
@@ -69,26 +72,62 @@ def read_checkpoint(path):
     return saved
 
 
+def checkpoint_model_kwargs(saved):
+    """Resolve architecture from tensors; verify any recorded spatial setting."""
+    state = saved["model_state_dict"]
+    spatial = any(k.startswith(("decoder.spatial_", "coarse.decoder.spatial_")) for k in state)
+    run = saved.get("run_config", {})
+    for config in (saved.get("experiment_config", {}), run.get("experiment_config", {}), run):
+        if "spatial_evidence" in config and config["spatial_evidence"] != spatial:
+            raise ValueError("Checkpoint spatial_evidence metadata disagrees with model tensors")
+    return {"tiny": run.get("tiny", is_tiny_state(state)), "spatial_evidence": spatial}
+
+
+def save_checkpoint(saved, path):
+    """Replace a checkpoint only after its temporary file was fully written."""
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        torch.save(saved, temporary, _use_new_zipfile_serialization=False)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def load_model_weights(model, saved, *, allow_latent_initialization=False):
     """Strict for inference/resume/teachers; only explicit student initialization may omit latent tensors."""
-    config = saved.get("experiment_config")
-    if config is not None and config != model.experiment_config:
-        raise ValueError("Checkpoint configuration does not match model configuration")
     state = saved.get("model_state_dict", saved)
     target_keys = set(model.state_dict())
     missing = target_keys - set(state)
-    if allow_latent_initialization and set(state) < target_keys and (missing <= LATENT_ANSWER_KEYS or missing <= COARSENED_LATENT_ANSWER_KEYS):
-        model.load_state_dict(state, strict=False)
+    allowed = (BASE_LATENT_ANSWER_KEYS, SPATIAL_EVIDENCE_KEYS, LATENT_ANSWER_KEYS)
+    allowed += tuple({f"coarse.{k}" for k in group} for group in allowed)
+    partial = allow_latent_initialization and set(state) < target_keys and missing in allowed
+    config = saved.get("experiment_config")
+    if config is not None:
+        config = dict(config)
+        config.setdefault("spatial_evidence", any("decoder.spatial_" in k for k in state))
+        expected = dict(model.experiment_config)
+        if partial:
+            # Explicit weight initialization can add whole modules, never arbitrary tensors.
+            config["spatial_evidence"] = expected["spatial_evidence"]
+        if config != expected:
+            raise ValueError("Checkpoint configuration does not match model configuration")
+    if partial:
+        incompatible = model.load_state_dict(state, strict=False)
+        if set(incompatible.missing_keys) != missing or incompatible.unexpected_keys:
+            raise ValueError("Unexpected partial checkpoint tensors")
+        warnings.warn(f"Initialized new module tensors: {', '.join(sorted(missing))}", stacklevel=2)
     else:
         model.load_state_dict(state, strict=True)
+    run = saved.get("run_config", {})
+    core = model.coarse if hasattr(model, "coarse") else model
+    core.question_only = run.get("training_config", {}).get("question_only", run.get("question_only", False))
 
 
 def initialize_weights(path, model):
     saved = path if isinstance(path, dict) else read_checkpoint(path)
     state = saved["model_state_dict"]
     target = model
-    if hasattr(model, "coarse"):
-        coarse_keys = set(model.coarse.state_dict())
-        if set(state) == coarse_keys or (set(state) < coarse_keys and coarse_keys - set(state) == LATENT_ANSWER_KEYS):
-            target = model.coarse
+    if hasattr(model, "coarse") and state and not any(k.startswith("coarse.") for k in state):
+        target = model.coarse
     load_model_weights(target, saved, allow_latent_initialization=True)

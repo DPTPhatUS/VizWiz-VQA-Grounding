@@ -8,7 +8,7 @@ from losses import per_image_iou
 from models.image_encoder import ImageEncoder, TinyVision
 from models.text_encoder import TextEncoder, masked_mean
 from models.mask_decoder import CompactDecoder
-from utils import load_model_weights, is_tiny_state, read_checkpoint
+from utils import load_model_weights, checkpoint_model_kwargs, read_checkpoint
 
 class CompactGroundingModel(nn.Module):
     """Shared encoders, latent answer predictor and conditioned mask decoder."""
@@ -38,7 +38,7 @@ class CompactGroundingModel(nn.Module):
         self.register_buffer("image_mean", torch.tensor([.48145466, .4578275, .40821073]).view(1,3,1,1))  # (1, 3, 1, 1)
         self.register_buffer("image_std", torch.tensor([.26862954, .26130258, .27577711]).view(1,3,1,1))  # (1, 3, 1, 1)
         self.experiment_config = {"experiment": "controls", "architecture": self.architecture, "tiny": tiny,
-                                  "protocol": "normalized-masked-question-v1"}
+                                  "protocol": "normalized-masked-question-v1", "spatial_evidence": spatial_evidence}
 
     def _init_decoder(self, tiny, spatial_evidence=True):
         self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128,
@@ -164,6 +164,9 @@ class CompactGroundingModel(nn.Module):
         features = self.encode_image(batch["image"])  # 4 x (B, D_v, H_p, W_p)
         text, q = self.encode_question(batch.get("question_text", batch["text"]))
 
+        if getattr(self, "question_only", False):
+            return self.decode_question(features, text, q)
+
         # Resolve the recipe's view requests at the forward boundary.
         has_target = (self.training and batch.get("encode_answer_target", True)
                       and ("answer_only_text" in batch or "answer_text" in batch))
@@ -195,11 +198,9 @@ class CompactGroundingModel(nn.Module):
     def from_checkpoint(cls, checkpoint_path, device=None, **kwargs):
         device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         saved = read_checkpoint(checkpoint_path)
-        default_tiny = saved.get("run_config", {}).get("tiny", is_tiny_state(saved["model_state_dict"]))
-        tiny = kwargs.pop("tiny", default_tiny)
-        default_spatial = any("spatial_bottleneck" in k for k in saved.get("model_state_dict", {}))
-        spatial_evidence = kwargs.pop("spatial_evidence", default_spatial)
-        model = cls(tiny=tiny, spatial_evidence=spatial_evidence, **kwargs)
+        options = checkpoint_model_kwargs(saved)
+        options.update(kwargs)
+        model = cls(**options)
         load_model_weights(model, saved)
         return model.to(device).eval()
 

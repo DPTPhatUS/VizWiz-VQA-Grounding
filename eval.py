@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 from dataset import VizWizGroundingDataset, make_loader
 from models.model import GroundingModel, TeacherModel
-from utils import read_checkpoint, load_model_weights, is_tiny_state
+from utils import read_checkpoint, load_model_weights, checkpoint_model_kwargs
 from metrics import evaluate
 
 
@@ -29,7 +29,7 @@ def eval_main(argv=None):
         or (bool(state) and not any(k.startswith("coarse.") for k in state))
     )
     model_type = TeacherModel if is_teacher else GroundingModel
-    model = model_type(tiny=config.get("tiny", is_tiny_state(state)))
+    model = model_type(**checkpoint_model_kwargs(saved))
     load_model_weights(model, saved)
     device = torch.device(args.device); model.to(device)
     dataset = VizWizGroundingDataset(args.data_root,args.dataset,config.get("image_size", 336))
@@ -39,6 +39,7 @@ def eval_main(argv=None):
     summary = {"num_samples":len(scores),"mean_iou":sum(scores.values())/len(scores),
                "dataset":args.dataset,"metric_resolution":"original",
                "text_mode":"question","checkpoint":str(args.checkpoint),
+               "grounding_mode":"question" if getattr(getattr(model, "coarse", model), "question_only", False) else "predicted_answer",
                "experiment_config":model.experiment_config}
     (out/"metrics.json").write_text(json.dumps({"summary":summary,"per_sample":scores},indent=2))
     print(json.dumps(summary),flush=True)
