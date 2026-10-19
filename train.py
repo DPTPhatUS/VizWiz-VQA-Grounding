@@ -151,13 +151,23 @@ def training_parser():
     parser.add_argument("--config", help="Optional JSON for loss weights, detachment, warm-up or freezing text; no file needed for normal runs")
     parser.add_argument("--spatial-upsample-stages", type=int, nargs="*", default=None,
                         help="Upsampling stages to apply spatial evidence interaction (default: 0 1)")
+    parser.add_argument("--spatial-detail", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable semantic-guided region-pixel detail fusion (default: True)")
+    parser.add_argument("--detail-upsample-stages", type=int, nargs="*", default=None,
+                        help="Upsampling stages to apply region-pixel detail fusion (default: 2 3)")
+    parser.add_argument("--detail-dim", type=int, default=16,
+                        help="Channel dimension of detail features from pixel detail stem (default: 16)")
     return parser
 
 
 def check_arguments(args):
-    from models.mask_decoder import resolve_spatial_upsample_stages
+    from models.mask_decoder import resolve_spatial_upsample_stages, resolve_detail_upsample_stages
     if args.spatial_upsample_stages is not None:
         resolve_spatial_upsample_stages(args.spatial_upsample_stages)
+    if getattr(args, "detail_upsample_stages", None) is not None:
+        resolve_detail_upsample_stages(args.detail_upsample_stages)
+    if getattr(args, "detail_dim", None) is not None and args.detail_dim <= 0:
+        raise ValueError("detail_dim must be positive")
     if min(args.num_epochs, args.batch_size) <= 0:
         raise ValueError("Epochs and batch size must be positive")
     if args.save_every < 0:
@@ -199,11 +209,17 @@ def train_main(argv=None):
 def _train(args, rank, world, distributed, device):
     checkpoint = read_checkpoint(args.resume_checkpoint) if args.resume_checkpoint else None
     model_options = checkpoint_model_kwargs(checkpoint) if checkpoint else {}
-    if checkpoint and args.spatial_upsample_stages is not None:
-        from models.mask_decoder import resolve_spatial_upsample_stages
-        requested = resolve_spatial_upsample_stages(args.spatial_upsample_stages)
-        if requested != model_options.get("spatial_upsample_stages", ()):
-            raise ValueError("Resume spatial stages differ from the checkpoint; start a new experiment instead")
+    if checkpoint:
+        if args.spatial_upsample_stages is not None:
+            from models.mask_decoder import resolve_spatial_upsample_stages
+            requested = resolve_spatial_upsample_stages(args.spatial_upsample_stages)
+            if requested != model_options.get("spatial_upsample_stages", ()):
+                raise ValueError("Resume spatial stages differ from the checkpoint; start a new experiment instead")
+        if getattr(args, "detail_upsample_stages", None) is not None:
+            from models.mask_decoder import resolve_detail_upsample_stages
+            requested = resolve_detail_upsample_stages(args.detail_upsample_stages)
+            if requested != model_options.get("detail_upsample_stages", ()):
+                raise ValueError("Resume detail stages differ from the checkpoint; start a new experiment instead")
     resolve_training_arguments(args, checkpoint)
     seed_everything(args.seed)
     run_config = vars(args).copy()
@@ -227,10 +243,17 @@ def _train(args, rank, world, distributed, device):
     train_set = VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE, text_mode="question")
     if checkpoint:
         model = GroundingModel(**model_options)
-    elif args.spatial_upsample_stages is not None:
-        model = GroundingModel(spatial_upsample_stages=tuple(args.spatial_upsample_stages))
     else:
-        model = GroundingModel()
+        model_kwargs = {}
+        if args.spatial_upsample_stages is not None:
+            model_kwargs["spatial_upsample_stages"] = tuple(args.spatial_upsample_stages)
+        if args.spatial_detail is not None:
+            model_kwargs["spatial_detail"] = args.spatial_detail
+        if args.detail_upsample_stages is not None:
+            model_kwargs["detail_upsample_stages"] = tuple(args.detail_upsample_stages)
+        if args.detail_dim is not None:
+            model_kwargs["detail_dim"] = args.detail_dim
+        model = GroundingModel(**model_kwargs)
     if getattr(args, "init_checkpoint", None):
         initialize_weights(args.init_checkpoint, model)
     model = model.to(device)
@@ -277,6 +300,9 @@ def _train(args, rank, world, distributed, device):
     run_config["experiment_config"] = unwrap(model).experiment_config
     run_config["spatial_evidence"] = unwrap(model).coarse.decoder.spatial_evidence_enabled
     run_config["spatial_upsample_stages"] = list(unwrap(model).coarse.decoder.spatial_upsample_stages)
+    run_config["spatial_detail"] = unwrap(model).coarse.decoder.spatial_detail_enabled
+    run_config["detail_upsample_stages"] = list(unwrap(model).coarse.decoder.detail_upsample_stages)
+    run_config["detail_dim"] = unwrap(model).coarse.decoder.detail_dim
     run_config["tiny"] = getattr(unwrap(model), "coarse", unwrap(model)).experiment_config.get("tiny", False)
     if rank == 0:
         print(json.dumps({"parameters":sum(p.numel() for p in unwrap(model).parameters()),
