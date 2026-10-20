@@ -151,6 +151,8 @@ def training_parser():
     parser.add_argument("--config", help="Optional JSON for loss weights, detachment, warm-up or freezing text; no file needed for normal runs")
     parser.add_argument("--spatial-upsample-stages", type=int, nargs="*", default=None,
                         help="Upsampling stages to apply spatial evidence interaction (default: 0 1)")
+    parser.add_argument("--spatial-evidence", action=argparse.BooleanOptionalAction, default=None,
+                        help="Enable cosine spatial interaction at bottleneck and selected stages (fresh default: True)")
     parser.add_argument("--spatial-detail", action=argparse.BooleanOptionalAction, default=None,
                         help="Enable semantic-guided region-pixel detail fusion (default: True)")
     parser.add_argument("--detail-upsample-stages", type=int, nargs="*", default=None,
@@ -165,6 +167,8 @@ def check_arguments(args):
                                      validate_detail_dim)
     if args.spatial_upsample_stages is not None:
         resolve_spatial_upsample_stages(args.spatial_upsample_stages)
+        if args.spatial_evidence is False and args.spatial_upsample_stages:
+            raise ValueError("--no-spatial-evidence cannot be combined with nonempty --spatial-upsample-stages")
     if getattr(args, "detail_upsample_stages", None) is not None:
         resolve_detail_upsample_stages(args.detail_upsample_stages)
     if args.detail_dim is not None:
@@ -211,7 +215,7 @@ def resolve_model_arguments(args, checkpoint=None):
     """Restore architecture on resume; reject any conflicting explicit override."""
     from models.mask_decoder import resolve_spatial_upsample_stages, resolve_detail_upsample_stages
     requested = {key: getattr(args, key) for key in (
-        "spatial_upsample_stages", "spatial_detail", "detail_upsample_stages", "detail_dim")
+        "spatial_evidence", "spatial_upsample_stages", "spatial_detail", "detail_upsample_stages", "detail_dim")
         if getattr(args, key) is not None}
     for key, resolve in (("spatial_upsample_stages", resolve_spatial_upsample_stages),
                          ("detail_upsample_stages", resolve_detail_upsample_stages)):

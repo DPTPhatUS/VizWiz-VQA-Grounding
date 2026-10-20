@@ -92,6 +92,7 @@ model_last_only = GroundingModel(detail_upsample_stages=(3,))
 ```
 
 #### CLI Flags
+- `--no-spatial-evidence`: Disable all cosine spatial interaction, including the bottleneck, while retaining the latent-answer token, skip conditioning, and detail path. Use this for the alignment + detail comparison; train a fresh run with the matched alignment/stable/frozen-text settings.
 - `--spatial-detail` / `--no-spatial-detail`: Enable/disable detail fusion (default: enabled).
 - `--detail-upsample-stages 2 3`: Upsampling stages for detail fusion (default: `2 3`).
 - `--detail-dim 16`: Channel dimension for pixel detail stem; a positive multiple of 4 (fresh-run default: `16`).
