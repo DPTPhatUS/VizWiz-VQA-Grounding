@@ -1,9 +1,10 @@
 """CLIP token features and the small offline encoder used by tests."""
+
 from typing import NamedTuple
 
 import torch
 from torch import nn
-from transformers import CLIPTokenizer, CLIPTextModel
+from transformers import CLIPTextModel, CLIPTokenizer
 
 
 class TextFeatures(NamedTuple):
@@ -37,18 +38,25 @@ class TextEncoder(nn.Module):
         if isinstance(texts, str):
             texts = [texts]
         if self.tiny:
-            rows = [[1] + [b + 3 for b in text.encode("utf8")[:75]] + [2] for text in texts]
+            rows = [
+                [1] + [b + 3 for b in text.encode("utf8")[:75]] + [2] for text in texts
+            ]
             max_len = max(map(len, rows))
             padded = [row + [0] * (max_len - len(row)) for row in rows]
-            ids = torch.tensor(padded, dtype=torch.long, device=self.embedding.weight.device)  # (B, L)
+            ids = torch.tensor(
+                padded, dtype=torch.long, device=self.embedding.weight.device
+            )  # (B, L)
             attention = ids != 0  # (B, L)
             tokens = self.embedding(ids)  # (B, L, D_t)
         else:
-            inputs = self.tokenizer(texts, return_tensors="pt", padding=True,
-                truncation=True, max_length=77).to(self.encoder.model.device)
+            inputs = self.tokenizer(
+                texts, return_tensors="pt", padding=True, truncation=True, max_length=77
+            ).to(self.encoder.model.device)
             attention = inputs.attention_mask.bool()  # (B, L)
             tokens = self.encoder.model(**inputs).last_hidden_state  # (B, L, D_t)
         valid = attention.clone()  # (B, L)
         valid[:, 0] = False
-        valid[torch.arange(len(texts), device=valid.device), attention.sum(1) - 1] = False  # (B, L), mask SOT/EOT
+        valid[torch.arange(len(texts), device=valid.device), attention.sum(1) - 1] = (
+            False  # (B, L), mask SOT/EOT
+        )
         return TextFeatures(tokens, attention, valid)

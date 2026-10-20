@@ -1,455 +1,145 @@
-"""Text-conditioned compact mask decoding."""
+"""Question-conditioned skip compression and four-stage detail-guided decoding."""
+
 import torch
-from numbers import Integral
-from torch import nn
+from torch import Tensor, nn
 from torch.nn import functional as F
-from models.text_encoder import masked_mean
+
+
+def conv_block(
+    in_channels: int, out_channels: int, *, separable: bool = False
+) -> nn.Sequential:
+    """Convolution, affine GroupNorm and GELU; no bias before normalization."""
+    layers = []
+    if separable:
+        layers.append(
+            nn.Conv2d(
+                in_channels, in_channels, 3, padding=1, groups=in_channels, bias=False
+            )
+        )
+        layers.append(nn.Conv2d(in_channels, out_channels, 1, bias=False))
+    else:
+        layers.append(nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False))
+    layers.extend((nn.GroupNorm(4, out_channels), nn.GELU()))
+    return nn.Sequential(*layers)
 
 
 class SkipConditioner(nn.Module):
-    def __init__(self, text_dim, channels, reduction=64):
+    """Nonlinear skip compression, Q-FiLM, then reduction to decoder width."""
+
+    def __init__(
+        self, visual_dim: int, text_dim: int, width: int, hidden: int, reduction: int
+    ):
         super().__init__()
-        self.qa_gate = nn.Linear(2 * text_dim, text_dim)
-        self.reduction = nn.Linear(text_dim, reduction)
-        self.affine = nn.ModuleList([nn.Linear(reduction, 2 * channels) for _ in range(3)])
+        self.projections = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(visual_dim, hidden, 1, bias=False),
+                    nn.GroupNorm(8, hidden),
+                    nn.GELU(),
+                )
+                for _ in range(3)
+            ]
+        )
+        self.question = nn.Sequential(nn.Linear(text_dim, reduction), nn.GELU())
+        self.affine = nn.ModuleList(
+            [nn.Linear(reduction, 2 * hidden) for _ in range(3)]
+        )
+        self.outputs = nn.ModuleList([nn.Conv2d(hidden, width, 1) for _ in range(3)])
         for head in self.affine:
             nn.init.zeros_(head.weight)
             nn.init.zeros_(head.bias)
 
-    def forward(self, skips, text, answer_vec=None):
-        q = masked_mean(text.tokens, text.valid_mask) if hasattr(text, "tokens") else text  # (B, D_t)
-        if answer_vec is None:
-            a = q
-        elif answer_vec.dim() == 3:
-            a = answer_vec.mean(dim=1).to(q.dtype)
-        else:
-            a = answer_vec.to(q.dtype)
-        gate = torch.sigmoid(self.qa_gate(torch.cat([q, a], dim=-1)))  # (B, D_t)
-        blended = gate * q + (1 - gate) * a  # (B, D_t)
-        condition = F.gelu(self.reduction(blended))  # (B, R)
-        output = []
-        for feature, head in zip(skips, self.affine):
-            gamma, beta = head(condition).chunk(2, dim=-1)  # (B, C), (B, C)
-            gamma = gamma.to(feature.dtype)
-            beta = beta.to(feature.dtype)
-            output.append(feature * (1 + gamma[:, :, None, None]) + beta[:, :, None, None])  # (B, C, H_p, W_p)
-        return output
+    def forward(self, skips: tuple[Tensor, ...], question: Tensor) -> list[Tensor]:
+        if len(skips) != 3:
+            raise ValueError("Exactly three CLIP skips are required")
+        condition = self.question(question)
+        result = []
+        for skip, project, head, output in zip(
+            skips, self.projections, self.affine, self.outputs
+        ):
+            feature = project(skip)
+            gamma, beta = head(condition).chunk(2, dim=-1)
+            feature = feature * (1 + gamma[:, :, None, None]) + beta[:, :, None, None]
+            result.append(output(feature))
+        return result
 
 
-def separable(in_channels, out_channels):
-    num_groups = 4 if out_channels % 4 == 0 else 1
-    return nn.Sequential(
-        nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels, bias=False),
-        nn.Conv2d(in_channels, out_channels, 1, bias=False),
-        nn.GroupNorm(num_groups, out_channels), nn.GELU(),
-    )
+class QuestionDetailFusion(nn.Module):
+    """A nonlinear spatial guide combines semantic, local and question features."""
 
-
-class SpatialEvidenceInteraction(nn.Module):
-    """Spatial evidence-decoder interaction inspired by DaVI (Pan et al., CVPR 2022 Workshop).
-
-    Computes per-location cosine compatibility between visual features and answer evidence,
-    generating a continuous 2D spatial gate without single-key softmax degeneracy:
-        S(b, 1, h, w) = sum_c ( norm(V_proj(b, c, h, w)) * norm(A_proj(b, c)) )
-        Gate(b, 1, h, w) = sigmoid(gate_scale * S + gate_bias)
-
-    Modulated visual features are combined with the spatial gate and refined via
-    depthwise-separable convolution:
-        Delta_V = Refine([V * Gate, Gate])
-        V_out = V + residual_scale * Delta_V
-
-    Properties:
-    1. residual_scale is initialized to 0 -> strictly identity mapping at step 0.
-    2. When answer_vec is None (Q-only view), returns visual_feat untouched.
-    3. Position-wise sigmoid gating avoids softmax collapse over a single answer token.
-    4. Supports single pooled vectors (B, D_t) and multi-token evidence (B, K, D_t).
-    """
-    def __init__(self, visual_channels, text_dim, hidden_dim=None):
+    def __init__(self, channels: int, detail_dim: int, question_dim: int):
         super().__init__()
-        self.visual_channels = visual_channels
-        self.text_dim = text_dim
-        hidden_dim = hidden_dim or visual_channels
-        self.visual_proj = nn.Conv2d(visual_channels, hidden_dim, kernel_size=1, bias=False)
-        self.evidence_proj = nn.Linear(text_dim, hidden_dim, bias=False)
-        self.gate_scale = nn.Parameter(torch.tensor(1.0))
-        self.gate_bias = nn.Parameter(torch.zeros(1))
-
-        num_groups = 4 if visual_channels % 4 == 0 else 1
-        self.refine = nn.Sequential(
-            nn.Conv2d(visual_channels + 1, visual_channels + 1, kernel_size=3, padding=1,
-                      groups=visual_channels + 1, bias=False),
-            nn.Conv2d(visual_channels + 1, visual_channels, kernel_size=1, bias=False),
-            nn.GroupNorm(num_groups, visual_channels),
+        self.guide = nn.Sequential(
+            nn.Conv2d(channels + detail_dim + question_dim, detail_dim, 1),
             nn.GELU(),
+            nn.Conv2d(detail_dim, 1, 1),
+            nn.Sigmoid(),
         )
-        self.residual_scale = nn.Parameter(torch.zeros(1))
-        self.last_gate = None
+        self.refine = conv_block(channels + detail_dim, channels, separable=True)
+        self.residual_scale = nn.Parameter(torch.zeros(()))
 
-    def compute_gate(self, visual_feat, answer_vec):
-        """Compute continuous 2D spatial evidence gate in (0, 1)."""
-        v_proj = self.visual_proj(visual_feat)  # (B, H_dim, H, W)
-        v_norm = F.normalize(v_proj, p=2, dim=1, eps=1e-6)
-
-        a_proj = self.evidence_proj(answer_vec.to(dtype=visual_feat.dtype, device=visual_feat.device))
-        a_norm = F.normalize(a_proj, p=2, dim=-1, eps=1e-6)
-
-        if a_norm.dim() == 2:
-            sim = (v_norm * a_norm[:, :, None, None]).sum(dim=1, keepdim=True)  # (B, 1, H, W)
-        elif a_norm.dim() == 3:
-            sim = torch.einsum("bchw,bkc->bkhw", v_norm, a_norm).max(dim=1, keepdim=True)[0]  # (B, 1, H, W)
-        else:
-            raise ValueError(f"Expected answer_vec with 2 or 3 dims, got {answer_vec.shape}")
-
-        gate_logits = self.gate_scale.to(sim.dtype) * sim + self.gate_bias.to(sim.dtype)
-        return torch.sigmoid(gate_logits)
-
-    def forward(self, visual_feat, answer_vec=None):
-        if answer_vec is None:
-            self.last_gate = None
-            return visual_feat
-
-        gate = self.compute_gate(visual_feat, answer_vec).to(visual_feat.dtype)
-        self.last_gate = gate.detach()
-
-        gated = visual_feat * gate
-        cat_feat = torch.cat([gated, gate], dim=1)  # (B, C + 1, H, W)
-        delta = self.refine(cat_feat)
-        return visual_feat + self.residual_scale.to(delta.dtype) * delta
+    def forward(self, visual: Tensor, detail: Tensor, question: Tensor) -> Tensor:
+        if detail.shape[-2:] != visual.shape[-2:]:
+            raise ValueError(
+                "Detail pyramid and decoder stage must have matching grids"
+            )
+        qmap = question[:, :, None, None].expand(-1, -1, *visual.shape[-2:])
+        guide = self.guide(torch.cat((visual, detail, qmap), dim=1))
+        delta = self.refine(torch.cat((visual, detail * guide), dim=1))
+        return visual + self.residual_scale * delta
 
 
-UPSAMPLE_STAGE_CHANNELS = (64, 32, 16, 16)
+class DetailDecoder(nn.Module):
+    """Fuse three CLIP skips, then upsample through four detail-supported stages."""
 
-
-def resolve_spatial_upsample_stages(stages):
-    if stages is None:
-        return ()
-    if isinstance(stages, bool):
-        raise ValueError("Spatial stages must be integer IDs, not booleans")
-    if isinstance(stages, Integral):
-        if not 0 <= stages <= len(UPSAMPLE_STAGE_CHANNELS):
-            raise ValueError("Spatial stage count must be between 0 and 4")
-        stages = range(stages)
-    try:
-        stages = tuple(stages)
-    except TypeError as error:
-        raise ValueError("Spatial stages must be a sequence of integer IDs") from error
-    if any(isinstance(s, bool) or not isinstance(s, Integral) for s in stages):
-        raise ValueError("Spatial stages must contain only integer IDs")
-    stages = tuple(int(s) for s in stages)
-    for s in stages:
-        if s < 0 or s >= len(UPSAMPLE_STAGE_CHANNELS):
-            raise ValueError(f"Invalid spatial upsample stage: {s}. Must be in range(0, {len(UPSAMPLE_STAGE_CHANNELS)})")
-    if len(set(stages)) != len(stages):
-        raise ValueError(f"Duplicate spatial upsample stages: {stages}")
-    return tuple(sorted(stages))
-
-
-def resolve_detail_upsample_stages(stages):
-    if stages is None:
-        return ()
-    if isinstance(stages, bool):
-        raise ValueError("Detail stages must be integer IDs, not booleans")
-    if isinstance(stages, Integral):
-        if not 0 <= stages <= len(UPSAMPLE_STAGE_CHANNELS):
-            raise ValueError("Detail stage count must be between 0 and 4")
-        stages = tuple(range(len(UPSAMPLE_STAGE_CHANNELS) - stages, len(UPSAMPLE_STAGE_CHANNELS)))
-    try:
-        stages = tuple(stages)
-    except TypeError as error:
-        raise ValueError("Detail stages must be a sequence of integer IDs") from error
-    if any(isinstance(s, bool) or not isinstance(s, Integral) for s in stages):
-        raise ValueError("Detail stages must contain only integer IDs")
-    stages = tuple(int(s) for s in stages)
-    for s in stages:
-        if s < 0 or s >= len(UPSAMPLE_STAGE_CHANNELS):
-            raise ValueError(f"Invalid detail upsample stage: {s}. Must be in range(0, {len(UPSAMPLE_STAGE_CHANNELS)})")
-    if len(set(stages)) != len(stages):
-        raise ValueError(f"Duplicate detail upsample stages: {stages}")
-    return tuple(sorted(stages))
-
-
-def validate_detail_dim(detail_dim):
-    if isinstance(detail_dim, bool) or not isinstance(detail_dim, Integral) or detail_dim <= 0 or detail_dim % 4:
-        raise ValueError("detail_dim must be a positive integer divisible by 4")
-    return int(detail_dim)
-
-
-class PixelDetailStem(nn.Module):
-    """Shallow convolutional stem learning local features from the resized image.
-
-    Inspired by DDVT (Dual-level Vision Transformer, Zhang et al., 2026).
-    Bypasses ViT patch embedding; cannot recover details lost before the RGB input
-    reaches the model. Edge selectivity is learned, not imposed by a high-pass filter.
-    """
-    def __init__(self, in_channels=3, detail_dim=16):
+    def __init__(self, visual_dim: int, text_dim: int, *, tiny: bool = False):
         super().__init__()
-        self.in_channels = in_channels
-        self.detail_dim = detail_dim = validate_detail_dim(detail_dim)
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, detail_dim, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(4, detail_dim),
-            nn.GELU(),
-            nn.Conv2d(detail_dim, detail_dim, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(4, detail_dim),
-            nn.GELU(),
+        width, hidden, reduction = (16, 32, 16) if tiny else (128, 256, 64)
+        detail_dim = 8 if tiny else 16
+        channels = (8, 8, 4, 4) if tiny else (64, 32, 16, 16)
+        self.bottleneck = nn.Conv2d(visual_dim, width, 1)
+        self.skips = SkipConditioner(visual_dim, text_dim, width, hidden, reduction)
+        self.skip_fusion = nn.ModuleList(
+            [conv_block(width, width, separable=True) for _ in range(3)]
         )
-
-    def forward(self, image):
-        """Extract dense detail representation (B, detail_dim, H_img, W_img)."""
-        return self.stem(image)
-
-
-class RegionPixelFuser(nn.Module):
-    """Semantic-guided region-pixel detail fusion, inspired by multi-level fusion.
-
-    Uses semantic visual features to generate a continuous 2D spatial guidance
-    mask M_guide in (0, 1), which gates learned local features D. The mask is
-    supervised indirectly by the grounding loss:
-        M_guide = sigmoid(guide_scale * Conv_1x1(X_sem) + guide_bias)
-        D_tilde = D * M_guide
-        Delta_X = SeparableRefine([X_sem, D_tilde])
-        X_out = X_sem + residual_scale * Delta_X
-
-    Properties:
-    1. residual_scale is initialized to 0 -> strictly identity mapping at step 0.
-    2. When detail_feat is None, returns visual_feat untouched.
-    3. Seamlessly handles resolution alignment via bilinear interpolation.
-    """
-    def __init__(self, visual_channels, detail_dim=16):
-        super().__init__()
-        self.visual_channels = visual_channels
-        self.detail_dim = detail_dim = validate_detail_dim(detail_dim)
-        self.guide_proj = nn.Conv2d(visual_channels, 1, kernel_size=1)
-        self.guide_scale = nn.Parameter(torch.tensor(1.0))
-        self.guide_bias = nn.Parameter(torch.zeros(1))
-
-        in_fused = visual_channels + detail_dim
-        num_groups = 4 if visual_channels % 4 == 0 else 1
-        self.refine = nn.Sequential(
-            nn.Conv2d(in_fused, in_fused, kernel_size=3, padding=1, groups=in_fused, bias=False),
-            nn.Conv2d(in_fused, visual_channels, kernel_size=1, bias=False),
-            nn.GroupNorm(num_groups, visual_channels),
-            nn.GELU(),
+        self.upsample = nn.ModuleList(
+            [conv_block(a, b) for a, b in zip((width, *channels[:-1]), channels)]
         )
-        self.residual_scale = nn.Parameter(torch.zeros(1))
-        self.last_guide_mask = None
+        self.detail_fusion = nn.ModuleList(
+            [QuestionDetailFusion(c, detail_dim, detail_dim) for c in channels]
+        )
+        self.auxiliary_heads = nn.ModuleDict(
+            {
+                "96": nn.Conv2d(channels[1], 1, 1),
+                "192": nn.Conv2d(channels[2], 1, 1),
+            }
+        )
+        self.mask_head = nn.Conv2d(channels[-1], 1, 1)
+        self.output_channels = channels[-1]
 
-    def compute_guide_mask(self, visual_feat):
-        """Compute continuous 2D semantic guidance mask in (0, 1)."""
-        logits = self.guide_scale.to(visual_feat.dtype) * self.guide_proj(visual_feat) + self.guide_bias.to(visual_feat.dtype)
-        return torch.sigmoid(logits)
-
-    def forward(self, visual_feat, detail_feat=None):
-        if detail_feat is None:
-            self.last_guide_mask = None
-            return visual_feat
-
-        if detail_feat.shape[-2:] != visual_feat.shape[-2:]:
-            detail_feat = F.interpolate(detail_feat, size=visual_feat.shape[-2:],
-                                        mode="bilinear", align_corners=False)
-
-        guide_mask = self.compute_guide_mask(visual_feat).to(visual_feat.dtype)
-        self.last_guide_mask = guide_mask.detach()
-
-        gated_detail = detail_feat.to(visual_feat.dtype) * guide_mask
-        fused = torch.cat([visual_feat, gated_detail], dim=1)
-        delta = self.refine(fused)
-        return visual_feat + self.residual_scale.to(delta.dtype) * delta
-
-
-class CompactDecoder(nn.Module):
-    def __init__(self, in_channels=1024, text_dim=768, width=128,
-                 spatial_evidence=True, spatial_upsample_stages=(0, 1),
-                 spatial_detail=True, detail_upsample_stages=(2, 3), detail_dim=16):
-        super().__init__()
-        self.spatial_evidence_enabled = spatial_evidence
-        self.spatial_upsample_stages = resolve_spatial_upsample_stages(spatial_upsample_stages) if spatial_evidence else ()
-        self.spatial_detail_enabled = spatial_detail
-        self.detail_upsample_stages = resolve_detail_upsample_stages(detail_upsample_stages) if spatial_detail else ()
-        self.detail_dim = detail_dim = validate_detail_dim(detail_dim)
-
-        self.projections = nn.ModuleList([nn.Conv2d(in_channels, width, 1) for _ in range(4)])
-        self.conditioner = SkipConditioner(text_dim, width)
-        self.fusion = nn.ModuleList([separable(width, width) for _ in range(3)])
-        self.upsample = nn.ModuleList([
-            separable(width, 64), separable(64, 32),
-            separable(32, 16), separable(16, 16),
-        ])
-        self.output = nn.Conv2d(16, 1, 1)
-        self.register_buffer("spatial_stage_ids", torch.tensor(self.spatial_upsample_stages, dtype=torch.long)
-                             if spatial_evidence else None)
-        self.register_buffer("detail_stage_ids", torch.tensor(self.detail_upsample_stages, dtype=torch.long)
-                             if spatial_detail else None)
-
-        if spatial_evidence and self.spatial_upsample_stages:
-            self.spatial_bottleneck = SpatialEvidenceInteraction(width, text_dim)
-            self.spatial_upsample = nn.ModuleDict({
-                str(i): SpatialEvidenceInteraction(UPSAMPLE_STAGE_CHANNELS[i], text_dim)
-                for i in self.spatial_upsample_stages
-            })
-        elif spatial_evidence:
-            self.spatial_bottleneck = SpatialEvidenceInteraction(width, text_dim)
-            self.spatial_upsample = None
-        else:
-            self.spatial_bottleneck = None
-            self.spatial_upsample = None
-
-        if spatial_detail and self.detail_upsample_stages:
-            self.detail_stem = PixelDetailStem(in_channels=3, detail_dim=detail_dim)
-            self.detail_upsample = nn.ModuleDict({
-                str(i): RegionPixelFuser(UPSAMPLE_STAGE_CHANNELS[i], detail_dim=detail_dim)
-                for i in self.detail_upsample_stages
-            })
-        else:
-            self.detail_stem = None
-            self.detail_upsample = None
-
-
-    def project_skips(self, skip3, skip2, skip1):
-        return [proj(feat) for proj, feat in zip(self.projections[1:], (skip3, skip2, skip1))]  # 3 x (B, C, H_p, W_p)
-
-    def get_spatial_gates(self):
-        """Retrieve recent spatial evidence gate maps for inspection or visualization."""
-        if not self.spatial_evidence_enabled or self.spatial_bottleneck is None:
-            return []
-        gates = []
-        if self.spatial_bottleneck.last_gate is not None:
-            gates.append(self.spatial_bottleneck.last_gate)
-        if self.spatial_upsample is not None:
-            for module in self.spatial_upsample.values():
-                if module.last_gate is not None:
-                    gates.append(module.last_gate)
-        return gates
-
-    def get_detail_guide_masks(self):
-        """Retrieve recent semantic guidance masks from region-pixel detail fusion."""
-        if not self.spatial_detail_enabled or self.detail_upsample is None:
-            return []
-        masks = []
-        for module in self.detail_upsample.values():
-            if module.last_guide_mask is not None:
-                masks.append(module.last_guide_mask)
-        return masks
-
-    def forward(self, bottleneck, skip3, skip2, skip1, text, answer_vec=None, *,
-                projected_skips=None, image=None, detail_features=None):
-        if self.detail_stem is not None:
-            if detail_features is None:
-                if image is None:
-                    raise ValueError("Detail fusion requires image or detail_features from the same encoded image")
-                detail_features = self.detail_stem(image)
-            if (detail_features.ndim != 4 or detail_features.shape[0] != bottleneck.shape[0]
-                    or detail_features.shape[1] != self.detail_dim):
-                raise ValueError("detail_features must have shape (batch, detail_dim, height, width)")
-        x = self.projections[0](bottleneck)  # (B, C, H_p, W_p)
-        skips = projected_skips if projected_skips is not None else self.project_skips(skip3, skip2, skip1)  # 3 x (B, C, H_p, W_p)
-        skips = self.conditioner(skips, text, answer_vec=answer_vec)  # 3 x (B, C, H_p, W_p)
-        for block, skip in zip(self.fusion, skips):
-            if skip.shape[-2:] != x.shape[-2:]:
-                skip = F.interpolate(skip, size=x.shape[-2:], mode="bilinear", align_corners=False)
-            x = x + block(x + skip)  # (B, C, H_p, W_p)
-
-        # Bottleneck spatial evidence interaction
-        if self.spatial_bottleneck is not None:
-            x = self.spatial_bottleneck(x, answer_vec)
-
-        # Progressive upsampling with multi-level spatial evidence and detail fusion
-        for i, block in enumerate(self.upsample):
-            x = block(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False))  # 2x spatial per stage
-            if self.spatial_upsample is not None and i in self.spatial_upsample_stages:
-                x = self.spatial_upsample[str(i)](x, answer_vec)
-            if self.detail_upsample is not None and i in self.detail_upsample_stages and detail_features is not None:
-                x = self.detail_upsample[str(i)](x, detail_features)
-
-        return self.output(x)  # (B, 1, 16*H_p, 16*W_p)
-
-
-
-class UNetDecoder(nn.Module):
-    def __init__(self, in_channels=1024, mid_channels=(1024, 512, 256, 128), out_channels=1):
-        """
-        U-Net based decoder (matched to ImageEncoder output structure)
-        in_channels: number of bottleneck and skip channels (e.g. 1024 for ViT-L)
-        mid_channels: decoder output channels per stage (1024, 512, 256, 128)
-        """
-        super().__init__()
-        c0, c1, c2, c3 = mid_channels
-
-        # upsample layers
-        self.upconvs = nn.ModuleList([
-            nn.ConvTranspose2d(in_channels, c0, kernel_size=2, stride=2),
-            nn.ConvTranspose2d(c0, c1, kernel_size=2, stride=2),
-            nn.ConvTranspose2d(c1, c2, kernel_size=2, stride=2),
-            nn.ConvTranspose2d(c2, c3, kernel_size=2, stride=2),
-        ])
-
-        # decoder blocks
-        self.dec_blocks = nn.ModuleList([
-            # stage 1 (c0 + in_channels -> c0)
-            nn.Sequential(
-                nn.Conv2d(c0 + in_channels, c0, kernel_size=3, padding=1),
-                nn.BatchNorm2d(c0),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(c0, c0, kernel_size=3, padding=1),
-                nn.BatchNorm2d(c0),
-                nn.ReLU(inplace=True),
-            ),
-            # stage 2 (c1 + in_channels -> c1)
-            nn.Sequential(
-                nn.Conv2d(c1 + in_channels, c1, kernel_size=3, padding=1),
-                nn.BatchNorm2d(c1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(c1, c1, kernel_size=3, padding=1),
-                nn.BatchNorm2d(c1),
-                nn.ReLU(inplace=True),
-            ),
-            # stage 3 (c2 + in_channels -> c2)
-            nn.Sequential(
-                nn.Conv2d(c2 + in_channels, c2, kernel_size=3, padding=1),
-                nn.BatchNorm2d(c2),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(c2, c2, kernel_size=3, padding=1),
-                nn.BatchNorm2d(c2),
-                nn.ReLU(inplace=True),
-            ),
-            # stage 4 (no skip connection)
-            nn.Sequential(
-                nn.Conv2d(c3, c3, kernel_size=3, padding=1),
-                nn.BatchNorm2d(c3),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(c3, c3, kernel_size=3, padding=1),
-                nn.BatchNorm2d(c3),
-                nn.ReLU(inplace=True),
-            ),
-        ])
-
-        # output layer
-        self.final_conv = nn.Conv2d(c3, out_channels, kernel_size=1)
-
-    def forward(self, x, enc_feat3, enc_feat2, enc_feat1):
-        # stage 1: x(768) -> 1024 upsample + enc_feat3(1024) concat
-        x = self.upconvs[0](x)  # (B, c0, 2*H_p, 2*W_p)
-        if x.shape[2:] != enc_feat3.shape[2:]:
-            enc_feat3 = F.interpolate(enc_feat3, size=x.shape[2:], mode="bilinear", align_corners=False)
-        x = torch.cat([x, enc_feat3], dim=1)  # (B, c0 + D_v, 2*H_p, 2*W_p)
-        x = self.dec_blocks[0](x)  # (B, c0, 2*H_p, 2*W_p)
-
-        # stage 2
-        x = self.upconvs[1](x)  # (B, c1, 4*H_p, 4*W_p)
-        if x.shape[2:] != enc_feat2.shape[2:]:
-            enc_feat2 = F.interpolate(enc_feat2, size=x.shape[2:], mode="bilinear", align_corners=False)
-        x = torch.cat([x, enc_feat2], dim=1)  # (B, c1 + D_v, 4*H_p, 4*W_p)
-        x = self.dec_blocks[1](x)  # (B, c1, 4*H_p, 4*W_p)
-
-        # stage 3
-        x = self.upconvs[2](x)  # (B, c2, 8*H_p, 8*W_p)
-        if x.shape[2:] != enc_feat1.shape[2:]:
-            enc_feat1 = F.interpolate(enc_feat1, size=x.shape[2:], mode="bilinear", align_corners=False)
-        x = torch.cat([x, enc_feat1], dim=1)  # (B, c2 + D_v, 8*H_p, 8*W_p)
-        x = self.dec_blocks[2](x)  # (B, c2, 8*H_p, 8*W_p)
-
-        # stage 4 (no skip)
-        x = self.upconvs[3](x)  # (B, c3, 16*H_p, 16*W_p)
-        x = self.dec_blocks[3](x)  # (B, c3, 16*H_p, 16*W_p)
-
-        return self.final_conv(x)  # (B, out_channels, 16*H_p, 16*W_p)
+    def forward(
+        self,
+        features: tuple[Tensor, ...],
+        question: Tensor,
+        detail: tuple[Tensor, ...],
+        detail_question: Tensor,
+        run_block,
+    ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
+        s1, s2, s3, bottleneck = features
+        x = self.bottleneck(bottleneck)
+        for skip, block in zip(self.skips((s3, s2, s1), question), self.skip_fusion):
+            x = x + block(x + skip)
+        auxiliary = {}
+        for index, (block, fusion, local) in enumerate(
+            zip(self.upsample, self.detail_fusion, detail[:4])
+        ):
+            x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+            x = run_block(block, x)
+            x = run_block(fusion, x, local, detail_question)
+            if self.training and index in (1, 2):
+                name = "96" if index == 1 else "192"
+                auxiliary[name] = self.auxiliary_heads[name](x)
+        logits = self.mask_head(x)
+        if self.training:
+            auxiliary["384"] = logits
+        return logits, x, auxiliary

@@ -1,24 +1,33 @@
 """Original-resolution per-image IoU and mask export."""
-import torch
-from torch.nn import functional as F
+
 from pathlib import Path
+
 import numpy as np
+import torch
 from PIL import Image
+from torch.nn import functional as F
 from tqdm.auto import tqdm
-from utils import to_device
+
 from losses import per_image_iou
+from utils import to_device
 
 
 def metric_samples(logits, batch):
     for i, name in enumerate(batch["filename"]):
-        truth = batch["original_mask"][i].unsqueeze(0).to(logits.device, non_blocking=True)  # (1, 1, H_orig, W_orig)
-        resized = F.interpolate(logits[i:i+1].float(), size=truth.shape[-2:],
-                                mode="bilinear", align_corners=False)  # (1, 1, H_orig, W_orig)
+        truth = (
+            batch["original_mask"][i].unsqueeze(0).to(logits.device, non_blocking=True)
+        )  # (1, 1, H_orig, W_orig)
+        resized = F.interpolate(
+            logits[i : i + 1].float(),
+            size=truth.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )  # (1, 1, H_orig, W_orig)
         score = per_image_iou(resized, truth).item()
-        yield name, score, resized[0,0] > 0  # (H_orig, W_orig)
+        yield name, score, resized[0, 0] > 0  # (H_orig, W_orig)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate(model, loader, device, output=None):
     model.eval()
     scores = {}
@@ -27,9 +36,13 @@ def evaluate(model, loader, device, output=None):
         # Dataset validation/test always supplies question-only text.
         logits = model(batch)["logits"]
         for name, score, prediction in metric_samples(logits, batch):
+            if name in scores:
+                raise ValueError(f"Duplicate evaluation sample: {name}")
             scores[name] = score
             if output is not None:
                 path = Path(output) / Path(name).with_suffix(".png")
                 path.parent.mkdir(parents=True, exist_ok=True)
-                Image.fromarray((prediction.cpu().numpy().astype(np.uint8)*255)).save(path)
+                Image.fromarray((prediction.cpu().numpy().astype(np.uint8) * 255)).save(
+                    path
+                )
     return scores

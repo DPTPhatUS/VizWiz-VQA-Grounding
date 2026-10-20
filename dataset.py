@@ -1,26 +1,36 @@
-"""Aligned raw RGB inputs and explicitly separated question/answer views."""
+"""Aligned low/high-resolution RGB views, one mask and question-only conditioning."""
+
 import json
 import random
 from pathlib import Path
 
+import numpy as np
 import torch
 from PIL import Image, ImageOps
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
+from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms.functional import to_tensor
 
 
+def image_views(
+    image: Image.Image, image_size: int = 336, detail_size: int = 768
+) -> dict:
+    """Both views come directly from the same upright RGB image, in [0, 1]."""
+    return {
+        "image": to_tensor(
+            image.resize((image_size, image_size), Image.Resampling.BICUBIC)
+        ),
+        "detail_image": to_tensor(
+            image.resize((detail_size, detail_size), Image.Resampling.BICUBIC)
+        ),
+    }
+
+
 class VizWizGroundingDataset(Dataset):
-    def __init__(self, root, split, image_size=336, *, text_mode="question", answer_dropout=0.5):
+    def __init__(self, root, split, image_size=336, *, detail_size=768):
+        if split not in {"train", "val", "test"}:
+            raise ValueError("Expected train, val or test split")
         self.root, self.split = Path(root), split
-        if text_mode not in {"question", "dropout"}:
-            raise ValueError("Unknown text mode")
-        if split != "train" and text_mode != "question":
-            raise ValueError("Research validation/test must be question-only")
-        if not 0 <= answer_dropout <= 1:
-            raise ValueError("answer_dropout must be in [0,1]")
-        self.image_size = image_size
-        self.text_mode, self.answer_dropout = text_mode, answer_dropout
+        self.image_size, self.detail_size = image_size, detail_size
         self.records = json.loads((self.root / f"{split}_grounding.json").read_text())
         self.names = list(self.records)
         if not self.names:
@@ -29,52 +39,46 @@ class VizWizGroundingDataset(Dataset):
     def __len__(self):
         return len(self.names)
 
-    @staticmethod
-    def mask_tensor(mask, size):
-        return (to_tensor(mask.resize((size, size), Image.Resampling.NEAREST)) > 0.5).float()  # (1, H, W)
-
     def __getitem__(self, index):
         name = self.names[index]
-        meta = self.records[name]
         with Image.open(self.root / self.split / name) as source:
             image = ImageOps.exif_transpose(source).convert("RGB")
-        with Image.open(self.root / "binary_masks_png" / self.split / Path(name).with_suffix(".png")) as source:
+        with Image.open(
+            self.root / "binary_masks_png" / self.split / Path(name).with_suffix(".png")
+        ) as source:
             mask = source.convert("L")
+        # Masks are annotations in the upright coordinate system, not EXIF-tagged photos.
         if image.size != mask.size:
-            raise ValueError(f"Image/mask dimensions differ for {name}")
-        question = str(meta.get("question", "")).strip()
-        answer = str(meta.get("most_common_answer") or "").strip()
-        question_text = f"Q: {question}"
-        answer_text = f"{question_text} A: {answer}" if answer else question_text
-        answer_only_text = f"A: {answer}" if answer else question_text
-        use_answer = self.text_mode == "dropout" and random.random() >= self.answer_dropout
-        result = {
-            "image": to_tensor(image.resize((self.image_size, self.image_size), Image.Resampling.BICUBIC)),  # (3, H, W)
-            "mask": self.mask_tensor(mask, self.image_size),  # (1, H, W)
-            "text": answer_text if use_answer else question_text,
-            "question_text": question_text, "answer_text": answer_text,
-            "answer_only_text": answer_only_text,
-            "answer_available": bool(answer), "filename": name,
-            "original_size": (image.height, image.width),
-        }
+            raise ValueError(f"Upright image/mask dimensions differ for {name}")
+        question = str(self.records[name].get("question") or "").strip()
+        result = image_views(image, self.image_size, self.detail_size)
+        result.update(
+            mask=(
+                to_tensor(
+                    mask.resize(
+                        (self.detail_size, self.detail_size), Image.Resampling.NEAREST
+                    )
+                )
+                > 0.5
+            ).float(),
+            question_text=f"Q: {question}",
+            filename=name,
+            original_size=(image.height, image.width),
+        )
         if self.split != "train":
-            result["original_mask"] = (to_tensor(mask) > .5).float()  # (1, H_orig, W_orig)
+            result["original_mask"] = (to_tensor(mask) > 0.5).float()
         return result
 
 
 def collate_samples(samples):
-    result = {}
-    for key in samples[0]:
-        values = [sample[key] for sample in samples]
-        if key == "original_mask":
-            result[key] = values
-        elif isinstance(values[0], torch.Tensor):
-            result[key] = torch.stack(values)  # (B, ...)
-        elif isinstance(values[0], bool):
-            result[key] = torch.tensor(values, dtype=torch.bool)  # (B,)
-        else:
-            result[key] = values
-    return result
+    return {
+        key: (
+            torch.stack([s[key] for s in samples])
+            if torch.is_tensor(samples[0][key]) and key != "original_mask"
+            else [s[key] for s in samples]
+        )
+        for key in samples[0]
+    }
 
 
 GroundingDataset = VizWizGroundingDataset
@@ -87,10 +91,16 @@ def seed_worker(worker_id):
 
 
 def make_loader(dataset, args, batch_size, sampler=None, shuffle=False, generator=None):
-    kwargs = {"batch_size":batch_size,"sampler":sampler,"shuffle":shuffle,
-              "num_workers":args.num_workers,"collate_fn":collate_samples,
-              "pin_memory":str(args.device).startswith("cuda"), "worker_init_fn":seed_worker,
-              "generator":generator}
+    kwargs = dict(
+        batch_size=batch_size,
+        sampler=sampler,
+        shuffle=shuffle,
+        num_workers=args.num_workers,
+        collate_fn=collate_samples,
+        pin_memory=str(args.device).startswith("cuda"),
+        worker_init_fn=seed_worker,
+        generator=generator,
+    )
     if args.num_workers:
         kwargs["prefetch_factor"] = 2
     return DataLoader(dataset, **kwargs)

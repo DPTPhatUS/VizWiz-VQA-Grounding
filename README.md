@@ -1,191 +1,173 @@
-# Latent-Answer Grounding: Region/Pixel & Multi-Scale Detail Decoder (`exp/spatial-detail-decoder`)
+# Question-guided high-resolution detail pyramid
 
-This branch tests a **Region/Pixel & Multi-scale Detail Decoder**. It combines the **Spatial Evidence-Decoder Interaction** from `exp/spatial-evidence-decoder` with a shallow **Pixel Detail Stem** and **Semantic-Guided Region-Pixel Detail Fusion** modules. This is a custom fusion design inspired by multi-level aggregation in [DDVT (Zhang et al., 2026)](https://arxiv.org/html/2607.23921v1#S3.SS2), rather than a reproduction of its CMA module.
+Branch: `exp/question-guided-detail-pyramid`, created from
+`exp/spatial-detail-decoder` at `63977d2`. This is a new experiment requiring
+fresh training from pretrained CLIP, not a checkpoint-compatible refactor.
 
-Student inference requires only image + question. CLIP input is fixed at 336 pixels.
+The hypothesis is that high-resolution local features, question-conditioned
+fusion, and signed mask refinement can improve small-region precision. The
+implementation and synthetic checks do not establish an accuracy improvement.
 
----
+## Architecture
 
-## Architecture: DDVT-Inspired Detail Decoder
-
-### 1. Motivation and Problem Formulation
-
-The CLIP ViT-L/14-336 backbone uses $14 \times 14$ pixel patches, producing a $24 \times 24$ feature grid. A shallow image path lets the decoder access local features before this spatial compression. Whether it improves small-object grounding and boundary accuracy must be measured on validation data.
-
-Inspired by DDVT (Zhang et al., 2026), this architecture introduces a dual-level vision representation:
-1. **Semantic Stream**: High-level semantic features modulated by latent answer evidence $A'$ across the decoder hierarchy.
-2. **Detail Stream**: A shallow convolutional stem operating on the same normalized, resized $336 \times 336$ image, without further downsampling. It cannot recover information already lost when the original image was resized.
-
-```
-Resized RGB Image (3 x 336 x 336), then CLIP normalization
-  │
-  ├──► CLIP ViT Encoder ──► Patch Grid (24x24) ──► Latent Answer Interaction (A') ──► Semantic Stream (X_sem)
-  │                                                                                          │
-  └──► PixelDetailStem  ──► High-Freq Features (16 x H x W) (Detail Stream D)               │
-                                   │                                                         │
-                                   ▼                                                         ▼
-                         [ Semantic Guidance Mask: M_guide = σ(Conv_1x1(X_sem)) ]
-                                   │
-                                   ▼
-                         [ Gated Detail: D_tilde = D ⊙ M_guide ]
-                                   │
-                                   ▼
-                         [ Separable Refinement: ΔX = Refine([X_sem, D_tilde]) ]
-                                   │
-                                   ▼
-                         [ Residual Fusion: X_out = X_sem + residual_scale * ΔX ] (residual_scale = 0 at step 0)
+```text
+Original upright RGB image
+  +-- resize 336 --> CLIP vision --> image/text cross-attention + visual residual
+  |                                      |
+  |                 3 CLIP skips: 1024 -> 256/GN/GELU -> Q-FiLM -> 128
+  |                                      |
+  |                           three skip fusions at 24x24
+  |                                      |
+  |                         standard-conv upsampling stages
+  |                               48 -> 96 -> 192 -> 384
+  |                                ^     ^      ^      ^
+  +-- resize 768 --> CNN encoder --> top-down detail pyramid, 16 channels
+                                  48 -> 96 -> 192 -> 384 -> 768
+                                                         |
+  Question --> frozen CLIP text --> pooled Q --> spatial guidance at all stages
+                                                         |
+  Decoder feature + logits384 + detail768 + projected Q --> residual refiner
+                                                         |
+                        logits768 = resize(logits384) + signed correction
 ```
 
----
+* Both RGB views come directly from the same original image, in `[0,1]`. The
+  model applies CLIP mean/std to both. No crop/flip/color augmentation is added.
+  Aspect ratios are warped to squares, as in the parent CLIP experiments.
+* CLIP is `openai/clip-vit-large-patch14-336`. Text is frozen and kept in eval
+  mode. Vision is trainable except pooled-CLS `post_layernorm`, which patch
+  grounding does not use. Its checkpoint keys are retained.
+* Vision skips are hidden states 4/7/9. They and the final bottleneck have shape
+  `(B,1024,24,24)`. Each skip has its own nonlinear compression and FiLM head;
+  Q reduction is shared. FiLM heads start at zero (identity modulation).
+* Decoder channels are `128 -> 64 -> 32 -> 16 -> 16`. Every upsampling block is
+  bilinear resize followed by **one standard 3x3 convolution**, GroupNorm and
+  GELU. CLIP skip-fusion and detail-fusion blocks remain depthwise separable.
+* CNN encoder channels at `768/384/192/96/48` are `8/16/32/64/128`. Each level
+  has two standard 3x3/GN/GELU blocks. Max pooling downsamples. Top-down pyramid
+  levels use 1x1 lateral projection, addition and 3x3/GN/GELU smoothing.
+* Each spatial guide is a nonlinear function of semantic features, 16-channel
+  detail features and 16-channel projected Q. Fusion adds a residual whose
+  scalar starts at zero. The refiner reads 41 concatenated channels, reduces
+  to 16 with a standard 3x3 block, then predicts a one-channel correction.
+  The final correction head starts at zero, so initial logits768 exactly match
+  bilinear-resized logits384. Refinement is not restricted to a thresholded mask.
+* Mask heads at 96/192 are training-only; the 384 mask feeds the refiner. Only
+  final 768 logits are exported for evaluation. There is no latent answer,
+  teacher, oracle view, answer reader, or GT answer input on this branch.
 
-### 2. Core Components
+The implemented non-backbone parameter count is **6,649,101**, including text
+projection and cross-attention. This differs from the earlier 6.09M sketch
+because skip conditioning, Q-guided detail fusion and auxiliary heads changed.
 
-#### A. Pixel Detail Stem (`PixelDetailStem`)
-A lightweight, shallow 2-layer convolutional network operating directly on normalized, resized input images:
-- **Layer 1**: $\text{Conv}_{3\times 3}(3 \to 16, \text{pad}=1) \to \text{GroupNorm}(4, 16) \to \text{GELU}$
-- **Layer 2**: $\text{Conv}_{3\times 3}(16 \to 16, \text{pad}=1) \to \text{GroupNorm}(4, 16) \to \text{GELU}$
-- **Output**: Learned local feature map $D \in \mathbb{R}^{B \times 16 \times 336 \times 336}$. No explicit high-pass or edge supervision is imposed.
+## Objective
 
-#### B. Semantic-Guided Region-Pixel Fuser (`RegionPixelFuser`)
-Custom semantic-guided fusion. DDVT's Cross-Modal Multi-Scale Aggregation (CMA) also uses deformable alignment and CondConv; those operations are not implemented here.
-1. **Semantic Guidance Mask**: Visual features $X_{\text{sem}}$ (which already integrate latent answer evidence) generate a continuous 2D spatial guidance mask:
-   $$M_{\text{guide}} = \sigma(\text{guide\_scale} \cdot \text{Conv}_{1\times 1}(X_{\text{sem}}) + \text{guide\_bias}) \in (0, 1)^{B \times 1 \times H_i \times W_i}$$
-2. **Spatial Gating**: Detail features $D$ are dynamically resampled to stage resolution $(H_i, W_i)$ and selectively gated:
-   $$\widetilde{D} = D \odot M_{\text{guide}}$$
-   The mask is trained indirectly by segmentation loss. Suppression of clutter and selection of useful detail are hypotheses to evaluate, rather than guaranteed properties.
-3. **Depthwise-Separable Refinement**:
-   $$\Delta X = \text{Refine}([\,X_{\text{sem}} \,\|\, \widetilde{D}\,])$$
-4. **Zero-Init Identity Residual**:
-   $$X_{\text{out}} = X_{\text{sem}} + \text{residual\_scale} \cdot \Delta X$$
-   `residual_scale` is initialized to $0.0$, preserving the spatial-evidence decoder's output when common weights, inputs, and execution settings match. Scale parameters receive gradients first; gradients reach the detail stem as scales move away from zero.
+The default is `BCE + 0.5 * soft Dice` for each head:
 
-The default detail path adds **4,504 trainable parameters**. Its dense spatial activations still add computation and memory; parameter count alone does not establish runtime cost.
-
----
-
-### 3. Modular Upsampling Hierarchy & Defaults
-
-The decoder features 4 progressive upsampling stages:
-- **Stage 0**: $48 \times 48$, 64 channels
-- **Stage 1**: $96 \times 96$, 32 channels
-- **Stage 2**: $192 \times 192$, 16 channels
-- **Stage 3**: $384 \times 384$, 16 channels
-
-#### Modular Configuration
-- **Strict Default**: Region-pixel detail fusion is applied to the **last 2 upsampling stages** (`detail_upsample_stages=(2, 3)` corresponding to $192 \times 192$ and $384 \times 384$), exactly where channels are narrow and boundary sharpness is most critical.
-- **Configurable Stages**: Can be set to any subset of stages or all 4 stages:
-
-```python
-from models.model import GroundingModel
-
-# Default: detail fusion at last 2 stages (2, 3) -> 192x192 & 384x384
-model_default = GroundingModel()
-
-# All 4 upsampling stages enabled for detail fusion
-model_4stages = GroundingModel(detail_upsample_stages=(0, 1, 2, 3))
-
-# Disable detail fusion (reverts to pure spatial-evidence decoder)
-model_no_detail = GroundingModel(spatial_detail=False)
-
-# Custom stage combinations
-model_last_only = GroundingModel(detail_upsample_stages=(3,))
+```text
+L = L768 + 0.3 * L384 + 0.2 * L192 + 0.1 * L96
 ```
 
-#### CLI Flags
-- `--no-spatial-evidence`: Disable all cosine spatial interaction, including the bottleneck, while retaining the latent-answer token, skip conditioning, and detail path. Use this for the alignment + detail comparison; train a fresh run with the matched alignment/stable/frozen-text settings.
-- `--spatial-detail` / `--no-spatial-detail`: Enable/disable detail fusion (default: enabled).
-- `--detail-upsample-stages 2 3`: Upsampling stages for detail fusion (default: `2 3`).
-- `--detail-dim 16`: Channel dimension for pixel detail stem; a positive multiple of 4 (fresh-run default: `16`).
-- `--spatial-upsample-stages 0 1`: Spatial evidence interaction stages from Hướng 1 (default: `0 1`).
+Main targets are nearest-neighbor binary masks at 768. Auxiliary targets use
+area interpolation from this target to preserve fractional coverage of tiny
+regions. This cannot recover an object already lost during the native-to-768
+mask conversion. Loss calculations accumulate in float32 under CUDA FP16 AMP.
+Weights above are initial experimental settings, not tuned coefficients.
 
----
+Optional `--config` JSON (all defaults shown):
 
-### 4. Checkpoint Compatibility & Auto-Detection
+```json
+{
+  "overlap_loss": "dice",
+  "overlap_weight": 0.5,
+  "fp_weight": 0.7,
+  "aux96_weight": 0.1,
+  "aux192_weight": 0.2,
+  "aux384_weight": 0.3
+}
+```
 
-- **Inference/resume**: Existing entry points reconstruct the saved architecture, including detail width. Omitted architecture flags restore checkpoint settings; conflicting explicit resume flags raise an error.
-- **Weight initialization**: `initialize_weights(path_or_saved, model)` can add complete new modules to compatible compact checkpoints from the latent/spatial-evidence branches. It starts a new experiment. The U-Net architecture on `main` is not interchangeable with this compact architecture.
-- **Automatic detection**: `checkpoint_model_kwargs(saved)` inspects checkpoint metadata and state dict keys to automatically instantiate matching architectures.
-- **Buffer serialization**: Active stage IDs are stored in persistent buffers (`decoder.detail_stage_ids`, `decoder.spatial_stage_ids`), ensuring exact architecture reconstruction without external config files.
-- **Feature ownership**: `encode_image` returns an `ImageFeatures` object that keeps detail features with their image pyramid. Existing four-feature iteration/indexing is preserved. Callers with a plain pyramid must pass matching `detail_features` explicitly when detail fusion is active.
+`fp_weight` is used only by `overlap_loss="tversky"`: its denominator is
+`TP + fp_weight*FP + (1-fp_weight)*FN + 1`, with numerator `TP + 1`.
+This is an optional separate ablation, not enabled in the default Dice run.
+Zero auxiliary weights retain zero-valued graph dependencies for DDP.
 
----
+## Kaggle setup and 20-epoch run
 
-## Training
-
-The dataset root contains `train_grounding.json`, `val_grounding.json`, image folders `train/`, `val/`, and masks in `binary_masks_png/<split>/`.
-
-### Matched Single-Stage Comparison (Detail Decoder Enabled)
-
-Keep the alignment/stable recipe and frozen text encoder used by the spatial-evidence comparison. Checkpoints below are written directly to `outputs/`.
+Enable Internet and two T4 GPUs. Clone the branch, change into the repository,
+and install the locked environment before launching multiple processes:
 
 ```bash
-mkdir -p outputs/configs
-printf '%s\n' '{"freeze_text_encoder": true, "dice_weight": 0.5, "latent_weight": 0.5}' > outputs/configs/spatial_detail_alignment_frozen.json
-uv run torchrun --nproc_per_node=2 train.py \
-    --data-root /path/to/vizwiz \
-    --num-epochs 20 \
-    --batch-size 4 \
-    --num-workers 2 \
-    --lr 0.00001 \
-    --seed 42 \
-    --save-every 10 \
-    --training-recipe alignment \
-    --loss-version stable \
-    --config outputs/configs/spatial_detail_alignment_frozen.json \
-    --output-dir outputs
+git clone --single-branch --branch exp/question-guided-detail-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+cd VizWiz-VQA-Grounding
+uv sync --frozen
 ```
 
-### Training with Custom Detail Stages (e.g. all 4 stages)
+With `DATA_ROOT` pointing at the VizWiz folder, run the short real-backbone check:
 
 ```bash
-uv run torchrun --nproc_per_node=2 train.py \
-    --data-root /path/to/vizwiz \
-    --num-epochs 20 \
-    --batch-size 4 \
-    --training-recipe alignment \
-    --loss-version stable \
-    --config outputs/configs/spatial_detail_alignment_frozen.json \
-    --spatial-upsample-stages 0 1 \
-    --detail-upsample-stages 0 1 2 3 \
-    --output-dir outputs/spatial_detail_4stages
+uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
+  --data-root "$DATA_ROOT" --batch-size 2 --num-workers 0 --steps 3 \
+  --gradient-checkpointing
 ```
 
-Batch size is **global across GPUs**: 4 on two GPUs means 2 per GPU. Training chooses CUDA automatically, uses AMP on CUDA, and does not run validation.
-The historical CLI defaults remain `full` and `legacy`; the matched comparison above selects its recipe explicitly. Architecture flags omitted on a fresh run enable detail stages `(2, 3)` with 16 channels.
-
-| `--training-recipe` | Objective |
-|---|---|
-| `full` | Predicted-answer mask + oracle/Q-reference masks + gain-weighted mask KD + answer alignment + attention guidance; no warm-up |
-| `grounding-only` | Predicted-answer mask supervision only; the latent predictor remains present |
-| `alignment` | Predicted-answer mask supervision + answer-vector alignment |
-| `warmup` | Answer alignment throughout; mask supervision transitions from real A to predicted A' |
-
-For new matched comparisons, explicitly select `--loss-version stable`. This uses audited KL calculations and valid-answer reductions.
-
----
-
-## Checkpoints and Evaluation
-
-`--save-every 10` writes resumable `checkpoint_epoch10.pt`, etc. Training also writes final raw weights as `model_final_epoch<N>.pt`.
+This checks real input shapes, several backward iterations, frozen/trainable
+gradients, AMP and DDP; it writes no checkpoints or training history. CPU checks
+cannot replace this GPU check. It does not establish accuracy or full-session runtime.
 
 ```bash
-uv run python eval.py \
-    --checkpoint outputs/checkpoint_epoch20.pt \
-    --dataset val \
-    --data-root /path/to/vizwiz \
-    --batch-size 4 \
-    --num-workers 2 \
-    --output-dir outputs/eval_val_detail_ep20
+uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
+  --data-root "$DATA_ROOT" \
+  --output-dir outputs \
+  --num-epochs 20 \
+  --batch-size 2 \
+  --gradient-accumulation-steps 2 \
+  --gradient-checkpointing \
+  --num-workers 2 \
+  --lr 0.00001 \
+  --seed 42 \
+  --save-every 10
 ```
 
-Evaluation scores and exports masks at native resolution by default. Student predictions do not use ground-truth answers.
+Batch size is **global microbatch**: one image/GPU here. Accumulation gives
+effective global batch 4, including correct sample weighting in the final
+partial window. If memory permits, `--batch-size 4` with accumulation 1 also
+gives effective batch 4. Memory/runtime have not been measured on Kaggle T4.
 
----
+Adam, no weight decay or LR scheduler, clipping at global norm 1, CUDA FP16
+GradScaler, deterministic epoch-keyed seeding and sampler shuffling follow the
+simple existing trainer. Activation checkpointing uses nonreentrant recomputation;
+it changes memory/time, not the intended forward computation. No per-epoch
+validation is run. Output collisions fail rather than overwrite another run.
 
-## Diagnostics & Probes
+Full checkpoints are `outputs/checkpoint_epoch10.pt` and `checkpoint_epoch20.pt`.
+Raw final weights are also saved. Full checkpoints include optimizer/scaler,
+resolved config, architecture, source hashes and environment version. Resume
+with `--resume-checkpoint` from this experiment only; `--num-epochs` is the
+total target epoch. Batch/accumulation/LR/seed/world size must match.
 
-All diagnostic tools seamlessly support the detail decoder:
-- `diagnose.py`: Compares Q-only, predicted-answer, and real-answer masks.
-- `probe_latent_conditioning.py`: Interventions, embedding retrieval, and conditioning traces.
-- `probe_predicted_answer.py`: Caches predicted vectors and runs answer swaps/zeroing.
-- `predict_save.py` & `visualize_predictions.py`: Single-image inference and mask overlay generation.
+## Evaluate and diagnose
+
+Run each evaluation with one process. Both views are reconstructed from the
+original image, and logits are resized to native GT size **before** thresholding.
+The metric is mean per-image foreground IoU, not foreground/background class mIoU.
+
+```bash
+uv run --frozen python eval.py \
+  --checkpoint outputs/checkpoint_epoch20.pt --dataset val \
+  --data-root "$DATA_ROOT" --output-dir outputs/eval_val_ep20 \
+  --batch-size 1 --num-workers 2 --device cuda
+
+uv run --frozen python diagnose.py \
+  --predictions outputs/eval_val_ep20 --data-root "$DATA_ROOT" \
+  --output-dir outputs/diagnostic_ep20
+```
+
+Repeat evaluation for epoch10 and for test if native test GT masks are available.
+Select checkpoints/hyperparameters by validation, never by the test results.
+Diagnostic reads exported masks on CPU, verifies each mask against stored IoU,
+and reports native precision/recall, predicted/GT area ratio and size groups.
+Evaluation/diagnostic output directories must be new or empty.
+
+Personal notebook instructions and local tests remain under ignored `personal/`.
+Older answer-latent probes/checkpoints belong to their original branches.
