@@ -17,6 +17,95 @@ from train import seed_everything
 from utils import to_device
 
 
+def checked_step(
+    model, wrapped, objective, batch, optimizer, scaler, device, *, max_scale_retries=8
+):
+    """Require one successful update; let AMP calibrate without hiding broken gradients."""
+    world = dist.get_world_size() if dist.is_initialized() else 1
+
+    def rank_counts(flags):
+        values = torch.tensor(flags, dtype=torch.int32, device=device)
+        if dist.is_initialized():
+            dist.all_reduce(values)
+        return values.tolist()
+
+    for attempt in range(max_scale_retries + 1):
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(
+            device.type, dtype=torch.float16, enabled=scaler.is_enabled()
+        ):
+            loss, _ = objective(wrapped, batch)
+        if rank_counts([not bool(torch.isfinite(loss))])[0]:
+            raise FloatingPointError(
+                "Preflight forward loss is nonfinite on at least one rank"
+            )
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        missing, nonfinite, frozen = [], [], []
+        parameters = []
+        for name, parameter in model.named_parameters():
+            if parameter.requires_grad:
+                parameters.append(parameter)
+                if parameter.grad is None:
+                    missing.append(name)
+                elif not torch.isfinite(parameter.grad).all():
+                    nonfinite.append(name)
+            elif parameter.grad is not None:
+                frozen.append(name)
+        missing_ranks, frozen_ranks, overflow_ranks = rank_counts(
+            [bool(missing), bool(frozen), bool(nonfinite)]
+        )
+        if missing_ranks:
+            raise RuntimeError(
+                f"Missing gradient (not AMP overflow); local parameters: {missing}; affected ranks: {missing_ranks}"
+            )
+        if frozen_ranks:
+            raise RuntimeError(
+                f"Frozen parameters received gradients: {frozen}; affected ranks: {frozen_ranks}"
+            )
+        if overflow_ranks:
+            if not scaler.is_enabled():
+                raise FloatingPointError(
+                    f"Nonfinite unscaled gradients in FP32: {nonfinite[:5]}"
+                )
+            if overflow_ranks != world:
+                raise RuntimeError(
+                    "Ranks disagree on gradient overflow after DDP reduction"
+                )
+            if attempt == max_scale_retries:
+                raise FloatingPointError(
+                    f"AMP gradients remain nonfinite after {max_scale_retries} scale reductions; "
+                    f"scale={scaler.get_scale()}, parameters={nonfinite[:5]}. "
+                    "Preflight has not passed; investigate numerical stability."
+                )
+            previous = scaler.get_scale()
+            # unscale_ recorded Inf/NaN: GradScaler skips this update on every rank.
+            scaler.step(optimizer)
+            scaler.update()
+            if scaler.get_scale() >= previous:
+                raise RuntimeError("AMP overflow did not reduce the loss scale")
+            print(
+                json.dumps(
+                    dict(
+                        event="amp_loss_scale_backoff",
+                        rank=dist.get_rank() if dist.is_initialized() else 0,
+                        previous_scale=previous,
+                        next_scale=scaler.get_scale(),
+                        retry=attempt + 1,
+                        nonfinite_parameters=nonfinite[:3],
+                        optimizer_update=False,
+                    )
+                ),
+                flush=True,
+            )
+            continue
+        torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
+        scaler.step(optimizer)
+        scaler.update()
+        return attempt
+    raise AssertionError("Unreachable preflight retry state")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", required=True)
@@ -88,26 +177,17 @@ def main(argv=None):
             torch.cuda.reset_peak_memory_stats(device)
             torch.cuda.synchronize(device)
         start = time.perf_counter()
+        scale_retries = 0
         for index, batch in enumerate(loader):
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device.type, enabled=device.type == "cuda"):
-                loss, _ = objective(wrapped, to_device(batch, device))
-            if not torch.isfinite(loss):
-                raise FloatingPointError("Preflight loss is nonfinite")
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            for name, parameter in model.named_parameters():
-                if parameter.requires_grad:
-                    if (
-                        parameter.grad is None
-                        or not torch.isfinite(parameter.grad).all()
-                    ):
-                        raise RuntimeError(f"Missing/nonfinite gradient: {name}")
-                elif parameter.grad is not None:
-                    raise RuntimeError(f"Frozen parameter has a gradient: {name}")
-            torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
-            scaler.step(optimizer)
-            scaler.update()
+            scale_retries += checked_step(
+                model,
+                wrapped,
+                objective,
+                to_device(batch, device),
+                optimizer,
+                scaler,
+                device,
+            )
             if index + 1 == args.steps:
                 break
         if device.type == "cuda":
@@ -118,6 +198,8 @@ def main(argv=None):
                     rank=rank,
                     status="passed",
                     steps=args.steps,
+                    amp_scale_retries=scale_retries,
+                    final_loss_scale=scaler.get_scale(),
                     device=str(device),
                     seconds=time.perf_counter() - start,
                     peak_allocated_gib=torch.cuda.max_memory_allocated(device) / 2**30

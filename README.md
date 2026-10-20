@@ -114,6 +114,10 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
 This checks real input shapes, several backward iterations, frozen/trainable
 gradients, AMP and DDP; it writes no checkpoints or training history. CPU checks
 cannot replace this GPU check. It does not establish accuracy or full-session runtime.
+Initial FP16 gradient overflow is handled by GradScaler backoff and a retry of
+the same batch (at most eight scale reductions per batch). Backoff events are
+printed and do not count as successful updates. Missing gradients, nonfinite
+forward loss, FP32 nonfinite gradients or persistent overflow still fail.
 
 ```bash
 uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
