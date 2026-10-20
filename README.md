@@ -1,6 +1,6 @@
 # Grounding first with local answer supervision
 
-Branch: `codex/grounding-first-answer`, based on `exp/spatial-detail-decoder` at `63977d2`.
+Branch: `exp/grounding-first-answer`, based on `exp/spatial-detail-decoder` at `63977d2`.
 This is a new experiment requiring fresh training. It tests whether answer supervision
 can improve the predicted evidence mask when the answer reader must use local RGB
 features selected by that mask.
