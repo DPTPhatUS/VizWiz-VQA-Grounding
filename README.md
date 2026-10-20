@@ -16,7 +16,10 @@ The mask decoder never receives a real or predicted answer. It retains three
 question-conditioned visual skips and RGB detail fusion at decoder stages 2/3.
 There is no cosine spatial interaction, pre-grounding answer predictor, teacher
 checkpoint, oracle-mask decoder, or self-distillation recipe on this branch.
-CLIP text is frozen and stays in eval mode. CLIP vision is trainable.
+CLIP text is frozen and stays in eval mode. CLIP vision patch features are trainable.
+The vision `post_layernorm` is frozen because it only normalizes pooled CLS,
+which this decoder does not use. Its weights remain in checkpoints; freezing it
+does not change patch features and avoids unused trainable parameters in DDP.
 
 The auxiliary reader has two bias-free 3x3 convolutions, question-gated visual
 channels, and a small bias-free projection. Its visual receptive field is 5x5,

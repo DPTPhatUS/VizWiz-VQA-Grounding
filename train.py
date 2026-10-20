@@ -242,6 +242,8 @@ def _train(args, rank, world, distributed, device):
         for name in (
             "train.py",
             "models/model.py",
+            "models/image_encoder.py",
+            "models/text_encoder.py",
             "models/answer_reader.py",
             "models/mask_decoder.py",
             "losses.py",

@@ -1,11 +1,16 @@
-import torch.nn.functional as F
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import CLIPVisionModel
+
 
 class ImageEncoder(nn.Module):
     def __init__(self, model_name="openai/clip-vit-large-patch14-336"):
         super().__init__()
         self.vision_encoder = CLIPVisionModel.from_pretrained(model_name)
+        # This layer normalizes pooled CLS only, not the patch tokens used below.
+        # Keep its checkpoint keys but exclude it from optimization and DDP reduction.
+        vision = getattr(self.vision_encoder, "vision_model", self.vision_encoder)
+        vision.post_layernorm.requires_grad_(False)
         self.out_channels = self.vision_encoder.config.hidden_size
 
     def forward(self, x):
@@ -24,17 +29,25 @@ class ImageEncoder(nn.Module):
             num_patches = feat.shape[1]
             grid_size = int(num_patches**0.5)
             if grid_size * grid_size != num_patches:
-                raise ValueError(f"Expected square patch grid, got {num_patches} patches")
-            return feat.view(B, grid_size, grid_size, D).permute(0, 3, 1, 2).contiguous()  # (B, D_v, H_p, W_p)
+                raise ValueError(
+                    f"Expected square patch grid, got {num_patches} patches"
+                )
+            return (
+                feat.view(B, grid_size, grid_size, D).permute(0, 3, 1, 2).contiguous()
+            )  # (B, D_v, H_p, W_p)
 
-        return tuple(map(reshape_feat, [enc_feat1, enc_feat2, enc_feat3])) + (reshape_feat(bottleneck),)
+        return tuple(map(reshape_feat, [enc_feat1, enc_feat2, enc_feat3])) + (
+            reshape_feat(bottleneck),
+        )
 
 
 class TinyVision(nn.Module):
     out_channels = 16
+
     def __init__(self):
         super().__init__()
         self.conv = nn.Conv2d(3, 16, 3, padding=1)
+
     def forward(self, image):
         feature = F.adaptive_avg_pool2d(self.conv(image), (2, 2))  # (B, 16, 2, 2)
         return feature, feature, feature, feature
