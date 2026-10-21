@@ -69,13 +69,28 @@ def main(argv=None):
                 predicted_area_fraction=p / truth.size,
                 area_ratio=p / g if g else None,
                 area_group=group,
+                true_positive_pixels=tp,
                 false_positive_pixels=p - tp,
                 false_negative_pixels=g - tp,
             )
         )
 
     def summarize(selected):
-        result = {"num_samples": len(selected)}
+        intersection = sum(r["true_positive_pixels"] for r in selected)
+        union = sum(
+            r["true_positive_pixels"]
+            + r["false_positive_pixels"]
+            + r["false_negative_pixels"]
+            for r in selected
+        )
+        result = {
+            "num_samples": len(selected),
+            "global_iou": (intersection / union if union else 1.0)
+            if selected
+            else None,
+            "total_intersection": intersection,
+            "total_union": union,
+        }
         for key in (
             "iou",
             "precision",

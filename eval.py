@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 from dataset import VizWizGroundingDataset, make_loader
-from metrics import evaluate
+from metrics import evaluate, global_iou_summary
 from models.model import GroundingModel
 from utils import checkpoint_model_kwargs, load_model_weights, read_checkpoint
 
@@ -45,8 +45,12 @@ def eval_main(argv=None):
         raise ValueError("Evaluation output must be a new or empty directory")
     out.mkdir(parents=True, exist_ok=True)
     diagnostics = {}
-    scores = evaluate(model, loader, device, out, diagnostics)
+    pixel_totals = {}
+    scores = evaluate(
+        model, loader, device, out, diagnostics, pixel_totals=pixel_totals
+    )
     summary = {
+        **global_iou_summary(pixel_totals),
         "num_samples": len(scores),
         "mean_iou": sum(scores.values()) / len(scores),
         "dataset": args.dataset,

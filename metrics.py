@@ -1,4 +1,4 @@
-"""Original-resolution per-image IoU and mask export."""
+"""Native-resolution per-image/global foreground IoU and mask export."""
 
 from pathlib import Path
 
@@ -12,7 +12,29 @@ from models.zoom import prediction_at_size
 from utils import to_device
 
 
-def metric_samples(output, batch, diagnostics=None):
+def accumulate_pixel_counts(prediction, truth, totals):
+    """Accumulate integer foreground counts on the native mask grid."""
+    if totals is None:
+        return
+    intersection, union = torch.stack(
+        [(prediction & truth).sum(), (prediction | truth).sum()]
+    ).tolist()
+    totals["intersection"] = totals.get("intersection", 0) + intersection
+    totals["union"] = totals.get("union", 0) + union
+
+
+def global_iou_summary(totals):
+    """Dataset foreground IoU; an empty union scores one, as with per-image IoU."""
+    intersection, union = totals.get("intersection", 0), totals.get("union", 0)
+    return {
+        "global_iou": intersection / union if union else 1.0,
+        "total_intersection": intersection,
+        "total_union": union,
+        "global_iou_definition": "foreground_sum_intersection_over_sum_union",
+    }
+
+
+def metric_samples(output, batch, diagnostics=None, *, pixel_totals=None):
     device = output["logits"].device
     for i, name in enumerate(batch["filename"]):
         truth = (
@@ -47,11 +69,15 @@ def metric_samples(output, batch, diagnostics=None):
                 .cpu()
                 .tolist(),
             )
-        yield name, score, resized[0, 0] > 0  # (H_orig, W_orig)
+        prediction = resized[0, 0] > 0  # (H_orig, W_orig)
+        accumulate_pixel_counts(prediction, truth[0, 0] > 0.5, pixel_totals)
+        yield name, score, prediction
 
 
 @torch.inference_mode()
-def evaluate(model, loader, device, output=None, diagnostics=None):
+def evaluate(
+    model, loader, device, output=None, diagnostics=None, *, pixel_totals=None
+):
     model.eval()
     scores = {}
     for batch in tqdm(loader, desc="Evaluating", unit="batch", dynamic_ncols=True):
@@ -59,7 +85,7 @@ def evaluate(model, loader, device, output=None, diagnostics=None):
         # Dataset validation/test always supplies question-only text.
         prediction_output = model(batch)
         for name, score, prediction in metric_samples(
-            prediction_output, batch, diagnostics
+            prediction_output, batch, diagnostics, pixel_totals=pixel_totals
         ):
             if name in scores:
                 raise ValueError(f"Duplicate evaluation sample: {name}")
