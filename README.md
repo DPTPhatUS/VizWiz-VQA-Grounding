@@ -329,3 +329,26 @@ Resume retains each branch's existing RNG/data-order policy; legacy branches
 that do not save or reconstruct RNG state do not guarantee bitwise replay.
 No freezing/optimization change retroactively changes a previously trained
 checkpoint or its reported results.
+
+## Foreground global IoU
+
+The existing evaluation command now writes both metrics to `metrics.json`
+under `summary`, using the final native-resolution binary predictions:
+
+- `mean_iou`: arithmetic mean of per-image foreground IoUs; each image has equal weight.
+- `global_iou`: sum of all foreground intersections divided by sum of all foreground unions across the evaluated split. This is not foreground/background class-averaged IoU.
+- `total_intersection` and `total_union`: exact integer pixel counts for auditing.
+
+Values are fractions in `[0, 1]`; multiply by 100 for percentages. Logits are
+restored to each original image size before thresholding at zero. Empty-union
+IoU is one. No training, checkpoint, inference or threshold change is required.
+
+`diagnose.py` also reports global IoU in `overall` and `by_gt_area` in its
+`summary.json`. It computes counts from exported PNG masks and original GT,
+so existing validation predictions can be analyzed on CPU without rerunning
+the model (use a new diagnostic output directory):
+
+```bash
+uv run diagnose.py --predictions outputs/eval_val_ep20 \
+    --data-root /path/to/vizwiz --output-dir outputs/diagnostic_global_iou_ep20
+```
