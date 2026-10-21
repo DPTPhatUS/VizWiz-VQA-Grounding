@@ -2,6 +2,12 @@
 
 This branch trains one compact grounding model with question-only text.
 
+The decoder bottleneck receives the cross-attention output directly, without adding the original visual tokens or using a residual scale. Decoder skip connections remain in place.
+
+CLIP's text encoder is frozen. The image encoder, text projection, cross-attention, and mask decoder remain trainable. This is the default behavior and needs no additional flag; saved run configuration records `freeze_text_encoder: true`.
+
+For an experiment with text frozen from the beginning, start a fresh run without either checkpoint argument.
+
 The experiment uses the existing `train.py`, `eval.py`, `dataset.py`, and `models/` layout. CLIP input is fixed at 336 pixels; architecture and loss settings are defined in code.
 
 ## Kaggle
@@ -34,7 +40,7 @@ python predict_save.py --checkpoint /path/to/checkpoint_epoch100.pt --image /pat
 python visualize_predictions.py --checkpoint /path/to/checkpoint_epoch100.pt --image /path/to/image.jpg --question "What does it say?" --output /kaggle/working/overlay.png
 ```
 
-`IoU.py` delegates to `eval.py`. Existing experiment weight keys are preserved. Raw weights and ordinary checkpoint dictionaries are accepted; model tensor names and shapes must match this branch. `docs/` and `tests/` remain ignored and local. CPU smoke tests do not establish real-data accuracy or GPU performance.
+`IoU.py` delegates to `eval.py`. Raw weights and ordinary checkpoint dictionaries are accepted; model tensor names and shapes must match this branch. `docs/` and `tests/` remain ignored and local. CPU smoke tests do not establish real-data accuracy or GPU performance.
 
 
 ## Training output and separate evaluation
@@ -43,9 +49,9 @@ Training reads only the training split: no validation dataset is loaded and no v
 
 Training saves only periodic resumable checkpoints: `checkpoint_epoch10.pt`, `checkpoint_epoch20.pt`, etc. `--save-every` defaults to **10**. Each checkpoint contains model weights, optimizer/scaler state, completed epoch, and embedded run configuration, and uses legacy PyTorch serialization. There is no additional final raw-model export or automatic final checkpoint. If training ends between checkpoint intervals, the latest saved model is from the preceding interval; use `--save-every 1` to save every completed epoch. `--save-every 0` disables all model saving.
 
-Existing raw weights remain loadable using this branch's default model settings. Resumable checkpoints retain their own `run_config` and `experiment_config`; no standalone configuration file is written or read. `history.jsonl` contains training losses only. Run `eval.py` separately with `--dataset val` or `--dataset test`; the commands above use the periodic checkpoint saved at their epoch count.
+Resumable checkpoints retain their own `run_config` and `experiment_config`; no standalone configuration file is written or read. `history.jsonl` contains training losses only. Run `eval.py` separately with `--dataset val` or `--dataset test`; the commands above use the periodic checkpoint saved at their epoch count.
 
-To resume a periodic checkpoint, use `--resume-checkpoint /path/to/checkpoint_epoch10.pt` with its existing output directory or a fresh one; optimizer/scaler state and completed epoch are restored, and `--num-epochs` is the final total epoch count. To start a new run from checkpoint weights, use `--init-checkpoint /path/to/checkpoint_epoch<N>.pt`; this starts a fresh optimizer and epoch counter. Repeat the original batch size, seed, learning rate, and experiment-specific training arguments when continuing a run. Older supported full checkpoints remain loadable.
+To resume a periodic checkpoint, use `--resume-checkpoint /path/to/checkpoint_epoch10.pt` with its existing output directory or a fresh one; optimizer/scaler state and completed epoch are restored, and `--num-epochs` is the final total epoch count. To start a new run from checkpoint weights, use `--init-checkpoint /path/to/checkpoint_epoch<N>.pt`; this starts a fresh optimizer and epoch counter. Repeat the original batch size, seed, learning rate, and experiment-specific training arguments when continuing a run.
 
 Existing output directories are accepted for all training modes. Matching model filenames are overwritten; other model files remain. History is appended to `history.jsonl`, creating it if absent. To continue in a fresh Kaggle notebook, only the resumable checkpoint is needed to restore training state; no previous history or separate configuration file is required. The training dataset must still be available.
 

@@ -87,7 +87,8 @@ def train_main(argv=None):
 def _train(args, rank, world, distributed, device):
     seed_everything(args.seed)
     run_config = vars(args).copy()
-    run_config.update(world_size=world, image_size=IMAGE_SIZE, text_mode="question")
+    run_config.update(world_size=world, image_size=IMAGE_SIZE, text_mode="question",
+                      freeze_text_encoder=True)
     out = Path(args.output_dir)
     if rank == 0:
         out.mkdir(parents=True, exist_ok=True)
