@@ -1,4 +1,11 @@
+import math
 import argparse
+from training_options import (
+    TrainingArgumentParser,
+    TrainingControls,
+    public_arguments,
+    restore_control_arguments,
+)
 from contextlib import nullcontext
 import json
 import os
@@ -42,8 +49,10 @@ def seed_worker(worker_id):
 
 
 def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
-                    accumulation_steps=1, use_amp=False, rank=0, is_dist=False, description="Train"):
+                    accumulation_steps=1, use_amp=False, rank=0, is_dist=False, description="Train", training_controls=None):
     model.train()
+    if training_controls is not None:
+        training_controls.set_encoder_modes()
     optimizer.zero_grad(set_to_none=True)
     totals = torch.zeros(2, dtype=torch.float64, device=device)
     local_samples = len(loader.sampler)
@@ -63,8 +72,11 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
                 loss = grounding_loss(pred, batch["mask"], loss_fn)
             scaler.scale(loss * n / window_samples).backward()
         if update:
-            scaler.step(optimizer)
-            scaler.update()
+            if training_controls is None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                training_controls.step(scaler)
             optimizer.zero_grad(set_to_none=True)
         totals[0] += loss.detach().double() * n
         totals[1] += n
@@ -90,7 +102,7 @@ def validate(model, loader, loss_fn, device, use_amp=False, rank=0, is_dist=Fals
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser()
+    parser = TrainingArgumentParser()
     parser.add_argument("--data-root", default="data/vizwiz")
     parser.add_argument("--num-epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=None,
@@ -112,6 +124,7 @@ def main(argv=None):
 
     checkpoint = (torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False)
                   if args.resume_checkpoint else None)
+    restore_control_arguments(args, checkpoint)
     config = checkpoint.get("model_config") if checkpoint else None
     previous = checkpoint.get("training_args", {}) if checkpoint else {}
     defaults = {"batch_size": 4, "gradient_accumulation_steps": 1, "amp": True,
@@ -162,12 +175,13 @@ def main(argv=None):
         for split, data in datasets.items()}
 
     model = model.to(device)
+    controls = TrainingControls(model, args, checkpoint, include_frozen=True)
     # Local BN: ranks may decode different numbers of aspect-ratio groups.
     if is_dist:
         model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None,
                     find_unused_parameters=False)
     underlying = model.module if is_dist else model
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = controls.optimizer
     use_amp = args.amp and device.type == "cuda"
     scaler = GradScaler("cuda", enabled=use_amp)
     loss_fn = torch.nn.BCEWithLogitsLoss()
@@ -184,20 +198,22 @@ def main(argv=None):
         if start_epoch >= args.num_epochs:
             parser.error("--num-epochs must exceed the checkpoint epoch when resuming")
         del checkpoint
+    controls.configure_schedule(args.num_epochs, math.ceil(len(loaders["train"]) / args.gradient_accumulation_steps), start_epoch)
     if rank == 0:
         os.makedirs(args.output_dir, exist_ok=True)
         print(f"Vision: {VISION_MODEL}; text: {args.text_encoder}; patches: {args.max_num_patches}; "
               f"per GPU: {args.batch_size // world_size}; effective batch: {args.batch_size * args.gradient_accumulation_steps}")
         with open(os.path.join(args.output_dir, "run_config.json"), "w") as f:
-            json.dump({"model_config": model_config, "training_args": vars(args), "world_size": world_size}, f, indent=2)
+            json.dump({"model_config": model_config, "training_args": public_arguments(args), "world_size": world_size}, f, indent=2)
     log = open(os.path.join(args.output_dir, f"train_loss_{start_epoch + 1}_{args.num_epochs}.txt"), "w") if rank == 0 else None
     try:
         for epoch in range(start_epoch, args.num_epochs):
             generator.manual_seed(args.seed + epoch * world_size + rank)
             if samplers["train"] is not None:
                 samplers["train"].set_epoch(epoch)
+            controls.log_learning_rates(epoch + 1)
             train_loss = train_one_epoch(model, loaders["train"], optimizer, loss_fn, scaler, device,
-                args.gradient_accumulation_steps, use_amp, rank, is_dist, f"Epoch {epoch + 1}/{args.num_epochs}")
+                args.gradient_accumulation_steps, use_amp, rank, is_dist, f"Epoch {epoch + 1}/{args.num_epochs}", training_controls=controls)
             if rank == 0:
                 print(f"[Epoch {epoch + 1}] train_loss={train_loss:.6f}")
                 log.write(f"train epoch={epoch + 1} loss={train_loss:.6f}\n")
@@ -207,11 +223,11 @@ def main(argv=None):
                     print(f"[Epoch {epoch + 1}] val_loss={val_loss:.6f}")
                     log.write(f"val epoch={epoch + 1} loss={val_loss:.6f}\n")
             state = {"epoch": epoch + 1, "model_state_dict": underlying.state_dict(),
-                     "model_config": model_config, "text_mode": args.text_mode, "training_args": vars(args)}
+                     "model_config": model_config, "text_mode": args.text_mode, "training_args": public_arguments(args)}
             if rank == 0:
                 log.flush()
                 if args.save_every and (epoch + 1) % args.save_every == 0:
-                    torch.save(dict(state, optimizer_state_dict=optimizer.state_dict(),
+                    torch.save(dict(state, training_controls=controls.state_dict(), optimizer_state_dict=optimizer.state_dict(),
                                     scaler_state_dict=scaler.state_dict(), loss=train_loss),
                                os.path.join(args.output_dir, f"checkpoint_epoch{epoch + 1}.pt"))
         if rank == 0:
