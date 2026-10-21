@@ -1,4 +1,4 @@
-"""Batch transfer and strict checkpoints for the question-guided detail pyramid."""
+"""Batch transfer and strict checkpoints for question-guided native zoom."""
 
 import os
 from pathlib import Path
@@ -7,10 +7,14 @@ import torch
 
 
 def to_device(batch, device):
-    return {
-        key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
-        for key, value in batch.items()
-    }
+    def transfer(value):
+        if torch.is_tensor(value):
+            return value.to(device, non_blocking=True)
+        if isinstance(value, list) and value and torch.is_tensor(value[0]):
+            return [transfer(item) for item in value]
+        return value
+
+    return {key: transfer(value) for key, value in batch.items()}
 
 
 def read_checkpoint(path):
@@ -26,10 +30,12 @@ def checkpoint_model_kwargs(saved):
 
     state = saved["model_state_dict"]
     key = "refiner.correction.weight"
-    if key not in state or "detail_pyramid.encoder.0.0.0.weight" not in state:
+    if key not in state or "zoom_version" not in state:
         raise ValueError(
-            "Use a question-guided-detail-pyramid checkpoint; older experiments belong to their original branches"
+            "Use a question-guided-zoom checkpoint; parent checkpoints belong to their original branch"
         )
+    if state["zoom_version"].item() != 1:
+        raise ValueError("Unknown zoom checkpoint version")
     tiny = "image_encoder.conv.weight" in state
     if state[key].shape != (1, 8 if tiny else 16, 1, 1):
         raise ValueError("Unexpected detail-pyramid refiner architecture")
@@ -52,7 +58,7 @@ def load_model_weights(model, saved):
     ):
         if config is not None and config != model.experiment_config:
             raise ValueError(
-                "Checkpoint configuration does not match this detail-pyramid model"
+                "Checkpoint configuration does not match this question-guided-zoom model"
             )
     model.load_state_dict(saved["model_state_dict"], strict=True)
 

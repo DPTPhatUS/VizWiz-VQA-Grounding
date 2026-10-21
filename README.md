@@ -1,80 +1,132 @@
-# Question-guided high-resolution detail pyramid
+# Question-guided native-image zoom
 
-Branch: `exp/question-guided-detail-pyramid`, created from
-`exp/spatial-detail-decoder` at `63977d2`. This is a new experiment requiring
-fresh training from pretrained CLIP, not a checkpoint-compatible refactor.
+Branch: `exp/question-guided-zoom`, based on the original
+`exp/question-guided-detail-pyramid` at `3eaa010`. This experiment adds a small
+crop reader to the global pyramid. It does not include token/region ranking or
+an answer predictor. Train fresh from pretrained CLIP; parent experiment
+checkpoints are deliberately rejected rather than partially loaded.
 
-The hypothesis is that high-resolution local features, question-conditioned
-fusion, and signed mask refinement can improve small-region precision. The
-implementation and synthetic checks do not establish an accuracy improvement.
+The hypothesis is that reading selected regions before full-image resizing
+can preserve evidence that the global 768-pixel view loses. This implementation
+does not establish a VizWiz accuracy improvement.
 
 ## Architecture
 
 ```text
-Original upright RGB image
-  +-- resize 336 --> CLIP vision --> image/text cross-attention + visual residual
-  |                                      |
-  |                 3 CLIP skips: 1024 -> 256/GN/GELU -> Q-FiLM -> 128
-  |                                      |
-  |                           three skip fusions at 24x24
-  |                                      |
-  |                         standard-conv upsampling stages
-  |                               48 -> 96 -> 192 -> 384
-  |                                ^     ^      ^      ^
-  +-- resize 768 --> CNN encoder --> top-down detail pyramid, 16 channels
-                                  48 -> 96 -> 192 -> 384 -> 768
-                                                         |
-  Question --> frozen CLIP text --> pooled Q --> spatial guidance at all stages
-                                                         |
-  Decoder feature + logits384 + detail768 + projected Q --> residual refiner
-                                                         |
-                        logits768 = resize(logits384) + signed correction
+Upright native RGB + question Q
+  |
+  +-- resize 336 --> trainable CLIP vision --+-- 3 skips + Q-FiLM
+  |                                        +-- image/text cross-attention
+  |                                                      |
+  +-- resize 768 --> small CNN/detail pyramid --> global decoder
+  |                                          48 -> 96 -> 192 -> 384
+  |                                                |           |
+  |                                        semantic F96    global refiner
+  |                                                |           |
+  |                     projected Q ----------> locator96  global logits768
+  |                                                |           |
+  |                          relevance + uncertainty --> two crop boxes
+  |                                                        |
+  +-- cut two native RGB crops, resize each to 256 <---------+
+                          |
+                shared small U-Net crop reader
+                RGB: 16@256 -> 32@128 -> 64@64
+                          + cropped global F96 -> 64@64
+                          + full Q token cross-attention at 64
+                          |
+                32@128 + skip -> 16@256 + skip
+                          |
+                  correction256 + crop quality
+                          |
+    global logits + weighted crop corrections in original coordinates
 ```
 
-* Both RGB views come directly from the same original image, in `[0,1]`. The
-  model applies CLIP mean/std to both. No crop/flip/color augmentation is added.
-  Aspect ratios are warped to squares, as in the parent CLIP experiments.
-* CLIP is `openai/clip-vit-large-patch14-336`. Text is frozen and kept in eval
-  mode. Vision is trainable except pooled-CLS `post_layernorm`, which patch
-  grounding does not use. Its checkpoint keys are retained.
-* Vision skips are hidden states 4/7/9. They and the final bottleneck have shape
-  `(B,1024,24,24)`. Each skip has its own nonlinear compression and FiLM head;
-  Q reduction is shared. FiLM heads start at zero (identity modulation).
-* Decoder channels are `128 -> 64 -> 32 -> 16 -> 16`. Every upsampling block is
-  bilinear resize followed by **one standard 3x3 convolution**, GroupNorm and
-  GELU. CLIP skip-fusion and detail-fusion blocks remain depthwise separable.
-* CNN encoder channels at `768/384/192/96/48` are `8/16/32/64/128`. Each level
-  has two standard 3x3/GN/GELU blocks. Max pooling downsamples. Top-down pyramid
-  levels use 1x1 lateral projection, addition and 3x3/GN/GELU smoothing.
-* Each spatial guide is a nonlinear function of semantic features, 16-channel
-  detail features and 16-channel projected Q. Fusion adds a residual whose
-  scalar starts at zero. The refiner reads 41 concatenated channels, reduces
-  to 16 with a standard 3x3 block, then predicts a one-channel correction.
-  The final correction head starts at zero, so initial logits768 exactly match
-  bilinear-resized logits384. Refinement is not restricted to a thresholded mask.
-* Mask heads at 96/192 are training-only; the 384 mask feeds the refiner. Only
-  final 768 logits are exported for evaluation. There is no latent answer,
-  teacher, oracle view, answer reader, or GT answer input on this branch.
+CLIP is `openai/clip-vit-large-patch14-336`. Text is frozen and stays in eval
+mode. Vision is fine-tuned except its unused pooled-CLS post-layernorm. The
+parent global branch is retained: three skips `1024 -> 256/GN/GELU -> Q-FiLM
+-> 128`, four standard-convolution upsampling blocks, four question-guided
+detail fusions, and a signed-logit refiner at 768.
 
-The implemented non-backbone parameter count is **6,649,101**, including text
-projection and cross-attention. This differs from the earlier 6.09M sketch
-because skip conditioning, Q-guided detail fusion and auxiliary heads changed.
-
-## Objective
-
-The default is `BCE + 0.5 * soft Dice` for each head:
+The locator receives `(B,32,96,96)` semantic features and broadcast projected
+Q with 16 channels. It predicts mask relevance independently of the global
+mask head. One crop at each scale is selected on a deterministic 16x16 center
+grid. Crop sides are 0.25 and 0.5 times the native shorter side, shifted into
+the image and snapped outward to native pixel edges. They remain approximately
+square (up to one pixel rounding). Each scale searches all centers, using:
 
 ```text
-L = L768 + 0.3 * L384 + 0.2 * L192 + 0.1 * L96
+utility = sigmoid(locator) * (1 + 0.25 * 4*p*(1-p))
+p = sigmoid(global logits resized to locator resolution)
+score = mean utility within the candidate window
+second-scale score *= 1 - 0.5 * IoU(candidate, first crop)
 ```
 
-Main targets are nearest-neighbor binary masks at 768. Auxiliary targets use
-area interpolation from this target to preserve fractional coverage of tiny
-regions. This cannot recover an object already lost during the native-to-768
-mask conversion. Loss calculations accumulate in float32 under CUDA FP16 AMP.
-Weights above are initial experimental settings, not tuned coefficients.
+Window means use integral images rather than sparse point sampling. The
+overlap penalty discourages redundant crops but does not prohibit overlap.
+The discrete box selection is detached. Its supervision comes from the
+locator loss, not from differentiating through argmax. An incorrectly low
+locator response can still miss the target; crop recall is measured at eval.
 
-Optional `--config` JSON (all defaults shown):
+Native RGB stays uint8 through loading/collation/device transfer. Only sliced
+crops are converted to `[0,1]`, resized with bicubic antialiasing, clamped to
+`[0,1]` and normalized with CLIP mean/std. Feature and mask crops share the
+same boxes. Feature sampling is bilinear; binary GT sampling is nearest.
+All geometry uses normalized xyxy pixel edges and `align_corners=False`.
+
+Local spatial features query all non-padding CLIP question tokens. They also
+receive the matching global semantic crop. The U-Net predicts a signed logit
+correction and one quality logit per crop. The correction head starts at zero,
+so the initial final mask equals the global mask. Quality starts at sigmoid(-2).
+
+At any output grid, including original resolution:
+
+```text
+w_k(x) = sigmoid(quality_k) * tapered_crop_window_k(x)
+z_final(x) = resize(z_global)(x) + sum_k(w_k(x)*delta_k(x)) / max(1, sum_k(w_k(x)))
+```
+
+The window is flat in the interior and tapers over the outer 10% on each side,
+reaching zero at/outside the crop edges. A high-quality crop can replace the
+global prediction in the interior; overlapping crops do not amplify corrections.
+At eval, crop corrections are placed directly
+on the native grid, avoiding an intermediate crop-to-768-to-native resize.
+The global logits are still interpolated from 768. No RGB restoration or OCR
+model is added; zoom cannot recover information absent in the original photo.
+
+Additional parameters: **250,723**. Total excluding both CLIP backbones:
+**6,899,824**. These are implementation counts, not GPU memory estimates.
+
+## Training and GT boundaries
+
+The final mask always uses exactly two model-selected crops in training and
+inference. No GT box or mask affects their selection or forward prediction.
+There is no teacher-forced final mask or train/inference crop curriculum.
+
+For training only, the same reader also processes one teaching crop centered
+on a foreground pixel nearest the GT centroid, at the smaller crop scale.
+An empty GT uses the image center and an empty target. This third crop is
+supervised locally and is excluded from final mask composition. GroupNorm and
+per-crop attention keep its activations independent of the two prediction
+crops. No extra annotation is needed; neither train nor inference reads A.
+
+Default objective:
+
+```text
+L = L_final768 + 0.3*L384 + 0.2*L192 + 0.1*L96
+    + 0.2*L_locator + 0.5*L_crop + 0.05*L_quality
+```
+
+Each segmentation loss is mean pixel BCE + 0.5 times mean per-image soft Dice
+loss. Main masks retain the parent's nearest-resized 768 targets. Auxiliary
+targets use area interpolation. Locator targets use area interpolation
+directly from native GT, and crop targets are sampled directly from native GT.
+`L_crop` averages all three fixed-count crops per image, then images. Quality
+BCE targets the detached hard foreground IoU of each local prediction against
+its local GT, using threshold zero and empty-union IoU=1. Quality predicts
+local correctness, not a guaranteed improvement over the global mask.
+
+These coefficients and crop sizes are initial experimental settings. Optional
+`--config` JSON exposes loss settings without adding architecture switches:
 
 ```json
 {
@@ -83,27 +135,30 @@ Optional `--config` JSON (all defaults shown):
   "fp_weight": 0.7,
   "aux96_weight": 0.1,
   "aux192_weight": 0.2,
-  "aux384_weight": 0.3
+  "aux384_weight": 0.3,
+  "locator_weight": 0.2,
+  "crop_weight": 0.5,
+  "quality_weight": 0.05
 }
 ```
 
-`fp_weight` is used only by `overlap_loss="tversky"`: its denominator is
-`TP + fp_weight*FP + (1-fp_weight)*FN + 1`, with numerator `TP + 1`.
-This is an optional separate ablation, not enabled in the default Dice run.
-Zero auxiliary weights retain zero-valued graph dependencies for DDP.
+`fp_weight` applies only to optional Tversky loss, not default Dice. Setting
+zoom losses to zero does not remove the crop architecture or create a parent
+baseline. Use the parent branch for that separately trained control.
 
-## Kaggle setup and 20-epoch run
+## Kaggle run
 
-Enable Internet and two T4 GPUs. Clone the branch, change into the repository,
-and install the locked environment before launching multiple processes:
+Enable Internet and two T4 GPUs, then install dependencies before torchrun:
 
 ```bash
-git clone --single-branch --branch exp/question-guided-detail-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+git clone --single-branch --branch exp/question-guided-zoom https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
 cd VizWiz-VQA-Grounding
 uv sync --frozen
+export DATA_ROOT=/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz
+export OMP_NUM_THREADS=1
 ```
 
-With `DATA_ROOT` pointing at the VizWiz folder, run the short real-backbone check:
+First check real-backbone AMP/DDP execution:
 
 ```bash
 uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
@@ -111,67 +166,58 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
   --gradient-checkpointing
 ```
 
-This checks real input shapes, several backward iterations, frozen/trainable
-gradients, AMP and DDP; it writes no checkpoints or training history. CPU checks
-cannot replace this GPU check. It does not establish accuracy or full-session runtime.
-Initial FP16 gradient overflow is handled by GradScaler backoff and a retry of
-the same batch (at most eight scale reductions per batch). Backoff events are
-printed and do not count as successful updates. Missing gradients, nonfinite
-forward loss, FP32 nonfinite gradients or persistent overflow still fail.
+Preflight requires finite gradients on all trainable parameters. It records
+initial AMP scale backoff and retries the same batch, up to eight reductions.
+Missing gradients, nonfinite forward losses or persistent overflow fail. It
+writes no checkpoints. Pass the same `--config` to preflight and train if using
+custom loss weights.
 
 ```bash
 uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
-  --data-root "$DATA_ROOT" \
-  --output-dir outputs \
-  --num-epochs 20 \
-  --batch-size 2 \
-  --gradient-accumulation-steps 2 \
-  --gradient-checkpointing \
-  --num-workers 2 \
-  --lr 0.00001 \
-  --seed 42 \
-  --save-every 10
+  --data-root "$DATA_ROOT" --output-dir outputs \
+  --num-epochs 20 --batch-size 2 --gradient-accumulation-steps 2 \
+  --gradient-checkpointing --num-workers 2 --lr 0.00001 --seed 42 --save-every 10
 ```
 
-Batch size is **global microbatch**: one image/GPU here. Accumulation gives
-effective global batch 4, including correct sample weighting in the final
-partial window. If memory permits, `--batch-size 4` with accumulation 1 also
-gives effective batch 4. Memory/runtime have not been measured on Kaggle T4.
+Global microbatch 2 means one image per GPU; accumulation 2 gives effective
+batch 4. CUDA FP16 AMP is automatic. Adam, LR1e-5, gradient clip norm1, no
+scheduler or epoch validation. Full checkpoints at epochs10/20 support resume
+with the same batch/accumulation/LR/seed/world size; raw final weights do not.
+All checkpoints stay directly in `outputs/`. Fresh runs reject existing run
+history/checkpoints. New native-image transfers and crop processing increase
+runtime; CPU checks do not establish T4 capacity or a full-session duration.
 
-Adam, no weight decay or LR scheduler, clipping at global norm 1, CUDA FP16
-GradScaler, deterministic epoch-keyed seeding and sampler shuffling follow the
-simple existing trainer. Activation checkpointing uses nonreentrant recomputation;
-it changes memory/time, not the intended forward computation. No per-epoch
-validation is run. Output collisions fail rather than overwrite another run.
+## Evaluation and diagnostic
 
-Full checkpoints are `outputs/checkpoint_epoch10.pt` and `checkpoint_epoch20.pt`.
-Raw final weights are also saved. Full checkpoints include optimizer/scaler,
-resolved config, architecture, source hashes and environment version. Resume
-with `--resume-checkpoint` from this experiment only; `--num-epochs` is the
-total target epoch. Batch/accumulation/LR/seed/world size must match.
-
-## Evaluate and diagnose
-
-Run each evaluation with one process. Both views are reconstructed from the
-original image, and logits are resized to native GT size **before** thresholding.
-The metric is mean per-image foreground IoU, not foreground/background class mIoU.
+Run all four combinations `(val,test) x (epoch10,epoch20)` with distinct output
+folders. Local test scoring requires test annotations and GT masks.
 
 ```bash
 uv run --frozen python eval.py \
   --checkpoint outputs/checkpoint_epoch20.pt --dataset val \
   --data-root "$DATA_ROOT" --output-dir outputs/eval_val_ep20 \
   --batch-size 1 --num-workers 2 --device cuda
-
 uv run --frozen python diagnose.py \
   --predictions outputs/eval_val_ep20 --data-root "$DATA_ROOT" \
   --output-dir outputs/diagnostic_ep20
 ```
 
-Repeat evaluation for epoch10 and for test if native test GT masks are available.
-Select checkpoints/hyperparameters by validation, never by the test results.
-Diagnostic reads exported masks on CPU, verifies each mask against stored IoU,
-and reports native precision/recall, predicted/GT area ratio and size groups.
-Evaluation/diagnostic output directories must be new or empty.
+Evaluation is FP32, one process, original-resolution mean per-image foreground
+IoU, threshold logit0, empty-union IoU1. Batch size4 is allowed if it fits.
+Outputs contain native-size binary PNGs and `metrics.json` with both final
+`mean_iou` and `global_mean_iou` from the same checkpoint. `zoom_diagnostics`
+records each image's global/final IoU, native GT coverage of the two crops,
+normalized boxes, and predicted crop quality. GT is read only after prediction
+for these diagnostic measurements, never for inference selection.
 
-Personal notebook instructions and local tests remain under ignored `personal/`.
-Older answer-latent probes/checkpoints belong to their original branches.
+The global view is an intervention on a jointly trained model, not an
+independently trained parent baseline. Compare against the parent run as well.
+Inspect small-region precision/recall and proposal coverage, not overall IoU
+alone. Select checkpoint/settings using validation rather than test scores.
+
+Offline checks cover native geometry, antialiasing, GT independence, Q-token
+masking, finite gradients, accumulation, two-rank Gloo with reduced real CLIP,
+FP16/BF16, tiny overfit, strict raw/full reload, exact epoch resume, and agreement
+between eval PNGs, native diagnostics and single-image prediction. Production
+heads also pass CPU forward/backward with synthetic CLIP features. Actual
+pretrained CLIP on CUDA, T4 VRAM/runtime and VizWiz accuracy remain unverified.

@@ -1,4 +1,4 @@
-"""Train the question-guided detail pyramid with native-resolution evaluation kept separate."""
+"""Train question-guided native zoom with native-resolution evaluation kept separate."""
 
 import argparse
 import hashlib
@@ -52,11 +52,11 @@ def training_parser():
     )
     parser.add_argument(
         "--resume-checkpoint",
-        help="Full checkpoint from this detail-pyramid experiment",
+        help="Full checkpoint from this question-guided-zoom experiment",
     )
     parser.add_argument(
         "--config",
-        help="Optional JSON for overlap loss and auxiliary supervision weights",
+        help="Optional JSON for segmentation, locator, crop and quality loss weights",
     )
     return parser
 
@@ -68,12 +68,12 @@ def resolve_training_arguments(args, saved=None):
         else {}
     )
     if not isinstance(requested, dict) or set(requested) - TRAINING_DEFAULTS.keys():
-        raise ValueError("Unknown detail-pyramid training config keys")
+        raise ValueError("Unknown question-guided-zoom training config keys")
     settings = dict(TRAINING_DEFAULTS)
     if saved is not None:
         run = saved["run_config"]
         if run.get("objective_version") != EXPERIMENT:
-            raise ValueError("Resume requires the same detail-pyramid objective")
+            raise ValueError("Resume requires the same question-guided-zoom objective")
         settings.update(run["training_config"])
         if any(settings[key] != value for key, value in requested.items()):
             raise ValueError("Resume loss configuration differs from checkpoint")
@@ -243,6 +243,7 @@ def _train(args, rank, world, distributed, device):
             "models/text_encoder.py",
             "models/detail_pyramid.py",
             "models/mask_decoder.py",
+            "models/zoom.py",
             "losses.py",
             "dataset.py",
             "metrics.py",

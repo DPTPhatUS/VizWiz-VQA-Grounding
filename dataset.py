@@ -1,4 +1,4 @@
-"""Aligned low/high-resolution RGB views, one mask and question-only conditioning."""
+"""Aligned global views, native RGB/masks and question-only conditioning."""
 
 import json
 import random
@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 from torch.utils.data import DataLoader, Dataset
-from torchvision.transforms.functional import to_tensor
+from torchvision.transforms.functional import pil_to_tensor, to_tensor
 
 
 def image_views(
@@ -22,6 +22,8 @@ def image_views(
         "detail_image": to_tensor(
             image.resize((detail_size, detail_size), Image.Resampling.BICUBIC)
         ),
+        # Keep native pixels as bytes; normalize only the selected crops on device.
+        "native_image": pil_to_tensor(image),
     }
 
 
@@ -65,6 +67,7 @@ class VizWizGroundingDataset(Dataset):
             filename=name,
             original_size=(image.height, image.width),
         )
+        result["native_mask"] = (pil_to_tensor(mask) > 127).to(torch.uint8)
         if self.split != "train":
             result["original_mask"] = (to_tensor(mask) > 0.5).float()
         return result
@@ -74,7 +77,8 @@ def collate_samples(samples):
     return {
         key: (
             torch.stack([s[key] for s in samples])
-            if torch.is_tensor(samples[0][key]) and key != "original_mask"
+            if torch.is_tensor(samples[0][key])
+            and key not in {"original_mask", "native_image", "native_mask"}
             else [s[key] for s in samples]
         )
         for key in samples[0]

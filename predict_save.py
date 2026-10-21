@@ -5,11 +5,16 @@ from pathlib import Path
 
 import torch
 from PIL import Image, ImageOps
-from torch.nn import functional as F
 
 from dataset import image_views
 from models.model import GroundingModel
-from utils import checkpoint_model_kwargs, load_model_weights, read_checkpoint
+from models.zoom import prediction_at_size
+from utils import (
+    checkpoint_model_kwargs,
+    load_model_weights,
+    read_checkpoint,
+    to_device,
+)
 
 
 def prediction_parser(description=__doc__):
@@ -38,7 +43,7 @@ def predict_image(checkpoint, image_path, question, device, teacher=False):
         image = ImageOps.exif_transpose(source).convert("RGB")
     question_text = f"Q: {question}"
     batch = {
-        key: tensor.unsqueeze(0).to(device)
+        key: [tensor] if key == "native_image" else tensor.unsqueeze(0)
         for key, tensor in image_views(
             image, model.image_size, model.detail_size
         ).items()
@@ -49,16 +54,8 @@ def predict_image(checkpoint, image_path, question, device, teacher=False):
             "filename": [Path(image_path).name],
         }
     )
-    logits = model(batch)["logits"].float()  # (1, 1, H_dec, W_dec)
-    mask = (
-        F.interpolate(
-            logits,
-            size=(image.height, image.width),
-            mode="bilinear",
-            align_corners=False,
-        )[0, 0]
-        > 0
-    )  # (H_orig, W_orig)
+    output = model(to_device(batch, device))
+    mask = prediction_at_size(output, 0, (image.height, image.width))[0, 0] > 0
     return image, Image.fromarray(mask.cpu().numpy().astype("uint8") * 255)
 
 

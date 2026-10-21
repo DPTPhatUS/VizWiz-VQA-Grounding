@@ -1,4 +1,4 @@
-"""Question-only grounding with a high-resolution detail pyramid."""
+"""Question-only global grounding with native-image zoom refinement."""
 
 import torch
 from torch import Tensor, nn
@@ -8,12 +8,21 @@ from models.detail_pyramid import DetailPyramid, HighResolutionRefiner
 from models.image_encoder import ImageEncoder, TinyVision
 from models.mask_decoder import DetailDecoder
 from models.text_encoder import TextEncoder, masked_mean
+from models.zoom import (
+    CROP_FRACTIONS,
+    EDGE_TAPER,
+    OVERLAP_PENALTY,
+    PROPOSAL_GRID,
+    UNCERTAINTY_WEIGHT,
+    QuestionGuidedZoom,
+    prediction_at_size,
+)
 
-EXPERIMENT = "question-guided-detail-pyramid-v1"
+EXPERIMENT = "question-guided-zoom-v1"
 
 
 class GroundingModel(nn.Module):
-    """336 CLIP view + 768 CNN view + Q -> 768 logits; never consumes an answer."""
+    """Global pyramid + two native RGB crops + Q; GT is never used in mask prediction."""
 
     def __init__(self, tiny: bool = False, gradient_checkpointing: bool = False):
         super().__init__()
@@ -48,6 +57,11 @@ class GroundingModel(nn.Module):
         )
         self.gradient_checkpointing = gradient_checkpointing
         self.image_size, self.detail_size = (32, 64) if tiny else (336, 768)
+        # Initialize the parent first so its common weights retain the same seed mapping.
+        self.zoom = QuestionGuidedZoom(
+            self.decoder.stage96_channels, text_dim, 8 if tiny else 16, tiny=tiny
+        )
+        self.register_buffer("zoom_version", torch.tensor(1, dtype=torch.int64))
         if gradient_checkpointing and not tiny:
             self.image_encoder.vision_encoder.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -67,6 +81,18 @@ class GroundingModel(nn.Module):
             "auxiliary_heads": [96, 192, 384],
             "refiner": "signed-logit-residual",
             "normalization": "clip-rgb-both-views",
+            "zoom": {
+                "crop_size": self.zoom.crop_size,
+                "crop_fractions": list(CROP_FRACTIONS),
+                "proposal_grid": PROPOSAL_GRID,
+                "uncertainty_weight": UNCERTAINTY_WEIGHT,
+                "overlap_penalty": OVERLAP_PENALTY,
+                "teacher_crops_train_only": 1,
+                "context_stage": 96,
+                "composition": "quality-flat-interior-normalized-signed-correction",
+                "edge_taper": EDGE_TAPER,
+                "native_input": "upright-rgb-uint8",
+            },
         }
 
     def train(self, mode: bool = True):
@@ -74,7 +100,7 @@ class GroundingModel(nn.Module):
         self.text_encoder.eval()
         return self
 
-    def _run(self, block: nn.Module, *inputs: Tensor) -> Tensor:
+    def _run(self, block: nn.Module, *inputs: Tensor) -> Tensor | tuple[Tensor, Tensor]:
         if self.training and self.gradient_checkpointing and torch.is_grad_enabled():
             return checkpoint(block, *inputs, use_reentrant=False)
         return block(*inputs)
@@ -118,11 +144,29 @@ class GroundingModel(nn.Module):
             (detail_image - self.image_mean) / self.image_std, self._run
         )
         detail_question = self.question_projection(question)
-        logits, semantic, auxiliary = self.decoder(
+        logits, semantic, auxiliary, region_feature = self.decoder(
             (*features[:3], fused), question, detail, detail_question, self._run
         )
         final = self._run(self.refiner, logits, semantic, detail[-1], detail_question)
-        return {"logits": final, "auxiliary_logits": auxiliary}
+        zoom = self.zoom(
+            region_feature,
+            detail_question,
+            text.tokens,
+            text.attention_mask,
+            final,
+            batch,
+            self.image_mean,
+            self.image_std,
+            self._run,
+        )
+        output = {"zoom": zoom, "auxiliary_logits": auxiliary}
+        output["logits"] = torch.cat(
+            [
+                prediction_at_size(output, i, (self.detail_size, self.detail_size))
+                for i in range(len(image))
+            ]
+        )
+        return output
 
     @classmethod
     def from_checkpoint(cls, path, device="cpu"):

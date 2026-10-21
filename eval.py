@@ -44,7 +44,8 @@ def eval_main(argv=None):
     if out.exists() and any(out.iterdir()):
         raise ValueError("Evaluation output must be a new or empty directory")
     out.mkdir(parents=True, exist_ok=True)
-    scores = evaluate(model, loader, device, out)
+    diagnostics = {}
+    scores = evaluate(model, loader, device, out, diagnostics)
     summary = {
         "num_samples": len(scores),
         "mean_iou": sum(scores.values()) / len(scores),
@@ -59,9 +60,15 @@ def eval_main(argv=None):
         "inference_precision": "float32",
         "threshold_logit": 0,
         "empty_union_iou": 1,
+        "global_mean_iou": sum(s["global_iou"] for s in diagnostics.values())
+        / len(scores),
+        "restoration": "native-crop-corrections-on-resized-global-logits",
     }
     (out / "metrics.json").write_text(
-        json.dumps({"summary": summary, "per_sample": scores}, indent=2)
+        json.dumps(
+            {"summary": summary, "per_sample": scores, "zoom_diagnostics": diagnostics},
+            indent=2,
+        )
     )
     print(json.dumps(summary), flush=True)
 

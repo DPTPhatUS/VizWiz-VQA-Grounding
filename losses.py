@@ -12,6 +12,9 @@ TRAINING_DEFAULTS = {
     "aux96_weight": 0.1,
     "aux192_weight": 0.2,
     "aux384_weight": 0.3,
+    "locator_weight": 0.2,
+    "crop_weight": 0.5,
+    "quality_weight": 0.05,
 }
 
 
@@ -52,7 +55,7 @@ def segmentation_loss(
 
 
 class SegmentationObjective:
-    """Full-resolution mask plus three auxiliary heads; no GT answer is consumed."""
+    """Final/global segmentation, native crop supervision and detached crop quality."""
 
     def __init__(
         self,
@@ -62,6 +65,9 @@ class SegmentationObjective:
         aux96_weight=0.1,
         aux192_weight=0.2,
         aux384_weight=0.3,
+        locator_weight=0.2,
+        crop_weight=0.5,
+        quality_weight=0.05,
     ):
         if overlap_loss not in {"dice", "tversky"}:
             raise ValueError("overlap_loss must be dice or tversky")
@@ -71,6 +77,9 @@ class SegmentationObjective:
             aux96_weight=aux96_weight,
             aux192_weight=aux192_weight,
             aux384_weight=aux384_weight,
+            locator_weight=locator_weight,
+            crop_weight=crop_weight,
+            quality_weight=quality_weight,
         ).items():
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
@@ -83,6 +92,11 @@ class SegmentationObjective:
         )
         self.auxiliary_weights = dict(
             zip(("96", "192", "384"), (aux96_weight, aux192_weight, aux384_weight))
+        )
+        self.locator_weight, self.crop_weight, self.quality_weight = (
+            locator_weight,
+            crop_weight,
+            quality_weight,
         )
 
     def __call__(self, model, batch, epoch=0):
@@ -102,4 +116,29 @@ class SegmentationObjective:
             loss = segmentation_loss(logits, target, **self.loss_kwargs)
             total = total + weight * loss
             components[f"aux{name}_loss"] = loss.detach()
+        zoom = output["zoom"]
+        locator = segmentation_loss(
+            zoom["locator_logits"], zoom["locator_target"], **self.loss_kwargs
+        )
+        crop = segmentation_loss(
+            zoom["crop_logits"], zoom["crop_target"], **self.loss_kwargs
+        )
+        with torch.no_grad():
+            quality_target = per_image_iou(zoom["crop_logits"], zoom["crop_target"])
+        quality = F.binary_cross_entropy_with_logits(
+            zoom["crop_quality"].float(), quality_target
+        )
+        total = (
+            total
+            + self.locator_weight * locator
+            + self.crop_weight * crop
+            + self.quality_weight * quality
+        )
+        components.update(
+            locator_loss=locator.detach(),
+            crop_loss=crop.detach(),
+            quality_loss=quality.detach(),
+            crop_iou=quality_target.mean(),
+            crop_confidence=zoom["crop_quality"].detach().float().sigmoid().mean(),
+        )
         return total, components
