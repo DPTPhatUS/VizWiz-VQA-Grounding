@@ -1,5 +1,12 @@
 """Train this branch's grounding experiment on CPU, CUDA, or torchrun DDP."""
 import argparse
+from training_options import (
+    TrainingArgumentParser,
+    TrainingControls,
+    recipe_config,
+    public_arguments,
+    restore_control_arguments,
+)
 import json
 import math
 import os
@@ -41,9 +48,9 @@ def objective_version(args):
 
 def resolve_training_arguments(args, saved=None):
     """Restore recipe settings on resume; never silently switch objective or schedule."""
-    requested = {}
+    requested = recipe_config(args, TRAINING_DEFAULTS)
     if args.config:
-        requested = json.loads(Path(args.config).read_text(encoding="utf-8-sig"))
+        requested = recipe_config(args, TRAINING_DEFAULTS)
         if not isinstance(requested, dict) or set(requested) - TRAINING_DEFAULTS.keys():
             raise ValueError("Config must be a JSON object containing only keys from TRAINING_DEFAULTS")
         for key, value in requested.items():
@@ -132,7 +139,7 @@ def unwrap(model):
 
 
 def training_parser():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = TrainingArgumentParser(recipe_keys=TRAINING_DEFAULTS, description=__doc__)
     parser.add_argument("--data-root", default="data/vizwiz")
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--num-epochs", type=int, default=100)
@@ -232,10 +239,11 @@ def resolve_model_arguments(args, checkpoint=None):
 
 def _train(args, rank, world, distributed, device):
     checkpoint = read_checkpoint(args.resume_checkpoint) if args.resume_checkpoint else None
+    restore_control_arguments(args, checkpoint)
     model_options = resolve_model_arguments(args, checkpoint)
     resolve_training_arguments(args, checkpoint)
     seed_everything(args.seed)
-    run_config = vars(args).copy()
+    run_config = public_arguments(args).copy()
     run_config.update(world_size=world, image_size=IMAGE_SIZE,
                       teacher_training=False, text_mode="question", answer_dropout=.5)
     version = objective_version(args)
@@ -265,10 +273,9 @@ def _train(args, rank, world, distributed, device):
     if isinstance(objective, DistillationObjective):
         run_config["loss_config"] = {name: getattr(objective, name) for name in
                                    ("dice_weight", "oracle_weight", "question_weight", "latent_weight", "attn_weight", "gain_mix")}
-    parameters = [p for p in model.parameters() if p.requires_grad]
-    if not parameters:
-        raise ValueError("No trainable parameters")
-    optimizer = torch.optim.Adam(parameters, lr=args.lr)
+    controls = TrainingControls(model, args, checkpoint)
+    parameters = controls.parameters
+    optimizer = controls.optimizer
     scaler = torch.amp.GradScaler("cuda",enabled=device.type=="cuda")
     start = 0
     if args.resume_checkpoint:
@@ -298,6 +305,12 @@ def _train(args, rank, world, distributed, device):
     sampler = DistributedSampler(train_set,num_replicas=world,rank=rank,seed=args.seed) if distributed else None
     generator = torch.Generator()
     train_loader = make_loader(train_set,args,args.batch_size//world,sampler,sampler is None,generator)
+    controls.configure_schedule(
+        args.num_epochs,
+        math.ceil(len(train_loader) / getattr(args, "gradient_accumulation_steps", 1)),
+        start,
+    )
+    run_config["optimization_config"] = controls.config
     run_config["experiment_config"] = unwrap(model).experiment_config
     run_config["spatial_evidence"] = unwrap(model).coarse.decoder.spatial_evidence_enabled
     run_config["spatial_upsample_stages"] = list(unwrap(model).coarse.decoder.spatial_upsample_stages)
@@ -316,6 +329,8 @@ def _train(args, rank, world, distributed, device):
         if sampler:
             sampler.set_epoch(epoch)
         model.train()
+        controls.set_encoder_modes()
+        controls.log_learning_rates(epoch + 1)
         totals = torch.zeros(2,device=device,dtype=torch.float64)  # (2,): [weighted_loss_sum, sample_count]
         component_sums = {}
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.num_epochs}",
@@ -330,7 +345,7 @@ def _train(args, rank, world, distributed, device):
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(parameters,1.)
-            scaler.step(optimizer); scaler.update()
+            controls.step(scaler)
             n = len(batch["filename"])
             totals[0] += loss.detach().to(torch.float64) * n
             totals[1] += n
@@ -356,6 +371,7 @@ def _train(args, rank, world, distributed, device):
                 checkpoint_path = out / f"checkpoint_epoch{epoch + 1}.pt"
                 save_checkpoint({"epoch": epoch + 1,
                             "model_state_dict": unwrap(model).state_dict(),
+                            "training_controls": controls.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
                             "scaler_state_dict": scaler.state_dict(),
                             "experiment_config": unwrap(model).experiment_config,
