@@ -13,7 +13,12 @@ from torch.utils.data import DistributedSampler
 from dataset import VizWizGroundingDataset, make_loader
 from losses import SegmentationObjective
 from models.model import GroundingModel
-from train import seed_everything
+from train import (
+    model_options,
+    objective_options,
+    resolve_training_arguments,
+    seed_everything,
+)
 from utils import to_device
 
 
@@ -115,6 +120,9 @@ def main(argv=None):
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument(
+        "--config", help="Same optional experiment JSON used by train.py"
+    )
+    parser.add_argument(
         "--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True
     )
     args = parser.parse_args(argv)
@@ -141,8 +149,12 @@ def main(argv=None):
         dist.init_process_group("nccl" if device.type == "cuda" else "gloo")
     try:
         seed_everything(42)
+        settings = resolve_training_arguments(args)
         model = (
-            GroundingModel(gradient_checkpointing=args.gradient_checkpointing)
+            GroundingModel(
+                gradient_checkpointing=args.gradient_checkpointing,
+                **model_options(settings),
+            )
             .to(device)
             .train()
         )
@@ -164,7 +176,12 @@ def main(argv=None):
             raise ValueError("Not enough batches for requested preflight steps")
         parameters = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.Adam(parameters, lr=1e-5)
-        objective = SegmentationObjective()
+        criterion = SegmentationObjective(**objective_options(settings))
+
+        def objective(module, batch):
+            # Exercise active ranking even when the real run starts with a warm-up.
+            return criterion(module, batch, epoch=settings["ranking_warmup_epochs"])
+
         scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
         wrapped = (
             DistributedDataParallel(

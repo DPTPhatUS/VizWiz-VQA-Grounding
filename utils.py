@@ -26,10 +26,12 @@ def checkpoint_model_kwargs(saved):
 
     state = saved["model_state_dict"]
     key = "refiner.correction.weight"
-    if key not in state or "detail_pyramid.encoder.0.0.0.weight" not in state:
+    if key not in state or "token_region_version" not in state:
         raise ValueError(
-            "Use a question-guided-detail-pyramid checkpoint; older experiments belong to their original branches"
+            "Use a pyramid-token-region-ranking checkpoint; parent checkpoints belong to their original branch"
         )
+    if state["token_region_version"].item() != 1:
+        raise ValueError("Unknown token/region checkpoint version")
     tiny = "image_encoder.conv.weight" in state
     if state[key].shape != (1, 8 if tiny else 16, 1, 1):
         raise ValueError("Unexpected detail-pyramid refiner architecture")
@@ -41,7 +43,11 @@ def checkpoint_model_kwargs(saved):
             raise ValueError("Checkpoint belongs to a different experiment")
         if "tiny" in config and config["tiny"] != tiny:
             raise ValueError("Checkpoint tiny metadata disagrees with tensors")
-    return {"tiny": tiny}
+    return {
+        "tiny": tiny,
+        "token_interaction": "decoder.token_interaction.query.weight" in state,
+        "region_ranking": "region_ranker.visual.weight" in state,
+    }
 
 
 def load_model_weights(model, saved):

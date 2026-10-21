@@ -1,11 +1,11 @@
-# Question-guided high-resolution detail pyramid
+# Token-aware detail pyramid with region ranking
 
-Branch: `exp/question-guided-detail-pyramid`, created from
-`exp/spatial-detail-decoder` at `63977d2`. This is a new experiment requiring
+Branch: `exp/pyramid-token-region-ranking`, created from
+`exp/question-guided-detail-pyramid` at `3eaa010`. This is a new experiment requiring
 fresh training from pretrained CLIP, not a checkpoint-compatible refactor.
 
-The hypothesis is that high-resolution local features, question-conditioned
-fusion, and signed mask refinement can improve small-region precision. The
+The hypothesis is that full-token interaction and within-image hard-negative
+region supervision can improve evidence selection beyond high-resolution detail alone. The
 implementation and synthetic checks do not establish an accuracy improvement.
 
 ## Architecture
@@ -56,16 +56,57 @@ Original upright RGB image
   final 768 logits are exported for evaluation. There is no latent answer,
   teacher, oracle view, answer reader, or GT answer input on this branch.
 
-The implemented non-backbone parameter count is **6,649,101**, including text
-projection and cross-attention. This differs from the earlier 6.09M sketch
-because skip conditioning, Q-guided detail fusion and auxiliary heads changed.
+## Token interaction and region ranking
+
+The parent architecture above is retained. After detail fusion at **96x96**, a
+residual token-pixel module projects `(B,32,96,96)` to 64-dimensional pixel
+queries. All CLIP Q tokens are projected from 768 to 64 dimensions; a four-head
+cross-attention reads them as keys/values. Padding is excluded; SOT/EOT remain
+available, like the existing bottleneck cross-attention. Pixel queries and text
+keys/values each have LayerNorm. A 64-to-32 projection and zero-initialized
+residual scale preserve the parent feature at initialization.
+
+During training, a shared nonlinear scorer reads pooled **post-interaction F96**
+and pooled Q. The positive support is the area-resized GT mask. Negatives are
+translations of exactly the same soft support: no wrap, clipping, area change,
+or overlap with the GT's one-cell dilation is allowed. A 5x5 placement grid and
+eight high-prediction centers supply candidates; the three highest detached
+prediction-confidence candidates are selected. These are task-negative regions
+outside the annotated GT, not guaranteed semantically different objects.
+
+Some GT regions (especially large/dispersed ones) have no valid translation.
+They retain all segmentation supervision and contribute **zero ranking loss**.
+The scorer sees no area/coordinates. Equal support area prevents a direct
+small-region-size shortcut, but does not rule out appearance/context shortcuts.
+
+```text
+Detail fusion96 -> token-pixel interaction -> F96 -> decoder192/384 -> refiner768
+                                              |
+                  GT mask -> positive pooling + translated negative pooling
+                                              |
+                             shared region/Q scorer -> margin ranking loss
+```
+
+Mining uses detached final logits and GT. Ranking gradients update the scorer
+and the feature-producing network up to F96; they do not flow through mining or
+directly update downstream decoder192/384/refiner. No segmentation logits are
+thresholded in the differentiable path. Scorer/mining do not execute in eval;
+inference still requires only RGB image and Q. The scorer's small weights remain
+in the checkpoint even though mask inference does not call it.
+
+Parameters outside CLIP: **6,770,798** in the full model, including 70,305 for
+token interaction and 51,392 for the training-only ranker. Parent modules keep
+identical initial weights across same-seed variants because new modules are
+initialized after all parent modules. These counts are from implementation;
+GPU memory/time and accuracy are not inferred from parameter count.
 
 ## Objective
 
 The default is `BCE + 0.5 * soft Dice` for each head:
 
 ```text
-L = L768 + 0.3 * L384 + 0.2 * L192 + 0.1 * L96
+L = L768 + 0.3 * L384 + 0.2 * L192 + 0.1 * L96 + effective_ranking_weight * Lrank
+Lrank = mean_images(mean_valid_pairs(relu(margin - score_positive + score_negative)))
 ```
 
 Main targets are nearest-neighbor binary masks at 768. Auxiliary targets use
@@ -87,6 +128,37 @@ Optional `--config` JSON (all defaults shown):
 }
 ```
 
+The experiment adds four JSON keys:
+
+```json
+{
+  "token_interaction": true,
+  "ranking_weight": 0.1,
+  "ranking_margin": 0.2,
+  "ranking_warmup_epochs": 2
+}
+```
+
+Ranking weight is zero for epochs1/2, then 0.1 from epoch3. Token interaction is
+trained through segmentation from the start. Warmup does not pretrain the
+scorer. Margin/weight/warmup are initial settings, not validated hyperparameters.
+Invalid images contribute zero to the batch mean; reduction is deliberately
+not normalized by a batch-dependent count of valid images, preserving DDP and
+gradient-accumulation equivalence. Logs include ranking coverage, gap and raw/
+weighted loss. Positive ranking weight constructs the ranker; zero omits it.
+
+For controlled fresh runs on this branch:
+
+| Variant | token_interaction | ranking_weight |
+|---|---|---:|
+| Parent-architecture control | false | 0.0 |
+| Token interaction only | true | 0.0 |
+| Full experiment (default) | true | 0.1 |
+
+Use the same remaining training settings. Resume requires the same config and
+architecture; do not change variants in the middle of a run. Parent experiment
+checkpoints are rejected, including raw weights without the new version marker.
+
 `fp_weight` is used only by `overlap_loss="tversky"`: its denominator is
 `TP + fp_weight*FP + (1-fp_weight)*FN + 1`, with numerator `TP + 1`.
 This is an optional separate ablation, not enabled in the default Dice run.
@@ -98,7 +170,7 @@ Enable Internet and two T4 GPUs. Clone the branch, change into the repository,
 and install the locked environment before launching multiple processes:
 
 ```bash
-git clone --single-branch --branch exp/question-guided-detail-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+git clone --single-branch --branch exp/pyramid-token-region-ranking https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
 cd VizWiz-VQA-Grounding
 uv sync --frozen
 ```
@@ -114,6 +186,8 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
 This checks real input shapes, several backward iterations, frozen/trainable
 gradients, AMP and DDP; it writes no checkpoints or training history. CPU checks
 cannot replace this GPU check. It does not establish accuracy or full-session runtime.
+Pass the same `--config` to preflight/train for non-default variants. Preflight
+exercises the active ranking objective rather than the warmup coefficient.
 Initial FP16 gradient overflow is handled by GradScaler backoff and a retry of
 the same batch (at most eight scale reductions per batch). Backoff events are
 printed and do not count as successful updates. Missing gradients, nonfinite

@@ -17,7 +17,8 @@ from torch.utils.data import DistributedSampler
 from tqdm.auto import tqdm
 
 from dataset import VizWizGroundingDataset, make_loader
-from losses import TRAINING_DEFAULTS, SegmentationObjective
+from losses import TRAINING_DEFAULTS as LOSS_DEFAULTS
+from losses import SegmentationObjective
 from models.model import EXPERIMENT, GroundingModel
 from utils import (
     checkpoint_model_kwargs,
@@ -26,6 +27,19 @@ from utils import (
     save_checkpoint,
     to_device,
 )
+
+TRAINING_DEFAULTS = dict(LOSS_DEFAULTS, token_interaction=True)
+
+
+def objective_options(settings):
+    return {key: value for key, value in settings.items() if key != "token_interaction"}
+
+
+def model_options(settings):
+    return {
+        "token_interaction": settings["token_interaction"],
+        "region_ranking": settings["ranking_weight"] > 0,
+    }
 
 
 def training_parser():
@@ -88,7 +102,9 @@ def resolve_training_arguments(args, saved=None):
                 raise ValueError(f"Resume {key} differs from checkpoint")
     else:
         settings.update(requested)
-    SegmentationObjective(**settings)
+    if type(settings["token_interaction"]) is not bool:
+        raise ValueError("token_interaction must be a boolean")
+    SegmentationObjective(**objective_options(settings))
     if args.gradient_checkpointing is None:
         args.gradient_checkpointing = (
             saved["run_config"].get("gradient_checkpointing", False) if saved else False
@@ -157,8 +173,10 @@ def _train(args, rank, world, distributed, device):
     checkpoint = (
         read_checkpoint(args.resume_checkpoint) if args.resume_checkpoint else None
     )
-    options = checkpoint_model_kwargs(checkpoint) if checkpoint else {}
     settings = resolve_training_arguments(args, checkpoint)
+    options = (
+        checkpoint_model_kwargs(checkpoint) if checkpoint else model_options(settings)
+    )
     seed_everything(args.seed)
     out = Path(args.output_dir)
     history_path = out / "history.jsonl"
@@ -184,7 +202,7 @@ def _train(args, rank, world, distributed, device):
     train_set = VizWizGroundingDataset(
         args.data_root, "train", model.image_size, detail_size=model.detail_size
     )
-    objective = SegmentationObjective(**settings)
+    objective = SegmentationObjective(**objective_options(settings))
     parameters = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(parameters, lr=args.lr)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
@@ -242,6 +260,7 @@ def _train(args, rank, world, distributed, device):
             "models/image_encoder.py",
             "models/text_encoder.py",
             "models/detail_pyramid.py",
+            "models/region_grounding.py",
             "models/mask_decoder.py",
             "losses.py",
             "dataset.py",

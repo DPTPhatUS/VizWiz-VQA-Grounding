@@ -7,15 +7,22 @@ from torch.utils.checkpoint import checkpoint
 from models.detail_pyramid import DetailPyramid, HighResolutionRefiner
 from models.image_encoder import ImageEncoder, TinyVision
 from models.mask_decoder import DetailDecoder
+from models.region_grounding import RegionRanker, TokenPixelInteraction
 from models.text_encoder import TextEncoder, masked_mean
 
-EXPERIMENT = "question-guided-detail-pyramid-v1"
+EXPERIMENT = "pyramid-token-region-ranking-v1"
 
 
 class GroundingModel(nn.Module):
     """336 CLIP view + 768 CNN view + Q -> 768 logits; never consumes an answer."""
 
-    def __init__(self, tiny: bool = False, gradient_checkpointing: bool = False):
+    def __init__(
+        self,
+        tiny: bool = False,
+        gradient_checkpointing: bool = False,
+        token_interaction: bool = True,
+        region_ranking: bool = True,
+    ):
         super().__init__()
         self.image_encoder = TinyVision() if tiny else ImageEncoder()
         self.text_encoder = TextEncoder(tiny)
@@ -48,6 +55,17 @@ class GroundingModel(nn.Module):
         )
         self.gradient_checkpointing = gradient_checkpointing
         self.image_size, self.detail_size = (32, 64) if tiny else (336, 768)
+        # Add modules after all parent modules: common initial weights stay matched across ablations.
+        if token_interaction:
+            self.decoder.token_interaction = TokenPixelInteraction(
+                self.decoder.stage96_channels, text_dim, 16 if tiny else 64
+            )
+        self.region_ranker = (
+            RegionRanker(self.decoder.stage96_channels, text_dim, 16 if tiny else 64)
+            if region_ranking
+            else None
+        )
+        self.register_buffer("token_region_version", torch.tensor(1, dtype=torch.int64))
         if gradient_checkpointing and not tiny:
             self.image_encoder.vision_encoder.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -67,6 +85,13 @@ class GroundingModel(nn.Module):
             "auxiliary_heads": [96, 192, 384],
             "refiner": "signed-logit-residual",
             "normalization": "clip-rgb-both-views",
+            "token_interaction": token_interaction,
+            "token_width": (16 if tiny else 64) if token_interaction else None,
+            "token_stage": 96 if token_interaction else None,
+            "region_ranking": region_ranking,
+            "region_mining": "translated-gt-soft-support-halo1-grid5-peaks8-top3"
+            if region_ranking
+            else None,
         }
 
     def train(self, mode: bool = True):
@@ -118,11 +143,22 @@ class GroundingModel(nn.Module):
             (detail_image - self.image_mean) / self.image_std, self._run
         )
         detail_question = self.question_projection(question)
-        logits, semantic, auxiliary = self.decoder(
-            (*features[:3], fused), question, detail, detail_question, self._run
+        logits, semantic, auxiliary, region_feature = self.decoder(
+            (*features[:3], fused),
+            question,
+            detail,
+            detail_question,
+            self._run,
+            text_tokens=text.tokens,
+            attention_mask=text.attention_mask,
         )
         final = self._run(self.refiner, logits, semantic, detail[-1], detail_question)
-        return {"logits": final, "auxiliary_logits": auxiliary}
+        output = {"logits": final, "auxiliary_logits": auxiliary}
+        if self.training and self.region_ranker is not None:
+            output["region_scores"] = self.region_ranker(
+                region_feature, question, final, batch["mask"]
+            )
+        return output
 
     @classmethod
     def from_checkpoint(cls, path, device="cpu"):
