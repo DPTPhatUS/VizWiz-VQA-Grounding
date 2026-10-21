@@ -1,11 +1,5 @@
 """Train this branch's grounding experiment on CPU, CUDA, or torchrun DDP."""
-import math
-from training_options import (
-    TrainingArgumentParser,
-    TrainingControls,
-    public_arguments,
-    restore_control_arguments,
-)
+import argparse
 import json
 import os
 import random
@@ -38,7 +32,7 @@ def unwrap(model):
 
 
 def training_parser():
-    parser = TrainingArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", default="data/vizwiz")
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--num-epochs", type=int, default=100)
@@ -91,10 +85,8 @@ def train_main(argv=None):
 
 
 def _train(args, rank, world, distributed, device):
-    checkpoint = read_checkpoint(args.resume_checkpoint) if args.resume_checkpoint else None
-    restore_control_arguments(args, checkpoint)
     seed_everything(args.seed)
-    run_config = public_arguments(args).copy()
+    run_config = vars(args).copy()
     run_config.update(world_size=world, image_size=IMAGE_SIZE, text_mode="question",
                       freeze_text_encoder=True)
     out = Path(args.output_dir)
@@ -107,12 +99,14 @@ def _train(args, rank, world, distributed, device):
     if getattr(args, "init_checkpoint", None):
         initialize_weights(args.init_checkpoint,model)
     objective = SupervisedObjective()
-    controls = TrainingControls(model, args, checkpoint)
-    parameters = controls.parameters
-    optimizer = controls.optimizer
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    if not parameters:
+        raise ValueError("No trainable parameters")
+    optimizer = torch.optim.Adam(parameters, lr=args.lr)
     scaler = torch.amp.GradScaler("cuda",enabled=device.type=="cuda")
     start = 0
     if args.resume_checkpoint:
+        checkpoint = read_checkpoint(args.resume_checkpoint)
         load_model_weights(model, checkpoint)
         if "optimizer_state_dict" not in checkpoint:
             raise ValueError("Raw model weights have no optimizer state; use --init-checkpoint for a new run")
@@ -133,12 +127,6 @@ def _train(args, rank, world, distributed, device):
     sampler = DistributedSampler(train_set,num_replicas=world,rank=rank,seed=args.seed) if distributed else None
     generator = torch.Generator()
     train_loader = make_loader(train_set,args,args.batch_size//world,sampler,sampler is None,generator)
-    controls.configure_schedule(
-        args.num_epochs,
-        math.ceil(len(train_loader) / getattr(args, "gradient_accumulation_steps", 1)),
-        start,
-    )
-    run_config["optimization_config"] = controls.config
     run_config["experiment_config"] = unwrap(model).experiment_config
     run_config["tiny"] = unwrap(model).experiment_config.get("tiny", False)
     if rank == 0:
@@ -152,8 +140,6 @@ def _train(args, rank, world, distributed, device):
         if sampler:
             sampler.set_epoch(epoch)
         model.train()
-        controls.set_encoder_modes()
-        controls.log_learning_rates(epoch + 1)
         totals = torch.zeros(2,device=device,dtype=torch.float64)
         component_sums = {}
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.num_epochs}",
@@ -167,7 +153,7 @@ def _train(args, rank, world, distributed, device):
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(parameters,1.)
-            controls.step(scaler)
+            scaler.step(optimizer); scaler.update()
             n = len(batch["filename"])
             totals += torch.tensor([loss.detach().item()*n,n],device=device)
             for name,value in components.items():
@@ -188,7 +174,6 @@ def _train(args, rank, world, distributed, device):
                 checkpoint_path = out / f"checkpoint_epoch{epoch + 1}.pt"
                 torch.save({"epoch": epoch + 1,
                             "model_state_dict": unwrap(model).state_dict(),
-                            "training_controls": controls.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
                             "scaler_state_dict": scaler.state_dict(),
                             "experiment_config": unwrap(model).experiment_config,
