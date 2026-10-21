@@ -1,4 +1,8 @@
-import argparse
+from training_options import (
+    TrainingArgumentParser,
+    TrainingControls,
+    restore_control_arguments,
+)
 import os
 import torch
 import torch.distributed as dist
@@ -6,7 +10,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.amp import autocast, GradScaler
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -49,7 +52,7 @@ def cleanup_distributed():
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser()
+    parser = TrainingArgumentParser()
     parser.add_argument("--data-root", type=str, default="data/vizwiz")
     parser.add_argument("--num-epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -62,6 +65,9 @@ def main():
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    checkpoint = torch.load(args.resume_checkpoint, map_location="cpu") if args.resume_checkpoint else None
+    restore_control_arguments(args, checkpoint)
 
     if args.resume_checkpoint is not None and not os.path.isfile(args.resume_checkpoint):
         parser.error(f"Resume checkpoint is not a file: {args.resume_checkpoint}")
@@ -130,6 +136,7 @@ def main():
 
     # --- Model ---
     model = GroundingModel().to(device)
+    controls = TrainingControls(model, args, checkpoint, include_frozen=True)
 
     # SyncBatchNorm: makes per-GPU BatchNorm stats identical to single-GPU
     if is_dist:
@@ -141,7 +148,7 @@ def main():
                 find_unused_parameters=True)
 
     # --- Optimizer / Loss / Scaler ---
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = controls.optimizer
     loss_fn = nn.BCEWithLogitsLoss()
     scaler = GradScaler()
 
@@ -149,7 +156,6 @@ def main():
     start_epoch = 0
 
     if args.resume_checkpoint is not None:
-        checkpoint = torch.load(args.resume_checkpoint, map_location="cpu")
         # Always load into the *unwrapped* model so state-dict keys match
         # regardless of DDP / SyncBN wrapping.
         underlying_model = model.module if is_dist else model
@@ -174,6 +180,8 @@ def main():
         del checkpoint
         torch.cuda.empty_cache()
 
+    controls.configure_schedule(args.num_epochs, len(train_loader), start_epoch)
+
     # --- Log file (rank 0 only) ---
     log_file = None
     log_path = None
@@ -196,6 +204,8 @@ def main():
 
         # ---- Train ----
         model.train()
+        controls.set_encoder_modes()
+        controls.log_learning_rates(epoch + 1)
         train_loss_sum = 0.0
 
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} (Train)", disable=(rank != 0))
@@ -210,8 +220,7 @@ def main():
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            controls.step(scaler)
 
             train_loss_sum += loss.item()
             if rank == 0:
@@ -267,7 +276,8 @@ def main():
             ckpt = {
                 "epoch": epoch + 1,
                 "model_state_dict": underlying_model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
+                "training_controls": controls.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
                 "scaler_state_dict": scaler.state_dict(),
                 "loss": avg_train_loss,
             }
