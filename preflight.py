@@ -1,6 +1,8 @@
 """Short real-backbone forward/backward/DDP check before a full Kaggle run."""
 
 import argparse
+from train import TRAINING_DEFAULTS
+from training_options import TrainingArgumentParser, TrainingControls
 import json
 import os
 import time
@@ -18,7 +20,7 @@ from utils import to_device
 
 
 def checked_step(
-    model, wrapped, objective, batch, optimizer, scaler, device, *, max_scale_retries=8
+    model, wrapped, objective, batch, optimizer, scaler, device, *, max_scale_retries=8, training_controls=None
 ):
     """Require one successful update; let AMP calibrate without hiding broken gradients."""
     world = dist.get_world_size() if dist.is_initialized() else 1
@@ -100,14 +102,17 @@ def checked_step(
             )
             continue
         torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
-        scaler.step(optimizer)
-        scaler.update()
+        if training_controls is None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            training_controls.step(scaler)
         return attempt
     raise AssertionError("Unreachable preflight retry state")
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = TrainingArgumentParser(description=__doc__, recipe_keys=TRAINING_DEFAULTS)
     parser.add_argument("--data-root", required=True)
     parser.add_argument(
         "--batch-size", type=int, default=2, help="Global microbatch size across ranks"
@@ -165,8 +170,9 @@ def main(argv=None):
         loader = make_loader(dataset, args, args.batch_size // world, sampler)
         if args.steps > len(loader):
             raise ValueError("Not enough batches for requested preflight steps")
-        parameters = [p for p in model.parameters() if p.requires_grad]
-        optimizer = torch.optim.Adam(parameters, lr=1e-5)
+        controls = TrainingControls(model, args)
+        controls.configure_schedule(1, args.steps)
+        optimizer = controls.optimizer
         objective = SegmentationObjective(**resolve_training_arguments(args))
         scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
         wrapped = (
@@ -190,6 +196,7 @@ def main(argv=None):
                 optimizer,
                 scaler,
                 device,
+                training_controls=controls,
             )
             if index + 1 == args.steps:
                 break

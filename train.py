@@ -1,6 +1,13 @@
 """Train question-guided native zoom with native-resolution evaluation kept separate."""
 
 import argparse
+from training_options import (
+    TrainingArgumentParser,
+    TrainingControls,
+    recipe_config,
+    public_arguments,
+    restore_control_arguments,
+)
 import hashlib
 import json
 import math
@@ -29,7 +36,7 @@ from utils import (
 
 
 def training_parser():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = TrainingArgumentParser(recipe_keys=TRAINING_DEFAULTS, description=__doc__)
     parser.add_argument("--data-root", default="data/vizwiz")
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--num-epochs", type=int, default=20)
@@ -56,17 +63,13 @@ def training_parser():
     )
     parser.add_argument(
         "--config",
-        help="Optional JSON for segmentation, locator, crop and quality loss weights",
+        help="JSON training options; config overrides CLI options",
     )
     return parser
 
 
 def resolve_training_arguments(args, saved=None):
-    requested = (
-        json.loads(Path(args.config).read_text(encoding="utf-8-sig"))
-        if args.config
-        else {}
-    )
+    requested = recipe_config(args, TRAINING_DEFAULTS)
     if not isinstance(requested, dict) or set(requested) - TRAINING_DEFAULTS.keys():
         raise ValueError("Unknown question-guided-zoom training config keys")
     settings = dict(TRAINING_DEFAULTS)
@@ -157,6 +160,7 @@ def _train(args, rank, world, distributed, device):
     checkpoint = (
         read_checkpoint(args.resume_checkpoint) if args.resume_checkpoint else None
     )
+    restore_control_arguments(args, checkpoint)
     options = checkpoint_model_kwargs(checkpoint) if checkpoint else {}
     settings = resolve_training_arguments(args, checkpoint)
     seed_everything(args.seed)
@@ -185,8 +189,9 @@ def _train(args, rank, world, distributed, device):
         args.data_root, "train", model.image_size, detail_size=model.detail_size
     )
     objective = SegmentationObjective(**settings)
-    parameters = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(parameters, lr=args.lr)
+    controls = TrainingControls(model, args, checkpoint)
+    parameters = controls.parameters
+    optimizer = controls.optimizer
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     start = 0
     if checkpoint:
@@ -215,19 +220,25 @@ def _train(args, rank, world, distributed, device):
     train_loader = make_loader(
         train_set, args, args.batch_size // world, sampler, sampler is None, generator
     )
+    controls.configure_schedule(
+        args.num_epochs,
+        math.ceil(len(train_loader) / getattr(args, "gradient_accumulation_steps", 1)),
+        start,
+    )
     version = EXPERIMENT
     run_config = dict(
-        vars(args),
+        public_arguments(args),
         training_config=settings,
         objective_version=version,
         image_size=unwrap(model).image_size,
         detail_size=unwrap(model).detail_size,
         experiment_config=unwrap(model).experiment_config,
-        freeze_text_encoder=True,
+        freeze_text_encoder=controls.is_encoder_frozen("text"),
         text_mode="question",
         torch_version=str(torch.__version__),
         tiny=unwrap(model).experiment_config["tiny"],
     )
+    run_config["optimization_config"] = controls.config
     run_config.update(
         gradient_clip_norm=1.0,
         gradient_clip_scope="all-trainable",
@@ -238,6 +249,7 @@ def _train(args, rank, world, distributed, device):
         name: hashlib.sha256((source_root / name).read_bytes()).hexdigest()
         for name in (
             "train.py",
+            "training_options.py",
             "models/model.py",
             "models/image_encoder.py",
             "models/text_encoder.py",
@@ -275,6 +287,8 @@ def _train(args, rank, world, distributed, device):
         if sampler:
             sampler.set_epoch(epoch)
         model.train()
+        controls.set_encoder_modes()
+        controls.log_learning_rates(epoch + 1)
         totals = torch.zeros(
             2, device=device, dtype=torch.float64
         )  # (2,): [weighted_loss_sum, sample_count]
@@ -313,8 +327,7 @@ def _train(args, rank, world, distributed, device):
                 torch.nn.utils.clip_grad_norm_(
                     parameters, 1.0, error_if_nonfinite=device.type != "cuda"
                 )
-                scaler.step(optimizer)
-                scaler.update()
+                controls.step(scaler)
                 optimizer.zero_grad(set_to_none=True)
             totals[0] += loss.detach().to(torch.float64) * n
             totals[1] += n
@@ -350,7 +363,8 @@ def _train(args, rank, world, distributed, device):
                     {
                         "epoch": epoch + 1,
                         "model_state_dict": unwrap(model).state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
+                        "training_controls": controls.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
                         "scaler_state_dict": scaler.state_dict(),
                         "experiment_config": unwrap(model).experiment_config,
                         "run_config": run_config,
