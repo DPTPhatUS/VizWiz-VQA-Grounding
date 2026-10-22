@@ -2,6 +2,8 @@
 
 This branch trains a compact grounding model with a high-resolution crop refiner and an expected-IoU-gain router. Inputs and evaluation use only the question. The coarse model stays frozen; the refiner is also frozen while training the router.
 
+The compact model explicitly freezes its CLIP text encoder, matching grounding-controls. During gain-guided training the entire coarse model is already frozen, so this does not change refiner/router optimization. To use a coarse model trained with text frozen from the beginning, initialize from a grounding-controls run trained with that setting.
+
 The coarse decoder now receives cross-attention output directly, matching grounding-controls with residual fusion removed. Initialize from a controls checkpoint trained with that architecture. Older coarse or gain-guided checkpoints containing `residual_scale` are incompatible with this version. The crop refiner still predicts additive mask corrections; that is separate from the removed encoder fusion.
 
 Install the project dependencies, or keep your notebook's Torch/Torchvision installation and install `transformers tqdm pillow numpy`. Run from this branch with a VizWiz root containing `<split>_grounding.json`, `<split>/` images, and `binary_masks_png/<split>/` masks.

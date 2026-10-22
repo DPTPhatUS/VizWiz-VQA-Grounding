@@ -13,7 +13,7 @@ class CompactGroundingModel(nn.Module):
     def __init__(self, tiny=False):
         super().__init__()
         self.image_encoder = TinyVision() if tiny else ImageEncoder()
-        self.text_encoder = TextEncoder(tiny)
+        self.text_encoder = TextEncoder(tiny).requires_grad_(False)
         self.visual_dim = self.image_encoder.out_channels
         self.text_dim = self.text_encoder.output_dim
         self.text_proj = nn.Linear(self.text_dim, self.visual_dim)
