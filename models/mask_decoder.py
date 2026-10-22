@@ -116,6 +116,7 @@ class DetailDecoder(nn.Module):
         )
         self.mask_head = nn.Conv2d(channels[-1], 1, 1)
         self.output_channels = channels[-1]
+        self.stage96_channels = channels[1]
 
     def forward(
         self,
@@ -124,22 +125,27 @@ class DetailDecoder(nn.Module):
         detail: tuple[Tensor, ...],
         detail_question: Tensor,
         run_block,
-    ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
+    ) -> tuple[Tensor, Tensor, dict[str, Tensor], Tensor]:
         s1, s2, s3, bottleneck = features
         x = self.bottleneck(bottleneck)
         for skip, block in zip(self.skips((s3, s2, s1), question), self.skip_fusion):
             x = x + block(x + skip)
         auxiliary = {}
+        region = None
         for index, (block, fusion, local) in enumerate(
             zip(self.upsample, self.detail_fusion, detail[:4])
         ):
             x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
             x = run_block(block, x)
             x = run_block(fusion, x, local, detail_question)
+            if index == 1:
+                region = x
             if self.training and index in (1, 2):
                 name = "96" if index == 1 else "192"
                 auxiliary[name] = self.auxiliary_heads[name](x)
         logits = self.mask_head(x)
         if self.training:
             auxiliary["384"] = logits
-        return logits, x, auxiliary
+        if region is None:
+            raise RuntimeError("Decoder did not produce its second-stage feature")
+        return logits, x, auxiliary, region

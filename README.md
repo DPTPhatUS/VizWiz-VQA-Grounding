@@ -1,280 +1,168 @@
-# Question-guided high-resolution detail pyramid
+# Question-guided scope correction
 
-Branch: `exp/question-guided-detail-pyramid`, created from
-`exp/spatial-detail-decoder` at `63977d2`. This is a new experiment requiring
-fresh training from pretrained CLIP, not a checkpoint-compatible refactor.
+This experiment adds a **79,803-parameter** scope verifier and edit evaluator to
+a trained `exp/question-guided-detail-pyramid` checkpoint. The complete parent
+predictor stays frozen, including its CNN, decoder, FiLM, encoders and refiner.
+There is one shared CLIP image/text pass. Inputs are image + question in both
+training and inference; no answer or extra annotation is required.
 
-The hypothesis is that high-resolution local features, question-conditioned
-fusion, and signed mask refinement can improve small-region precision. The
-implementation and synthetic checks do not establish an accuracy improvement.
+The verifier predicts removal probability `e`. The candidate is
+`p1 = sigmoid(Z0) * (1-e)`, evaluated through stable logits without probability
+clamping. It can remove interior false positives anywhere, but cannot recover
+missing foreground. The evaluator estimates whole-mask IoU gain and the fraction
+of the parent's true positives destroyed. It compares retained/removed features,
+question features, and spatial mask descriptors. Its inputs are detached from the
+verifier. Selection returns the original logits **exactly** unless both checks pass.
+An incorrect selection can still hurt accuracy; preservation is an experimental
+question, not a guarantee.
 
-## Architecture
-
-```text
-Original upright RGB image
-  +-- resize 336 --> CLIP vision --> image/text cross-attention + visual residual
-  |                                      |
-  |                 3 CLIP skips: 1024 -> 256/GN/GELU -> Q-FiLM -> 128
-  |                                      |
-  |                           three skip fusions at 24x24
-  |                                      |
-  |                         standard-conv upsampling stages
-  |                               48 -> 96 -> 192 -> 384
-  |                                ^     ^      ^      ^
-  +-- resize 768 --> CNN encoder --> top-down detail pyramid, 16 channels
-                                  48 -> 96 -> 192 -> 384 -> 768
-                                                         |
-  Question --> frozen CLIP text --> pooled Q --> spatial guidance at all stages
-                                                         |
-  Decoder feature + logits384 + detail768 + projected Q --> residual refiner
-                                                         |
-                        logits768 = resize(logits384) + signed correction
+```mermaid
+flowchart LR
+    IQ[Image + Q] --> P[Frozen trained pyramid]
+    P --> Z[Original logits Z0]
+    P --> F[Semantic/detail features and Q tokens]
+    F --> V[Scope verifier]
+    Z --> V
+    V --> C[Candidate p1 = p0 times 1-e]
+    F --> E[Edit evaluator]
+    Z --> E
+    C --> E
+    Z --> S[Select original or candidate]
+    C --> S
+    E --> S
+    S --> O[Resize logits to original size, then threshold]
 ```
 
-* Both RGB views come directly from the same original image, in `[0,1]`. The
-  model applies CLIP mean/std to both. No crop/flip/color augmentation is added.
-  Aspect ratios are warped to squares, as in the parent CLIP experiments.
-* CLIP is `openai/clip-vit-large-patch14-336`. Text is frozen and kept in eval
-  mode. Vision is trainable except pooled-CLS `post_layernorm`, which patch
-  grounding does not use. Its checkpoint keys are retained.
-* Vision skips are hidden states 4/7/9. They and the final bottleneck have shape
-  `(B,1024,24,24)`. Each skip has its own nonlinear compression and FiLM head;
-  Q reduction is shared. FiLM heads start at zero (identity modulation).
-* Decoder channels are `128 -> 64 -> 32 -> 16 -> 16`. Every upsampling block is
-  bilinear resize followed by **one standard 3x3 convolution**, GroupNorm and
-  GELU. CLIP skip-fusion and detail-fusion blocks remain depthwise separable.
-* CNN encoder channels at `768/384/192/96/48` are `8/16/32/64/128`. Each level
-  has two standard 3x3/GN/GELU blocks. Max pooling downsamples. Top-down pyramid
-  levels use 1x1 lateral projection, addition and 3x3/GN/GELU smoothing.
-* Each spatial guide is a nonlinear function of semantic features, 16-channel
-  detail features and 16-channel projected Q. Fusion adds a residual whose
-  scalar starts at zero. The refiner reads 41 concatenated channels, reduces
-  to 16 with a standard 3x3 block, then predicts a one-channel correction.
-  The final correction head starts at zero, so initial logits768 exactly match
-  bilinear-resized logits384. Refinement is not restricted to a thresholded mask.
-* Mask heads at 96/192 are training-only; the 384 mask feeds the refiner. Only
-  final 768 logits are exported for evaluation. There is no latent answer,
-  teacher, oracle view, answer reader, or GT answer input on this branch.
+## Setup and train
 
-The implemented non-backbone parameter count is **6,649,101**, including text
-projection and cross-attention. This differs from the earlier 6.09M sketch
-because skip conditioning, Q-guided detail fusion and auxiliary heads changed.
-
-## Objective
-
-The default is `BCE + 0.5 * soft Dice` for each head:
-
-```text
-L = L768 + 0.3 * L384 + 0.2 * L192 + 0.1 * L96
-```
-
-Main targets are nearest-neighbor binary masks at 768. Auxiliary targets use
-area interpolation from this target to preserve fractional coverage of tiny
-regions. This cannot recover an object already lost during the native-to-768
-mask conversion. Loss calculations accumulate in float32 under CUDA FP16 AMP.
-Weights above are initial experimental settings, not tuned coefficients.
-
-Optional `--config` JSON (all defaults shown):
-
-```json
-{
-  "overlap_loss": "dice",
-  "overlap_weight": 0.5,
-  "fp_weight": 0.7,
-  "aux96_weight": 0.1,
-  "aux192_weight": 0.2,
-  "aux384_weight": 0.3
-}
-```
-
-`fp_weight` is used only by `overlap_loss="tversky"`: its denominator is
-`TP + fp_weight*FP + (1-fp_weight)*FN + 1`, with numerator `TP + 1`.
-This is an optional separate ablation, not enabled in the default Dice run.
-Zero auxiliary weights retain zero-valued graph dependencies for DDP.
-
-## Kaggle setup and 20-epoch run
-
-Enable Internet and two T4 GPUs. Clone the branch, change into the repository,
-and install the locked environment before launching multiple processes:
+Use Python 3.12+ and the repository's locked environment:
 
 ```bash
-git clone --single-branch --branch exp/question-guided-detail-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
-cd VizWiz-VQA-Grounding
 uv sync --frozen
-```
-
-With `DATA_ROOT` pointing at the VizWiz folder, run the short real-backbone check:
-
-```bash
 uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
-  --data-root "$DATA_ROOT" --batch-size 2 --num-workers 0 --steps 3 \
-  --gradient-checkpointing
-```
+    --data-root /path/to/vizwiz \
+    --init-parent-checkpoint /path/to/pyramid/checkpoint_epoch20.pt \
+    --batch-size 4 --num-workers 0 --steps 3 --lr 0.0001
 
-This checks real input shapes, several backward iterations, frozen/trainable
-gradients, AMP and DDP; it writes no checkpoints or training history. CPU checks
-cannot replace this GPU check. It does not establish accuracy or full-session runtime.
-Initial FP16 gradient overflow is handled by GradScaler backoff and a retry of
-the same batch (at most eight scale reductions per batch). Backoff events are
-printed and do not count as successful updates. Missing gradients, nonfinite
-forward loss, FP32 nonfinite gradients or persistent overflow still fail.
-
-```bash
 uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
-  --data-root "$DATA_ROOT" \
-  --output-dir outputs \
-  --num-epochs 20 \
-  --batch-size 2 \
-  --gradient-accumulation-steps 2 \
-  --gradient-checkpointing \
-  --num-workers 2 \
-  --lr 0.00001 \
-  --seed 42 \
-  --save-every 10
+    --data-root /path/to/vizwiz \
+    --init-parent-checkpoint /path/to/pyramid/checkpoint_epoch20.pt \
+    --output-dir outputs --num-epochs 20 --save-every 10 \
+    --batch-size 4 --gradient-accumulation-steps 1 --num-workers 2 \
+    --optimizer adamw --lr 0.0001 --weight-decay 0.01 \
+    --lr-scheduler none --warmup-ratio 0 --seed 42
 ```
 
-Batch size is **global microbatch**: one image/GPU here. Accumulation gives
-effective global batch 4, including correct sample weighting in the final
-partial window. If memory permits, `--batch-size 4` with accumulation 1 also
-gives effective batch 4. Memory/runtime have not been measured on Kaggle T4.
+The optimization values above are an initial experiment setting, not a validated
+optimum. `--batch-size` is the **global microbatch across all ranks**: 4 on two
+GPUs means 2 images per GPU. Effective batch is global batch times accumulation.
+The frozen parent does not retain a backward graph. `--gradient-checkpointing`
+optionally recomputes only the trainable scope decoder blocks. Verify real T4
+memory/AMP using preflight; local CPU checks do not establish GPU execution.
 
-Adam, no weight decay or LR scheduler, clipping at global norm 1, CUDA FP16
-GradScaler, deterministic epoch-keyed seeding and sampler shuffling follow the
-simple existing trainer. Activation checkpointing uses nonreentrant recomputation;
-it changes memory/time, not the intended forward computation. No per-epoch
-validation is run. Output collisions fail rather than overwrite another run.
+This is **20 additional epochs training the correction modules around an already
+trained parent**, not a fresh end-to-end 20-epoch baseline. Account for parent
+training when comparing total training cost. Training loads only `train`, with
+no automatic validation. Evaluate saved epochs separately.
 
-Full checkpoints are `outputs/checkpoint_epoch10.pt` and `checkpoint_epoch20.pt`.
-Raw final weights are also saved. Full checkpoints include optimizer/scaler,
-resolved config, architecture, source hashes and environment version. Resume
-with `--resume-checkpoint` from this experiment only; `--num-epochs` is the
-total target epoch. Batch/accumulation/LR/seed/world size must match.
+## Settings
 
-## Evaluate and diagnose
+| Option | Default / purpose |
+|---|---|
+| `--init-parent-checkpoint` | Required for a new run; strict pyramid initialization |
+| `--resume-checkpoint` | Full checkpoint of this experiment; mutually exclusive with initialization |
+| `--num-epochs` | `20`; final total corrector epoch when resuming |
+| `--batch-size` | `4`, global microbatch |
+| `--gradient-accumulation-steps` | `1` |
+| `--lr` | `0.0001` for the new heads |
+| `--optimizer` | `adam` default; `adamw` also supported |
+| `--weight-decay` | `0` default; biases/norm vectors excluded from decay |
+| `--lr-scheduler` | `none` default; `cosine`, `linear`, `poly` |
+| `--warmup-ratio`, `--min-lr-ratio`, `--poly-power` | `0`, `0.1`, `0.9` |
+| `--gain-margin` | `0.01`: require predicted improvement >1 IoU percentage point |
+| `--max-damage` | `0.02`: require predicted destroyed-TP fraction <2% |
+| `--save-every` | `10`; periodic resumable checkpoints plus final raw weights |
+| `--seed`, `--num-workers` | `42`, `2` |
+| `--config` | Optional flat JSON; **JSON > explicit CLI > defaults** |
 
-Run each evaluation with one process. Both views are reconstructed from the
-original image, and logits are resized to native GT size **before** thresholding.
-The metric is mean per-image foreground IoU, not foreground/background class mIoU.
+Encoder-freezing options remain accepted for CLI consistency, but unfreezing is
+rejected: this experiment requires a fixed parent. `--backbone-lr` has no effect
+while all parent parameters are frozen. Selection thresholds are saved with the
+model; resume cannot silently change them. Do not choose thresholds/checkpoints
+from test scores.
 
-```bash
-uv run --frozen python eval.py \
-  --checkpoint outputs/checkpoint_epoch20.pt --dataset val \
-  --data-root "$DATA_ROOT" --output-dir outputs/eval_val_ep20 \
-  --batch-size 1 --num-workers 2 --device cuda
-
-uv run --frozen python diagnose.py \
-  --predictions outputs/eval_val_ep20 --data-root "$DATA_ROOT" \
-  --output-dir outputs/diagnostic_ep20
-```
-
-Repeat evaluation for epoch10 and for test if native test GT masks are available.
-Select checkpoints/hyperparameters by validation, never by the test results.
-Diagnostic reads exported masks on CPU, verifies each mask against stored IoU,
-and reports native precision/recall, predicted/GT area ratio and size groups.
-Evaluation/diagnostic output directories must be new or empty.
-
-Personal notebook instructions and local tests remain under ignored `personal/`.
-Older answer-latent probes/checkpoints belong to their original branches.
-
-## Encoder freezing and optimization
-
-Omitting the options below preserves this branch's existing training behavior:
-Adam, LR `1e-5`, zero weight decay, no LR schedule, and the branch's original
-encoder freezing policy. Freezing is opt-in; the detail CNN and decoder remain
-trainable. No model/state-dict keys or evaluation preprocessing change.
-
-| Option | Values / default |
-| --- | --- |
-| `--freeze-backbone [BOOL]` | Set both pretrained encoders; omitted preserves existing policy |
-| `--freeze-vision-encoder [BOOL]` | Set vision encoder only |
-| `--freeze-text-encoder [BOOL]` | Set text encoder only |
-| `--optimizer` | `adam` (default), `adamw` |
-| `--lr` | Main learning rate; default `0.00001` |
-| `--backbone-lr` | Optional separate LR for unfrozen encoders; default uses `--lr` |
-| `--weight-decay` | Nonnegative; default `0`. Biases, norm vectors and token/position embeddings receive no decay when parameter groups are enabled |
-| `--lr-scheduler` | `none` (default), `cosine`, `linear`, `poly` |
-| `--warmup-ratio` | Fraction of planned optimizer updates, in `[0, 1)`; default `0` |
-| `--min-lr-ratio` | Final LR / starting LR for decay schedules; default `0.1` |
-| `--poly-power` | Positive exponent for `poly`; default `0.9` |
-| `--config` | Flat JSON with training options; optional |
-
-`BOOL` accepts `True` or `False`; a freeze flag without a value means `True`.
-The aliases `--no-freeze-backbone`, `--no-freeze-vision-encoder`, and
-`--no-freeze-text-encoder` mean `False`. An explicit component setting overrides
-`freeze_backbone` within the same source. **JSON config > explicit CLI > branch
-defaults**: a config shorthand also overrides component flags on the CLI.
-Existing recipe/loss settings can share the same JSON; unsupported keys fail
-early. Existing branch-specific flags remain available through `train.py --help`.
-
-Append, for example, to this branch's existing training command:
-
-```bash
---freeze-backbone True \
---optimizer adamw \
---lr 0.0001 \
---weight-decay 0.01 \
---lr-scheduler cosine \
---warmup-ratio 0.05 \
---min-lr-ratio 0.1
-```
-
-This is a configurable experiment example, not a validated best hyperparameter
-setting. To freeze only vision while retaining the text policy, append
-`--freeze-vision-encoder True`. To explicitly train both encoders, use
-`--freeze-backbone False`. Models with a deliberately fixed reference stage
-(gain-guided refinement) reject encoder unfreezing to preserve that algorithm.
-Unused CLIP/SigLIP pooled-output parameters stay frozen when unfreezing token encoders.
-
-Equivalent JSON (`--config path/to/train.json`):
+Example JSON, shared with preflight and train:
 
 ```json
 {
-  "freeze_backbone": true,
   "optimizer": "adamw",
   "lr": 0.0001,
   "weight_decay": 0.01,
-  "lr_scheduler": "cosine",
-  "warmup_ratio": 0.05,
-  "min_lr_ratio": 0.1
+  "lr_scheduler": "none",
+  "removal_weight": 1.0,
+  "retention_weight": 2.0,
+  "segmentation_weight": 0.5,
+  "gain_weight": 1.0,
+  "damage_weight": 0.2,
+  "corruption_weight": 0.5,
+  "corruption_probability": 0.5,
+  "gain_margin": 0.01,
+  "max_damage": 0.02
 }
 ```
 
-Frozen encoders stay in eval mode during training and are excluded from the
-optimizer when a freezing option is set. LR schedules advance after successful
-optimizer updates, including gradient accumulation; AMP overflow skips do not
-advance them. Checkpoints save the resolved optimization settings, trainable
-parameter layout and schedule progress. Resume restores these settings and
-rejects conflicting options. For scheduled runs, keep the original total
-`--num-epochs`, loader length and accumulation so the LR trajectory is unchanged.
+Removal and retention BCE terms are normalized separately per image; an empty
+pixel set contributes zero. Candidate segmentation is BCE + 0.5 Dice at768.
+Gain uses Smooth-L1 (`beta=0.05`); damage uses BCE with a fractional target.
+Both evaluator targets use **native-resolution logits/GT** in dataset training.
+The selected hard route does not gate training gradients.
 
-Old checkpoints still load for evaluation with the same architecture and
-weights. Full legacy resume keeps its original optimizer layout and constant
-LR behavior; changing freezing, optimizer, decay or enabling a new LR schedule
-requires a new run (or an explicit weights-only initialization where supported).
-Resume retains each branch's existing RNG/data-order policy; legacy branches
-that do not save or reconstruct RNG state do not guarantee bitwise replay.
-No freezing/optimization change retroactively changes a previously trained
-checkpoint or its reported results.
+An auxiliary training view adds over-coverage to the source mask, using either
+dilated GT (radius16 at768) or its 1.5x bounding envelope, with foreground logit4.
+Each image is corrupted with probability0.5; the view's loss weight is0.5 and
+the two view losses are normalized by `1+weight`. This is synthetic train-only
+supervision, never the inference view. Set `corruption_weight=0` to disable it.
+The parent RGB views, normalization and masks remain as in the parent experiment.
 
-## Foreground global IoU
-
-The existing evaluation command now writes both metrics to `metrics.json`
-under `summary`, using the final native-resolution binary predictions:
-
-- `mean_iou`: arithmetic mean of per-image foreground IoUs; each image has equal weight.
-- `global_iou`: sum of all foreground intersections divided by sum of all foreground unions across the evaluated split. This is not foreground/background class-averaged IoU.
-- `total_intersection` and `total_union`: exact integer pixel counts for auditing.
-
-Values are fractions in `[0, 1]`; multiply by 100 for percentages. Logits are
-restored to each original image size before thresholding at zero. Empty-union
-IoU is one. No training, checkpoint, inference or threshold change is required.
-
-`diagnose.py` also reports global IoU in `overall` and `by_gt_area` in its
-`summary.json`. It computes counts from exported PNG masks and original GT,
-so existing validation predictions can be analyzed on CPU without rerunning
-the model (use a new diagnostic output directory):
+## Evaluate and diagnose
 
 ```bash
-uv run diagnose.py --predictions outputs/eval_val_ep20 \
-    --data-root /path/to/vizwiz --output-dir outputs/diagnostic_global_iou_ep20
+uv run --frozen eval.py --checkpoint outputs/checkpoint_epoch20.pt \
+    --data-root /path/to/vizwiz --dataset val --batch-size 4 \
+    --num-workers 2 --output-dir outputs/eval_val_ep20
+uv run --frozen diagnose.py --predictions outputs/eval_val_ep20 \
+    --data-root /path/to/vizwiz --output-dir outputs/diagnostic_ep20
+uv run --frozen diagnose_scope.py --predictions outputs/eval_val_ep20 \
+    --output-dir outputs/scope_diagnostic_ep20
 ```
+
+One evaluation forward produces **parent, raw candidate and selected** scores.
+Exported PNGs are selected masks. `metrics.json` also contains per-image native
+IoUs/global IoUs for the parent/candidate, selection decisions, gains and damage.
+`diagnose_scope.py` reports paired changes by GT area, harmful selections and
+large losses to initially good masks. GT grouping never chooses inference routes.
+Use `--dataset test` only for reporting after development decisions; the existing
+evaluator expects local GT masks to calculate metrics.
+
+Metrics use bilinear logit resizing to original resolution **before** threshold0.
+`mean_iou` is mean per-image foreground IoU. `global_iou` is sum intersection /
+sum union over native pixels. Empty-union IoU is1. Do not compare these metrics
+interchangeably.
+
+## Checkpoints and files
+
+New runs strictly load compatible raw/full pyramid weights; other experiment
+checkpoints are rejected. Parent checkpoints are not scope checkpoints. The new
+checkpoint embeds parent weights, head weights, selection policy, initialization
+SHA256, resolved run/loss/optimizer settings and source hashes. Resume restores
+optimizer/scaler/schedule state and epoch-keyed data/RNG order; retain the same
+seed, batch, accumulation and world size. A scheduled run must retain its total
+update budget. Original pyramid checkpoints/files are not overwritten.
+
+- `models/pyramid.py`: original parent, exposing detached reuse features.
+- `models/scope_correction.py`: verifier, evaluator, stable composition and train corruption.
+- `models/model.py`: frozen parent + correction/select forward flow.
+- `losses.py`: explicit removal, retention, candidate and evaluator objectives.
+- `eval.py`, `metrics.py`, `diagnose_scope.py`: native paired evaluation.
+
+No VizWiz accuracy claim is established by the implementation or synthetic tests.

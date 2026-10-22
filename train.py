@@ -1,13 +1,6 @@
-"""Train the question-guided detail pyramid with native-resolution evaluation kept separate."""
+"""Train scope correction around a fixed, explicitly initialized pyramid checkpoint."""
 
 import argparse
-from training_options import (
-    TrainingArgumentParser,
-    TrainingControls,
-    recipe_config,
-    public_arguments,
-    restore_control_arguments,
-)
 import hashlib
 import json
 import math
@@ -26,9 +19,18 @@ from tqdm.auto import tqdm
 from dataset import VizWizGroundingDataset, make_loader
 from losses import TRAINING_DEFAULTS, SegmentationObjective
 from models.model import EXPERIMENT, GroundingModel
+from training_options import (
+    TrainingArgumentParser,
+    TrainingControls,
+    public_arguments,
+    recipe_config,
+    restore_control_arguments,
+)
 from utils import (
     checkpoint_model_kwargs,
+    initialize_parent,
     load_model_weights,
+    parent_model_kwargs,
     read_checkpoint,
     save_checkpoint,
     to_device,
@@ -47,7 +49,7 @@ def training_parser():
         help="Global microbatch size across ranks before accumulation",
     )
     parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -55,15 +57,31 @@ def training_parser():
         "--gradient-checkpointing",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Recompute vision/CNN/decoder activations to reduce memory",
+        help="Recompute trainable scope decoder blocks to reduce memory",
     )
     parser.add_argument(
         "--resume-checkpoint",
-        help="Full checkpoint from this detail-pyramid experiment",
+        help="Full checkpoint from this scope-correction experiment",
+    )
+    parser.add_argument(
+        "--init-parent-checkpoint",
+        help="Trained pyramid checkpoint; required for a new run",
+    )
+    parser.add_argument(
+        "--gain-margin",
+        type=float,
+        default=None,
+        help="Minimum predicted IoU gain, default 0.01",
+    )
+    parser.add_argument(
+        "--max-damage",
+        type=float,
+        default=None,
+        help="Maximum predicted TP damage, default 0.02",
     )
     parser.add_argument(
         "--config",
-        help="Optional JSON for overlap loss and auxiliary supervision weights",
+        help="Optional JSON: loss, optimizer and selection settings; JSON overrides CLI",
     )
     return parser
 
@@ -71,12 +89,12 @@ def training_parser():
 def resolve_training_arguments(args, saved=None):
     requested = recipe_config(args, TRAINING_DEFAULTS)
     if not isinstance(requested, dict) or set(requested) - TRAINING_DEFAULTS.keys():
-        raise ValueError("Unknown detail-pyramid training config keys")
+        raise ValueError("Unknown scope-correction training config keys")
     settings = dict(TRAINING_DEFAULTS)
     if saved is not None:
         run = saved["run_config"]
         if run.get("objective_version") != EXPERIMENT:
-            raise ValueError("Resume requires the same detail-pyramid objective")
+            raise ValueError("Resume requires the same scope-correction objective")
         settings.update(run["training_config"])
         if any(settings[key] != value for key, value in requested.items()):
             raise ValueError("Resume loss configuration differs from checkpoint")
@@ -108,9 +126,45 @@ def check_arguments(args):
         raise ValueError("Invalid epoch, batch, save interval or worker count")
     if not math.isfinite(args.lr) or args.lr <= 0:
         raise ValueError("Learning rate must be finite and positive")
-    for key in ("config", "resume_checkpoint"):
+    for key in ("config", "resume_checkpoint", "init_parent_checkpoint"):
         if getattr(args, key) and not Path(getattr(args, key)).is_file():
             raise ValueError(f"{key} does not exist")
+    if bool(args.resume_checkpoint) == bool(args.init_parent_checkpoint):
+        raise ValueError(
+            "Choose exactly one of --init-parent-checkpoint or --resume-checkpoint"
+        )
+
+
+def initialize_training_model(args, checkpoint=None):
+    """A new corrector requires a trained anchor; resume embeds its own anchor."""
+    if checkpoint is not None:
+        options = checkpoint_model_kwargs(checkpoint)
+        for name in ("gain_margin", "max_damage"):
+            value = getattr(args, name, None)
+            if value is not None and value != options[name]:
+                raise ValueError(f"Resume {name} differs from checkpoint")
+        model = GroundingModel(
+            **options, gradient_checkpointing=args.gradient_checkpointing
+        )
+        load_model_weights(model, checkpoint)
+        return model, checkpoint["run_config"]["initialization"]
+    parent = read_checkpoint(args.init_parent_checkpoint)
+    options = parent_model_kwargs(parent)
+    for name in ("gain_margin", "max_damage"):
+        if getattr(args, name, None) is not None:
+            options[name] = getattr(args, name)
+    model = GroundingModel(
+        **options, gradient_checkpointing=args.gradient_checkpointing
+    )
+    initialize_parent(model, parent)
+    with Path(args.init_parent_checkpoint).open("rb") as handle:
+        digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    return model, {
+        "parent_checkpoint": str(args.init_parent_checkpoint),
+        "parent_sha256": digest,
+        "parent_epoch": parent.get("epoch"),
+        "parent_run_config": parent.get("run_config", {}),
+    }
 
 
 def seed_everything(seed):
@@ -161,7 +215,6 @@ def _train(args, rank, world, distributed, device):
         read_checkpoint(args.resume_checkpoint) if args.resume_checkpoint else None
     )
     restore_control_arguments(args, checkpoint)
-    options = checkpoint_model_kwargs(checkpoint) if checkpoint else {}
     settings = resolve_training_arguments(args, checkpoint)
     seed_everything(args.seed)
     out = Path(args.output_dir)
@@ -182,12 +235,19 @@ def _train(args, rank, world, distributed, device):
         out.mkdir(parents=True, exist_ok=True)
     if distributed:
         dist.barrier()
-    model = GroundingModel(
-        **options, gradient_checkpointing=args.gradient_checkpointing
-    ).to(device)
+    model, initialization = initialize_training_model(args, checkpoint)
+    model = model.to(device)
     train_set = VizWizGroundingDataset(
         args.data_root, "train", model.image_size, detail_size=model.detail_size
     )
+    annotation_sha256 = hashlib.sha256(
+        (Path(args.data_root) / "train_grounding.json").read_bytes()
+    ).hexdigest()
+    if (
+        checkpoint
+        and checkpoint["run_config"].get("train_annotation_sha256") != annotation_sha256
+    ):
+        raise ValueError("Resume training annotations differ from checkpoint")
     objective = SegmentationObjective(**settings)
     controls = TrainingControls(model, args, checkpoint)
     parameters = controls.parameters
@@ -195,7 +255,6 @@ def _train(args, rank, world, distributed, device):
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     start = 0
     if checkpoint:
-        load_model_weights(model, checkpoint)
         if "optimizer_state_dict" not in checkpoint:
             raise ValueError("Resume needs a full checkpoint with optimizer state")
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -237,6 +296,8 @@ def _train(args, rank, world, distributed, device):
         text_mode="question",
         torch_version=str(torch.__version__),
         tiny=unwrap(model).experiment_config["tiny"],
+        initialization=initialization,
+        train_annotation_sha256=annotation_sha256,
     )
     run_config["optimization_config"] = controls.config
     run_config.update(
@@ -251,6 +312,8 @@ def _train(args, rank, world, distributed, device):
             "train.py",
             "training_options.py",
             "models/model.py",
+            "models/pyramid.py",
+            "models/scope_correction.py",
             "models/image_encoder.py",
             "models/text_encoder.py",
             "models/detail_pyramid.py",
@@ -262,6 +325,7 @@ def _train(args, rank, world, distributed, device):
         )
     }
     if rank == 0:
+        (out / "run_config.json").write_text(json.dumps(run_config, indent=2))
         print(
             json.dumps(
                 {
@@ -363,7 +427,7 @@ def _train(args, rank, world, distributed, device):
                         "epoch": epoch + 1,
                         "model_state_dict": unwrap(model).state_dict(),
                         "training_controls": controls.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
                         "scaler_state_dict": scaler.state_dict(),
                         "experiment_config": unwrap(model).experiment_config,
                         "run_config": run_config,

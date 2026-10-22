@@ -44,8 +44,16 @@ def eval_main(argv=None):
     if out.exists() and any(out.iterdir()):
         raise ValueError("Evaluation output must be a new or empty directory")
     out.mkdir(parents=True, exist_ok=True)
-    pixel_totals = {}
-    scores = evaluate(model, loader, device, out, pixel_totals=pixel_totals)
+    pixel_totals, views, scope = {}, {}, {}
+    scores = evaluate(
+        model,
+        loader,
+        device,
+        out,
+        pixel_totals=pixel_totals,
+        view_results=views,
+        scope_diagnostics=scope,
+    )
     summary = {
         **global_iou_summary(pixel_totals),
         "num_samples": len(scores),
@@ -62,8 +70,33 @@ def eval_main(argv=None):
         "threshold_logit": 0,
         "empty_union_iou": 1,
     }
+    for result in views.values():
+        values = result["per_sample"]
+        result["summary"] = {
+            **global_iou_summary(result.pop("pixel_totals")),
+            "mean_iou": sum(values.values()) / len(values),
+            "num_samples": len(values),
+        }
+    summary["selection_fraction"] = sum(
+        row["selected"] for row in scope.values()
+    ) / len(scope)
+    summary["parent_mean_iou"] = views["parent"]["summary"]["mean_iou"]
+    summary["candidate_mean_iou"] = views["candidate"]["summary"]["mean_iou"]
+    for name, row in scope.items():
+        row["candidate_gain"] = (
+            views["candidate"]["per_sample"][name] - views["parent"]["per_sample"][name]
+        )
+        row["selected_gain"] = scores[name] - views["parent"]["per_sample"][name]
     (out / "metrics.json").write_text(
-        json.dumps({"summary": summary, "per_sample": scores}, indent=2)
+        json.dumps(
+            {
+                "summary": summary,
+                "per_sample": scores,
+                "views": views,
+                "scope_diagnostics": scope,
+            },
+            indent=2,
+        )
     )
     print(json.dumps(summary), flush=True)
 

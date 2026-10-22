@@ -1,105 +1,178 @@
-"""Float32 segmentation losses with area-preserving auxiliary supervision."""
+"""Per-image deletion/retention supervision and detached whole-mask edit targets."""
 
 import math
 
 import torch
+from torch import Tensor
 from torch.nn import functional as F
 
+from models.scope_correction import ScopePrediction
+
 TRAINING_DEFAULTS = {
-    "overlap_loss": "dice",
-    "overlap_weight": 0.5,
-    "fp_weight": 0.7,
-    "aux96_weight": 0.1,
-    "aux192_weight": 0.2,
-    "aux384_weight": 0.3,
+    "removal_weight": 1.0,
+    "retention_weight": 2.0,
+    "segmentation_weight": 0.5,
+    "gain_weight": 1.0,
+    "damage_weight": 0.2,
+    "corruption_weight": 0.5,
+    "corruption_probability": 0.5,
 }
 
 
-def resize_logits(logits, target):
+def resize_logits(logits: Tensor, target: Tensor) -> Tensor:
     return F.interpolate(
         logits.float(), size=target.shape[-2:], mode="bilinear", align_corners=False
     )
 
 
-def per_image_iou(logits, target):
+def per_image_iou(logits: Tensor, target: Tensor) -> Tensor:
     prediction, truth = resize_logits(logits, target) > 0, target > 0.5
     axes = tuple(range(1, truth.ndim))
-    intersection = (prediction & truth).sum(axes).float()
-    union = (prediction | truth).sum(axes).float()
+    intersection, union = (
+        (prediction & truth).sum(axes).float(),
+        (prediction | truth).sum(axes).float(),
+    )
     return torch.where(
         union > 0, intersection / union.clamp_min(1), torch.ones_like(union)
     )
 
 
-def segmentation_loss(
-    logits, target, *, overlap_loss="dice", overlap_weight=0.5, fp_weight=0.7
-):
-    """Per-image overlap averaged over batch, alongside mean pixel BCE."""
+def masked_per_image_mean(values: Tensor, mask: Tensor) -> Tensor:
+    axes = tuple(range(1, values.ndim))
+    # Empty pixel sets contribute zero for that image, preserving DDP sample weighting.
+    return (values * mask).sum(axes) / mask.sum(axes).clamp_min(1)
+
+
+def segmentation_loss(logits: Tensor, target: Tensor) -> Tensor:
     logits, target = logits.float(), target.float()
     bce = F.binary_cross_entropy_with_logits(logits, target)
     probability = logits.sigmoid()
     axes = tuple(range(1, target.ndim))
-    tp = (probability * target).sum(axes)
-    fp = (probability * (1 - target)).sum(axes)
-    fn = ((1 - probability) * target).sum(axes)
-    if overlap_loss == "dice":
-        score = (2 * tp + 1) / (2 * tp + fp + fn + 1)
-    elif overlap_loss == "tversky":
-        score = (tp + 1) / (tp + fp_weight * fp + (1 - fp_weight) * fn + 1)
-    else:
-        raise ValueError("overlap_loss must be dice or tversky")
-    return bce + overlap_weight * (1 - score).mean()
+    score = (2 * (probability * target).sum(axes) + 1) / (
+        probability.sum(axes) + target.sum(axes) + 1
+    )
+    return bce + 0.5 * (1 - score).mean()
+
+
+@torch.no_grad()
+def edit_targets(
+    view: ScopePrediction, target: Tensor, native_targets: list[Tensor] | None = None
+) -> tuple[Tensor, Tensor]:
+    """Whole-image gain and fraction of the parent's true positives destroyed."""
+    if native_targets is not None:
+        gains, damages = [], []
+        for index, native in enumerate(native_targets):
+            truth = native.unsqueeze(0).to(view.source_logits.device) > 0
+            source = resize_logits(view.source_logits[index : index + 1], truth)
+            candidate = resize_logits(view.candidate_logits[index : index + 1], truth)
+            count = ((source > 0) & truth).sum().float()
+            destroyed = ((source > 0) & truth & (candidate <= 0)).sum().float()
+            gains.append(
+                (per_image_iou(candidate, truth) - per_image_iou(source, truth))[0]
+            )
+            damages.append(
+                torch.where(
+                    count > 0, destroyed / count.clamp_min(1), torch.zeros_like(count)
+                )
+            )
+        return torch.stack(gains), torch.stack(damages)
+    original, candidate, truth = (
+        view.source_logits > 0,
+        view.candidate_logits > 0,
+        target > 0.5,
+    )
+    axes = tuple(range(1, target.ndim))
+    correct = original & truth
+    count = correct.sum(axes).float()
+    destroyed = (correct & ~candidate).sum(axes).float()
+    damage = torch.where(
+        count > 0, destroyed / count.clamp_min(1), torch.zeros_like(count)
+    )
+    gain = per_image_iou(view.candidate_logits, target) - per_image_iou(
+        view.source_logits, target
+    )
+    return gain, damage
 
 
 class SegmentationObjective:
-    """Full-resolution mask plus three auxiliary heads; no GT answer is consumed."""
-
-    def __init__(
-        self,
-        overlap_loss="dice",
-        overlap_weight=0.5,
-        fp_weight=0.7,
-        aux96_weight=0.1,
-        aux192_weight=0.2,
-        aux384_weight=0.3,
-    ):
-        if overlap_loss not in {"dice", "tversky"}:
-            raise ValueError("overlap_loss must be dice or tversky")
-        for name, value in dict(
-            overlap_weight=overlap_weight,
-            fp_weight=fp_weight,
-            aux96_weight=aux96_weight,
-            aux192_weight=aux192_weight,
-            aux384_weight=aux384_weight,
-        ).items():
+    def __init__(self, **settings):
+        unknown = settings.keys() - TRAINING_DEFAULTS.keys()
+        if unknown:
+            raise ValueError(f"Unknown scope loss settings: {sorted(unknown)}")
+        self.settings = {**TRAINING_DEFAULTS, **settings}
+        for name, value in self.settings.items():
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
-        if not 0 < fp_weight < 1:
-            raise ValueError("fp_weight must be strictly between zero and one")
-        self.loss_kwargs = dict(
-            overlap_loss=overlap_loss,
-            overlap_weight=overlap_weight,
-            fp_weight=fp_weight,
+        if self.settings["corruption_probability"] > 1:
+            raise ValueError("corruption_probability must be in [0, 1]")
+
+    def view_loss(
+        self,
+        view: ScopePrediction,
+        target: Tensor,
+        native_targets: list[Tensor] | None = None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        if view.source_logits.shape != target.shape:
+            raise ValueError(
+                "Scope logits and training masks must have matching shapes"
+            )
+        parent_foreground, truth = view.source_logits > 0, target > 0.5
+        remove, retain = parent_foreground & ~truth, parent_foreground & truth
+        removal = masked_per_image_mean(
+            F.softplus(-view.removal_logits.float()), remove
+        ).mean()
+        retention = masked_per_image_mean(
+            F.softplus(view.removal_logits.float()), retain
+        ).mean()
+        gain_target, damage_target = edit_targets(view, target, native_targets)
+        components = {
+            "removal": removal,
+            "retention": retention,
+            "segmentation": segmentation_loss(view.candidate_logits, target),
+            "gain": F.smooth_l1_loss(view.gain, gain_target, beta=0.05),
+            "damage": F.binary_cross_entropy_with_logits(
+                view.damage_logits, damage_target
+            ),
+        }
+        total = sum(
+            self.settings[name + "_weight"] * loss for name, loss in components.items()
         )
-        self.auxiliary_weights = dict(
-            zip(("96", "192", "384"), (aux96_weight, aux192_weight, aux384_weight))
+        metrics = {name + "_loss": loss.detach() for name, loss in components.items()}
+        metrics.update(
+            actual_gain=gain_target.mean(),
+            predicted_gain=view.gain.detach().mean(),
+            actual_damage=damage_target.mean(),
+            predicted_damage=view.damage_logits.detach().sigmoid().mean(),
+            selection_fraction=view.selected.float().mean(),
+            removal_valid_fraction=remove.flatten(1).any(1).float().mean(),
+            retention_valid_fraction=retain.flatten(1).any(1).float().mean(),
         )
+        return total, metrics
 
     def __call__(self, model, batch, epoch=0):
-        output = model(batch)
-        if output["logits"].shape != batch["mask"].shape:
-            raise ValueError(
-                "Main logits and high-resolution target must have matching shapes"
+        # The model computes its genuine inference view before this separate GT-derived view.
+        training_batch = batch
+        if (
+            self.settings["corruption_weight"] > 0
+            and self.settings["corruption_probability"] > 0
+        ):
+            training_batch = {
+                **batch,
+                "scope_training": {
+                    "corruption_probability": self.settings["corruption_probability"]
+                },
+            }
+        output = model(training_batch)
+        native = batch.get("native_mask")
+        loss, metrics = self.view_loss(output["scope"], batch["mask"], native)
+        if output["training_scope"] is not None:
+            extra, extra_metrics = self.view_loss(
+                output["training_scope"], batch["mask"], native
             )
-        main = segmentation_loss(output["logits"], batch["mask"], **self.loss_kwargs)
-        total, components = main, {"segmentation": main.detach()}
-        for name, weight in self.auxiliary_weights.items():
-            logits = output["auxiliary_logits"][name]
-            # Area targets preserve fractional coverage of tiny regions at coarse grids.
-            target = F.interpolate(
-                batch["mask"].float(), size=logits.shape[-2:], mode="area"
+            weight = self.settings["corruption_weight"]
+            # Fixed view weights: one statistical observation per original image.
+            loss = (loss + weight * extra) / (1 + weight)
+            metrics.update(
+                {"corrupt_" + key: value for key, value in extra_metrics.items()}
             )
-            loss = segmentation_loss(logits, target, **self.loss_kwargs)
-            total = total + weight * loss
-            components[f"aux{name}_loss"] = loss.detach()
-        return total, components
+        return loss, metrics

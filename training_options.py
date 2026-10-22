@@ -245,11 +245,14 @@ class TrainingControls:
                 root = model.module if hasattr(model, "module") else model
                 if (
                     not policy
-                    and getattr(root, "experiment_config", {}).get("experiment")
-                    == "gain-guided-refinement"
+                    and (
+                        getattr(root, "fixed_reference", False)
+                        or getattr(root, "experiment_config", {}).get("experiment")
+                        == "gain-guided-refinement"
+                    )
                 ):
                     raise ValueError(
-                        "Gain-guided refinement requires its fixed coarse reference; encoders cannot be unfrozen"
+                        "This experiment requires a fixed reference; its encoders cannot be unfrozen"
                     )
                 if full_resume and self._saved is None:
                     was_frozen = not any(p.requires_grad for p in module.parameters())

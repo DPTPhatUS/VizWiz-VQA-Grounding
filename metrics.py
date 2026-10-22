@@ -52,13 +52,23 @@ def metric_samples(logits, batch, *, pixel_totals=None):
 
 
 @torch.inference_mode()
-def evaluate(model, loader, device, output=None, *, pixel_totals=None):
+def evaluate(
+    model,
+    loader,
+    device,
+    output=None,
+    *,
+    pixel_totals=None,
+    view_results=None,
+    scope_diagnostics=None,
+):
     model.eval()
     scores = {}
     for batch in tqdm(loader, desc="Evaluating", unit="batch", dynamic_ncols=True):
         batch = to_device(batch, device)
         # Dataset validation/test always supplies question-only text.
-        logits = model(batch)["logits"]
+        result = model(batch)
+        logits = result["logits"]
         for name, score, prediction in metric_samples(
             logits, batch, pixel_totals=pixel_totals
         ):
@@ -68,7 +78,49 @@ def evaluate(model, loader, device, output=None, *, pixel_totals=None):
             if output is not None:
                 path = Path(output) / Path(name).with_suffix(".png")
                 path.parent.mkdir(parents=True, exist_ok=True)
-                Image.fromarray((prediction.cpu().numpy().astype(np.uint8) * 255)).save(
+                Image.fromarray(prediction.cpu().numpy().astype(np.uint8) * 255).save(
                     path
                 )
+        if view_results is not None:
+            for view in ("parent", "candidate"):
+                state = view_results.setdefault(
+                    view, {"per_sample": {}, "pixel_totals": {}}
+                )
+                for name, score, _ in metric_samples(
+                    result[view + "_logits"], batch, pixel_totals=state["pixel_totals"]
+                ):
+                    state["per_sample"][name] = score
+        if scope_diagnostics is not None:
+            selection = result["scope"]
+            for i, name in enumerate(batch["filename"]):
+                truth = batch["original_mask"][i].unsqueeze(0).to(logits.device) > 0.5
+                shape = truth.shape[-2:]
+                original = (
+                    F.interpolate(
+                        result["parent_logits"][i : i + 1].float(),
+                        size=shape,
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    > 0
+                )
+                candidate = (
+                    F.interpolate(
+                        result["candidate_logits"][i : i + 1].float(),
+                        size=shape,
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    > 0
+                )
+                count = int((original & truth).sum())
+                destroyed = int((original & truth & ~candidate).sum())
+                scope_diagnostics[name] = {
+                    "selected": bool(selection.selected[i]),
+                    "predicted_gain": float(selection.gain[i]),
+                    "predicted_damage": float(selection.damage_logits[i].sigmoid()),
+                    "actual_damage": destroyed / count if count else 0.0,
+                    "removed_pixels": int((original & ~candidate).sum()),
+                    "gt_area_fraction": float(truth.float().mean()),
+                }
     return scores

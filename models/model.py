@@ -1,128 +1,111 @@
-"""Question-only grounding with a high-resolution detail pyramid."""
+"""Frozen pyramid anchor with a small question-conditioned scope corrector."""
 
 import torch
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint
 
-from models.detail_pyramid import DetailPyramid, HighResolutionRefiner
-from models.image_encoder import ImageEncoder, TinyVision
-from models.mask_decoder import DetailDecoder
-from models.text_encoder import TextEncoder, masked_mean
+from models.pyramid import PyramidFeatures, PyramidModel
+from models.scope_correction import (
+    CORRUPTION_PROTOCOL,
+    SELECTION_DEFAULTS,
+    EditEvaluator,
+    ScopePrediction,
+    ScopeVerifier,
+    expanded_training_logits,
+    suppress_logits,
+    validate_selection,
+)
 
-EXPERIMENT = "question-guided-detail-pyramid-v1"
+EXPERIMENT = "question-guided-scope-correction-v1"
 
 
 class GroundingModel(nn.Module):
-    """336 CLIP view + 768 CNN view + Q -> 768 logits; never consumes an answer."""
+    fixed_reference = True
 
-    def __init__(self, tiny: bool = False, gradient_checkpointing: bool = False):
+    def __init__(
+        self,
+        tiny=False,
+        gradient_checkpointing=False,
+        gain_margin=SELECTION_DEFAULTS["gain_margin"],
+        max_damage=SELECTION_DEFAULTS["max_damage"],
+    ):
         super().__init__()
-        self.image_encoder = TinyVision() if tiny else ImageEncoder()
-        self.text_encoder = TextEncoder(tiny)
-        self.text_encoder.requires_grad_(False)
-        self.text_encoder.eval()
-        visual_dim, text_dim = (
-            self.image_encoder.out_channels,
-            self.text_encoder.output_dim,
+        validate_selection(gain_margin, max_damage)
+        self.parent = PyramidModel(tiny=tiny).requires_grad_(False).eval()
+        text_dim = self.parent.text_encoder.output_dim
+        self.verifier = ScopeVerifier(
+            self.parent.decoder.stage96_channels,
+            8 if tiny else 16,
+            text_dim,
+            tiny=tiny,
+            gradient_checkpointing=gradient_checkpointing,
         )
-        self.text_proj = nn.Linear(text_dim, visual_dim)
-        self.cross_attn = nn.MultiheadAttention(
-            visual_dim, 2 if tiny else 8, batch_first=True
-        )
-        self.residual_scale = nn.Parameter(torch.tensor(0.01))
-        self.question_projection = nn.Sequential(
-            nn.Linear(text_dim, 8 if tiny else 16), nn.GELU()
-        )
-        self.detail_pyramid = DetailPyramid(tiny=tiny)
-        self.decoder = DetailDecoder(visual_dim, text_dim, tiny=tiny)
-        self.refiner = HighResolutionRefiner(
-            self.decoder.output_channels, 8 if tiny else 16, tiny=tiny
-        )
+        self.evaluator = EditEvaluator(self.verifier.evidence_dim, text_dim, tiny=tiny)
+        self.register_buffer("scope_version", torch.tensor(1, dtype=torch.int64))
         self.register_buffer(
-            "image_mean",
-            torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1),
+            "selection_thresholds",
+            torch.tensor([gain_margin, max_damage], dtype=torch.float64),
         )
-        self.register_buffer(
-            "image_std",
-            torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1),
+        self.image_size, self.detail_size = (
+            self.parent.image_size,
+            self.parent.detail_size,
         )
-        self.gradient_checkpointing = gradient_checkpointing
-        self.image_size, self.detail_size = (32, 64) if tiny else (336, 768)
-        if gradient_checkpointing and not tiny:
-            self.image_encoder.vision_encoder.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
         self.experiment_config = {
             "experiment": EXPERIMENT,
             "tiny": tiny,
+            "parent": self.parent.experiment_config,
             "image_size": self.image_size,
             "detail_size": self.detail_size,
             "text_mode": "question",
-            "freeze_text_encoder": True,
-            "decoder_width": 16 if tiny else 128,
-            "skip_hidden": 32 if tiny else 256,
-            "detail_width": 8 if tiny else 16,
-            "upsample_convolution": "standard-3x3",
-            "detail_stages": [0, 1, 2, 3],
-            "auxiliary_heads": [96, 192, 384],
-            "refiner": "signed-logit-residual",
-            "normalization": "clip-rgb-both-views",
+            "parent_frozen": True,
+            "gain_margin": gain_margin,
+            "max_damage": max_damage,
+            "suppression": "probability-product-stable-logits",
+            "scope_width": 8 if tiny else 32,
+            "evaluator_grid": 8,
+            "evaluator_detached": True,
+            "corruption": CORRUPTION_PROTOCOL.copy(),
         }
 
-    def train(self, mode: bool = True):
+    def train(self, mode=True):
         super().train(mode)
-        self.text_encoder.eval()
+        self.parent.eval()
         return self
 
-    def _run(self, block: nn.Module, *inputs: Tensor) -> Tensor:
-        if self.training and self.gradient_checkpointing and torch.is_grad_enabled():
-            return checkpoint(block, *inputs, use_reentrant=False)
-        return block(*inputs)
+    def correct(self, features: PyramidFeatures, source: Tensor) -> ScopePrediction:
+        removal, evidence = self.verifier(
+            features.region, features.detail, features.text, source
+        )
+        candidate = suppress_logits(source, removal)
+        gain, damage = self.evaluator(evidence, features.text, source, candidate)
+        thresholds = self.selection_thresholds.to(dtype=gain.dtype)
+        selected = (gain > thresholds[0]) & (damage.sigmoid() < thresholds[1])
+        return ScopePrediction(source, candidate, removal, gain, damage, selected)
 
-    def forward(self, batch: dict) -> dict:
-        image, detail_image = batch["image"], batch["detail_image"]
-        if image.shape[1:] != (3, self.image_size, self.image_size):
-            raise ValueError(
-                f"CLIP view must have shape (B, 3, {self.image_size}, {self.image_size})"
+    def forward(self, batch):
+        # Frozen features feed trainable layers, so use no_grad, not inference_mode.
+        with torch.no_grad():
+            features = self.parent(batch)
+        predicted = self.correct(features, features.logits)
+        logits = torch.where(
+            predicted.selected[:, None, None, None],
+            predicted.candidate_logits,
+            features.logits.float(),
+        )
+        auxiliary = None
+        if self.training and "scope_training" in batch:
+            corrupted = expanded_training_logits(
+                features.logits,
+                batch["mask"],
+                batch["scope_training"]["corruption_probability"],
             )
-        if detail_image.shape != (
-            image.shape[0],
-            3,
-            self.detail_size,
-            self.detail_size,
-        ):
-            raise ValueError(
-                f"Detail view must have shape (B, 3, {self.detail_size}, {self.detail_size})"
-            )
-        features = self.image_encoder((image - self.image_mean) / self.image_std)
-        questions = (
-            batch["question_text"] if "question_text" in batch else batch["text"]
-        )
-        text = self.text_encoder(questions)
-        question = masked_mean(text.tokens, text.valid_mask)
-        projected = self.text_proj(text.tokens)
-        tokens = features[-1].flatten(2).transpose(1, 2).to(projected.dtype)
-        attended, _ = self.cross_attn(
-            tokens,
-            projected,
-            projected,
-            key_padding_mask=~text.attention_mask,
-            need_weights=False,
-        )
-        fused = (
-            (tokens + self.residual_scale * attended)
-            .transpose(1, 2)
-            .reshape_as(features[-1])
-        )
-        detail = self.detail_pyramid(
-            (detail_image - self.image_mean) / self.image_std, self._run
-        )
-        detail_question = self.question_projection(question)
-        logits, semantic, auxiliary = self.decoder(
-            (*features[:3], fused), question, detail, detail_question, self._run
-        )
-        final = self._run(self.refiner, logits, semantic, detail[-1], detail_question)
-        return {"logits": final, "auxiliary_logits": auxiliary}
+            auxiliary = self.correct(features, corrupted)
+        return {
+            "logits": logits,
+            "parent_logits": features.logits.float(),
+            "candidate_logits": predicted.candidate_logits,
+            "scope": predicted,
+            "training_scope": auxiliary,
+        }
 
     @classmethod
     def from_checkpoint(cls, path, device="cpu"):
