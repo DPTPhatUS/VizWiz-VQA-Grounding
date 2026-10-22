@@ -18,7 +18,6 @@ class CompactGroundingModel(nn.Module):
         self.text_dim = self.text_encoder.output_dim
         self.text_proj = nn.Linear(self.text_dim, self.visual_dim)
         self.cross_attn = nn.MultiheadAttention(self.visual_dim, 2 if tiny else 8, batch_first=True)
-        self.residual_scale = nn.Parameter(torch.tensor(.01))
         self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128)
         self.register_buffer("image_mean", torch.tensor([.48145466, .4578275, .40821073]).view(1, 3, 1, 1))
         self.register_buffer("image_std", torch.tensor([.26862954, .26130258, .27577711]).view(1, 3, 1, 1))
@@ -35,8 +34,7 @@ class CompactGroundingModel(nn.Module):
         projected = self.text_proj(text.tokens)
         attended, _ = self.cross_attn(
             query, projected, projected, key_padding_mask=~text.attention_mask, need_weights=False)
-        fused = query + self.residual_scale * attended
-        fused = fused.transpose(1, 2).reshape_as(vision)
+        fused = attended.transpose(1, 2).reshape_as(vision)
         logits = self.decoder(fused, s3, s2, s1, text)
         return {"logits": logits, "visual": fused,
                 "pooled_text": masked_mean(text.tokens, text.valid_mask)}
