@@ -1,7 +1,9 @@
-"""Text-conditioned compact mask decoding."""
+"""Text-conditioned compact decoding with context and membership connections."""
+import torch
 from torch import nn
 from torch.nn import functional as F
 from models.text_encoder import masked_mean
+from models.connections import ContextMembership
 
 
 class SkipConditioner(nn.Module):
@@ -31,7 +33,7 @@ def separable(in_channels, out_channels):
 
 
 class CompactDecoder(nn.Module):
-    def __init__(self, in_channels=1024, text_dim=768, width=128):
+    def __init__(self, in_channels=1024, text_dim=768, width=128, connection_mode='shared', tiny=False):
         super().__init__()
         self.projections = nn.ModuleList([nn.Conv2d(in_channels, width, 1) for _ in range(4)])
         self.conditioner = SkipConditioner(text_dim, width)
@@ -40,6 +42,9 @@ class CompactDecoder(nn.Module):
             separable(width, 64), separable(64, 32),
             separable(32, 16), separable(16, 16),
         ])
+        self.connections = ContextMembership(64, text_dim, connection_mode,
+                                             width=16 if tiny else 128)
+        self.membership_fusion = nn.Conv2d(65, 64, 1)
         self.output = nn.Conv2d(16, 1, 1)
 
     def forward(self, bottleneck, skip3, skip2, skip1, text):
@@ -51,6 +56,11 @@ class CompactDecoder(nn.Module):
         for block, skip in zip(self.fusion, skips):
             skip = F.interpolate(skip, size=x.shape[-2:], mode="bilinear", align_corners=False)
             x = x + block(x + skip)
-        for block in self.upsample:
+        x = self.upsample[0](F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False))
+        relations = self.connections(x, text)
+        x = self.membership_fusion(torch.cat(
+            (relations['features'], relations['membership_logits'].to(x.dtype)), dim=1))
+        for block in self.upsample[1:]:
             x = block(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False))
-        return self.output(x)
+        return {'logits': self.output(x),
+                **{key: value for key, value in relations.items() if key != 'features'}}

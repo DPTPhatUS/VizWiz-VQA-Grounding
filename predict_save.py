@@ -5,8 +5,7 @@ import torch
 from torch.nn import functional as F
 from torchvision.transforms.functional import to_tensor
 from PIL import Image, ImageOps
-from models.model import GroundingModel
-from utils import read_checkpoint, load_model_weights
+from utils import read_checkpoint, model_from_checkpoint
 
 
 def prediction_parser(description=__doc__):
@@ -23,8 +22,8 @@ def prediction_parser(description=__doc__):
 def predict_image(checkpoint,image_path,question,device):
     saved=read_checkpoint(checkpoint)
     config=saved['run_config']
-    model=GroundingModel(tiny=config.get("tiny", False))
-    load_model_weights(model,saved)
+    model=model_from_checkpoint(saved)
+    del saved
     model.to(device).eval()
     with Image.open(image_path) as source:
         image=ImageOps.exif_transpose(source).convert('RGB')

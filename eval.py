@@ -4,14 +4,13 @@ import json
 from pathlib import Path
 import torch
 from dataset import VizWizGroundingDataset, make_loader
-from models.model import GroundingModel
-from utils import read_checkpoint, load_model_weights
+from utils import read_checkpoint, model_from_checkpoint
 from metrics import evaluate
 
 
 def eval_main(argv=None):
     parser = argparse.ArgumentParser(description="Question-only evaluation using saved model architecture")
-    parser.add_argument("--checkpoint",required=True,help="Raw model weights or a training checkpoint")
+    parser.add_argument("--checkpoint",required=True,help="Checkpoint from this experiment")
     parser.add_argument("--data-root",default="data/vizwiz")
     parser.add_argument("--dataset",choices=["val","test"],default="val")
     parser.add_argument("--batch-size",type=int,default=4)
@@ -23,8 +22,8 @@ def eval_main(argv=None):
         raise ValueError("Invalid batch size or worker count")
     saved = read_checkpoint(args.checkpoint)
     config = saved["run_config"]
-    model = GroundingModel(tiny=config.get("tiny", False))
-    load_model_weights(model, saved)
+    model = model_from_checkpoint(saved)
+    del saved
     device = torch.device(args.device); model.to(device)
     dataset = VizWizGroundingDataset(args.data_root,args.dataset,config.get("image_size", 336))
     loader = make_loader(dataset,args,args.batch_size)

@@ -5,11 +5,11 @@ from models.image_encoder import ImageEncoder, TinyVision
 from models.text_encoder import TextEncoder
 from models.mask_decoder import CompactDecoder
 
-EXPERIMENT = 'controls'
+EXPERIMENT = 'context-membership'
 
 
 class GroundingModel(nn.Module):
-    def __init__(self, tiny=False):
+    def __init__(self, tiny=False, connection_mode='shared'):
         super().__init__()
         self.image_encoder = TinyVision() if tiny else ImageEncoder()
         self.text_encoder = TextEncoder(tiny).requires_grad_(False)
@@ -17,11 +17,17 @@ class GroundingModel(nn.Module):
         self.text_dim = self.text_encoder.output_dim
         self.text_proj = nn.Linear(self.text_dim, self.visual_dim)
         self.cross_attn = nn.MultiheadAttention(self.visual_dim, 2 if tiny else 8, batch_first=True)
-        self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128)
+        self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128,
+                                      connection_mode=connection_mode, tiny=tiny)
         self.register_buffer("image_mean", torch.tensor([.48145466, .4578275, .40821073]).view(1,3,1,1))
         self.register_buffer("image_std", torch.tensor([.26862954, .26130258, .27577711]).view(1,3,1,1))
-        self.experiment_config = {"experiment": "controls", "architecture": "compact", "tiny": tiny,
-                                  "protocol": "normalized-masked-question-v1"}
+        self.experiment_config = {
+            'experiment': EXPERIMENT, 'architecture': 'compact', 'tiny': tiny,
+            'connection_mode': connection_mode, 'connection_width': 16 if tiny else 128,
+            'pair_width': 16, 'membership_steps': 2, 'edge_neighborhood': 8,
+            'freeze_text_encoder': True, 'skip_film': True, 'residual_fusion': False,
+            'protocol': 'context-membership-v1',
+        }
 
     def encode_image(self, image):
         return self.image_encoder((image - self.image_mean) / self.image_std)
@@ -34,8 +40,7 @@ class GroundingModel(nn.Module):
         attended, _ = self.cross_attn(query, projected, projected,
             key_padding_mask=~text.attention_mask, need_weights=False)
         fused = attended.transpose(1,2).reshape_as(vision)
-        logits = self.decoder(fused, s3, s2, s1, text)
-        return {"logits": logits}
+        return self.decoder(fused, s3, s2, s1, text)
 
     def forward(self, batch):
         return self.decode(self.encode_image(batch["image"]), batch["text"])

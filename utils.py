@@ -7,22 +7,20 @@ def to_device(batch, device):
 
 
 def read_checkpoint(path):
-    """Accept a raw state_dict or a checkpoint; run settings are optional."""
-    saved = torch.load(path, map_location="cpu", weights_only=False)
-    if "model_state_dict" not in saved:
-        saved = {"model_state_dict": saved}
-    saved.setdefault("run_config", {})
-    return saved
+    """This experiment uses full checkpoints with embedded architecture settings."""
+    return torch.load(path, map_location="cpu", weights_only=True)
 
 
 def load_model_weights(model, saved):
-    """Strictly load tensors, checking model identity when the file records it."""
-    config = saved.get("experiment_config")
-    if config is not None and config != model.experiment_config:
+    """Strictly load tensors and require the same experiment configuration."""
+    if saved['experiment_config'] != model.experiment_config:
         raise ValueError("Checkpoint configuration does not match model configuration")
-    model.load_state_dict(saved.get("model_state_dict", saved), strict=True)
+    model.load_state_dict(saved['model_state_dict'], strict=True)
 
 
-def initialize_weights(path, model):
-    saved = read_checkpoint(path)
+def model_from_checkpoint(saved):
+    from models.model import GroundingModel
+    config = saved['experiment_config']
+    model = GroundingModel(tiny=config['tiny'], connection_mode=config['connection_mode'])
     load_model_weights(model, saved)
+    return model

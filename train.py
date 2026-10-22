@@ -11,7 +11,7 @@ from torch import nn
 from torch.utils.data import DistributedSampler
 from tqdm.auto import tqdm
 from dataset import VizWizGroundingDataset, make_loader
-from utils import to_device, read_checkpoint, load_model_weights, initialize_weights
+from utils import to_device, read_checkpoint, load_model_weights
 from models.model import GroundingModel
 from losses import SupervisedObjective
 
@@ -34,7 +34,11 @@ def unwrap(model):
 def training_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", default="data/vizwiz")
-    parser.add_argument("--output-dir", default="outputs")
+    parser.add_argument("--output-dir", help="Default: outputs/context-membership/<connection-mode>")
+    parser.add_argument('--connection-mode', choices=('shared', 'separate'),
+                        help='Default: shared for new runs; saved mode for checkpoint runs')
+    parser.add_argument('--edge-loss-weight', type=float,
+                        help='Membership supervision weight; default .1, or saved value on resume')
     parser.add_argument("--num-epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=4, help="Global batch size across all ranks")
     parser.add_argument("--num-workers", type=int, default=4)
@@ -42,8 +46,8 @@ def training_parser():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-every", type=int, default=10,
                         help="Save a resumable checkpoint every N epochs; 0 disables all model saves")
-    parser.add_argument("--resume-checkpoint", help="Resume a full checkpoint; raw weights use --init-checkpoint")
-    parser.add_argument("--init-checkpoint", help="Initialize from saved weights with a fresh optimizer")
+    parser.add_argument("--resume-checkpoint", help="Resume a full checkpoint of this experiment")
+    parser.add_argument("--init-checkpoint", help="Initialize from this experiment's checkpoint with a fresh optimizer")
     return parser
 
 
@@ -54,10 +58,12 @@ def check_arguments(args):
         raise ValueError("save-every cannot be negative")
     if args.num_workers < 0 or args.lr <= 0:
         raise ValueError("Workers cannot be negative; learning rate must be positive")
-    if args.resume_checkpoint and getattr(args, "init_checkpoint", None):
+    if args.edge_loss_weight is not None and (not np.isfinite(args.edge_loss_weight) or args.edge_loss_weight < 0):
+        raise ValueError('edge-loss-weight must be finite and nonnegative')
+    if args.resume_checkpoint and args.init_checkpoint:
         raise ValueError("Use either resume or weight initialization, not both")
     for name in ('resume_checkpoint', 'init_checkpoint'):
-        path = getattr(args, name, None)
+        path = getattr(args, name)
         if path and not Path(path).is_file():
             raise ValueError(f"{name} does not exist: {path}")
 
@@ -86,6 +92,13 @@ def train_main(argv=None):
 
 def _train(args, rank, world, distributed, device):
     seed_everything(args.seed)
+    checkpoint_path = args.resume_checkpoint or args.init_checkpoint
+    checkpoint = read_checkpoint(checkpoint_path) if checkpoint_path else None
+    args.connection_mode = args.connection_mode or (
+        checkpoint['experiment_config']['connection_mode'] if checkpoint else 'shared')
+    if args.edge_loss_weight is None:
+        args.edge_loss_weight = checkpoint['run_config']['edge_loss_weight'] if args.resume_checkpoint else .1
+    args.output_dir = args.output_dir or f'outputs/context-membership/{args.connection_mode}'
     run_config = vars(args).copy()
     run_config.update(world_size=world, image_size=IMAGE_SIZE, text_mode="question",
                       freeze_text_encoder=True)
@@ -95,10 +108,10 @@ def _train(args, rank, world, distributed, device):
     if distributed:
         dist.barrier()
     train_set = VizWizGroundingDataset(args.data_root, "train", IMAGE_SIZE)
-    model = GroundingModel().to(device)
-    if getattr(args, "init_checkpoint", None):
-        initialize_weights(args.init_checkpoint,model)
-    objective = SupervisedObjective()
+    model = GroundingModel(connection_mode=args.connection_mode).to(device)
+    if checkpoint:
+        load_model_weights(model, checkpoint)
+    objective = SupervisedObjective(args.edge_loss_weight)
     parameters = [p for p in model.parameters() if p.requires_grad]
     if not parameters:
         raise ValueError("No trainable parameters")
@@ -106,10 +119,6 @@ def _train(args, rank, world, distributed, device):
     scaler = torch.amp.GradScaler("cuda",enabled=device.type=="cuda")
     start = 0
     if args.resume_checkpoint:
-        checkpoint = read_checkpoint(args.resume_checkpoint)
-        load_model_weights(model, checkpoint)
-        if "optimizer_state_dict" not in checkpoint:
-            raise ValueError("Raw model weights have no optimizer state; use --init-checkpoint for a new run")
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         for group in optimizer.param_groups:
             group["lr"] = args.lr
@@ -120,6 +129,7 @@ def _train(args, rank, world, distributed, device):
         start = checkpoint["epoch"]
         if start >= args.num_epochs:
             raise ValueError("num-epochs must exceed the resumed epoch")
+    del checkpoint
     if distributed:
         model = nn.parallel.DistributedDataParallel(model,
             device_ids=[device.index] if device.type=="cuda" else None,
@@ -132,6 +142,7 @@ def _train(args, rank, world, distributed, device):
     if rank == 0:
         print(json.dumps({"parameters":sum(p.numel() for p in unwrap(model).parameters()),
                           "trainable":sum(p.numel() for p in parameters),"device":str(device),
+                          "connection_parameters":sum(p.numel() for p in unwrap(model).decoder.connections.parameters()),
                           "experiment":unwrap(model).experiment_config}),flush=True)
     for epoch in range(start,args.num_epochs):
         # Epoch-keyed RNG permits reproducible continuation, including loader shuffling.
