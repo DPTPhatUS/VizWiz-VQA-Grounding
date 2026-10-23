@@ -4,12 +4,13 @@ import torch
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
+from models.area_calibration import AreaCalibration
 from models.detail_pyramid import DetailPyramid, HighResolutionRefiner
 from models.image_encoder import ImageEncoder, TinyVision
 from models.mask_decoder import DetailDecoder
 from models.text_encoder import TextEncoder, masked_mean
 
-EXPERIMENT = "question-guided-detail-pyramid-v1"
+EXPERIMENT = "area-calibrated-pyramid-v1"
 
 
 class GroundingModel(nn.Module):
@@ -67,7 +68,13 @@ class GroundingModel(nn.Module):
             "auxiliary_heads": [96, 192, 384],
             "refiner": "signed-logit-residual",
             "normalization": "clip-rgb-both-views",
+            "calibration": "implicit-foreground-mass-v1",
+            "calibration_width": 8 if tiny else 16,
         }
+
+        self.calibration = AreaCalibration(
+            self.decoder.output_channels, 8 if tiny else 16, width=8 if tiny else 16
+        )
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -122,7 +129,8 @@ class GroundingModel(nn.Module):
             (*features[:3], fused), question, detail, detail_question, self._run
         )
         final = self._run(self.refiner, logits, semantic, detail[-1], detail_question)
-        return {"logits": final, "auxiliary_logits": auxiliary}
+        output = self.calibration(final, semantic, detail_question)
+        return {**output, "auxiliary_logits": auxiliary}
 
     @classmethod
     def from_checkpoint(cls, path, device="cpu"):

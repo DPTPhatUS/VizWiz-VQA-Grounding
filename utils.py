@@ -26,6 +26,11 @@ def checkpoint_model_kwargs(saved):
 
     state = saved["model_state_dict"]
     key = "refiner.correction.weight"
+    if (
+        "calibration.format_version" not in state
+        or state["calibration.format_version"].item() != 1
+    ):
+        raise ValueError("Use an area-calibrated-pyramid checkpoint from this branch")
     if key not in state or "detail_pyramid.encoder.0.0.0.weight" not in state:
         raise ValueError(
             "Use a question-guided-detail-pyramid checkpoint; older experiments belong to their original branches"
