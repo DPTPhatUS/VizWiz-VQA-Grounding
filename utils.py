@@ -28,8 +28,15 @@ def checkpoint_model_kwargs(saved):
     key = "refiner.correction.weight"
     if "answer_head.embedding.weight" not in state:
         raise ValueError(
-            "Use an answer-token-supervision checkpoint; pyramid initialization is not a resume"
+            "Use a mask-conditioned-answer checkpoint; other experiments are not resumes"
         )
+    version = state.get("answer_head.mask_attention_version")
+    if version is None or version.numel() != 1 or version.item() != 1:
+        raise ValueError("Use this branch's mask-conditioned-answer checkpoint")
+    grid = state.get("answer_head.spatial_position")
+    expected_grid = 16 if "image_encoder.conv.weight" in state else 1024
+    if grid is None or grid.shape[1] != expected_grid:
+        raise ValueError("Checkpoint reader grid belongs to another experiment")
     if key not in state or "detail_pyramid.encoder.0.0.0.weight" not in state:
         raise ValueError(
             "Use a question-guided-detail-pyramid checkpoint; older experiments belong to their original branches"

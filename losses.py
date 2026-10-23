@@ -12,9 +12,14 @@ TRAINING_DEFAULTS = {
     "aux96_weight": 0.1,
     "aux192_weight": 0.2,
     "aux384_weight": 0.3,
-    "answer_weight": 0.05,
-    "answer_warmup_epochs": 2,
-    "answer_ramp_epochs": 3,
+    "answer_weight": 0.01,
+    "answer_warmup_epochs": 0,
+    "answer_ramp_epochs": 1,
+    "mask_answer_weight": 0.01,
+    "mask_answer_warmup_epochs": 5,
+    "mask_answer_ramp_epochs": 5,
+    "reader_margin": 0.05,
+    "mask_answer_tolerance": 0.05,
 }
 
 
@@ -73,7 +78,7 @@ def answer_statistics(output):
 
 
 class SegmentationObjective:
-    """Full-resolution mask plus three auxiliary heads; no GT answer is consumed."""
+    """Segmentation plus a GT-trained reader and reliability-gated mask guidance."""
 
     def __init__(
         self,
@@ -83,9 +88,14 @@ class SegmentationObjective:
         aux96_weight=0.1,
         aux192_weight=0.2,
         aux384_weight=0.3,
-        answer_weight=0.05,
-        answer_warmup_epochs=2,
-        answer_ramp_epochs=3,
+        answer_weight=0.01,
+        answer_warmup_epochs=0,
+        answer_ramp_epochs=1,
+        mask_answer_weight=0.01,
+        mask_answer_warmup_epochs=5,
+        mask_answer_ramp_epochs=5,
+        reader_margin=0.05,
+        mask_answer_tolerance=0.05,
     ):
         if overlap_loss not in {"dice", "tversky"}:
             raise ValueError("overlap_loss must be dice or tversky")
@@ -96,6 +106,9 @@ class SegmentationObjective:
             "aux192_weight": aux192_weight,
             "aux384_weight": aux384_weight,
             "answer_weight": answer_weight,
+            "mask_answer_weight": mask_answer_weight,
+            "reader_margin": reader_margin,
+            "mask_answer_tolerance": mask_answer_tolerance,
         }.items():
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
@@ -113,12 +126,40 @@ class SegmentationObjective:
             raise ValueError("answer_warmup_epochs must be a nonnegative integer")
         if type(answer_ramp_epochs) is not int or answer_ramp_epochs <= 0:
             raise ValueError("answer_ramp_epochs must be a positive integer")
+        if answer_weight == 0 and mask_answer_weight > 0:
+            raise ValueError(
+                "Mask guidance requires GT-reader training; set both answer weights to zero to disable it"
+            )
         self.answer_weight = answer_weight
         self.answer_warmup_epochs = answer_warmup_epochs
         self.answer_ramp_epochs = answer_ramp_epochs
+        if type(mask_answer_warmup_epochs) is not int or mask_answer_warmup_epochs < 0:
+            raise ValueError("mask_answer_warmup_epochs must be a nonnegative integer")
+        if type(mask_answer_ramp_epochs) is not int or mask_answer_ramp_epochs <= 0:
+            raise ValueError("mask_answer_ramp_epochs must be a positive integer")
+        self.mask_answer_weight = mask_answer_weight
+        self.mask_answer_warmup_epochs = mask_answer_warmup_epochs
+        self.mask_answer_ramp_epochs = mask_answer_ramp_epochs
+        self.reader_margin = reader_margin
+        self.mask_answer_tolerance = mask_answer_tolerance
 
     def __call__(self, model, batch, epoch=0):
-        output = model({**batch, "answer_supervision": True})
+        mask_progress = min(
+            1.0,
+            max(
+                0.0,
+                (epoch - self.mask_answer_warmup_epochs + 1)
+                / self.mask_answer_ramp_epochs,
+            ),
+        )
+        mask_weight = self.mask_answer_weight * mask_progress
+        output = model(
+            {
+                **batch,
+                "answer_supervision": True,
+                "mask_answer_supervision": mask_weight > 0,
+            }
+        )
         if output["logits"].shape != batch["mask"].shape:
             raise ValueError(
                 "Main logits and high-resolution target must have matching shapes"
@@ -147,4 +188,51 @@ class SegmentationObjective:
             answer_valid_fraction=available.float().mean(),
             effective_answer_weight=answer.new_tensor(effective),
         )
+        if "predicted_answer" in output:
+            guidance, metrics = mask_answer_statistics(
+                output,
+                reader_margin=self.reader_margin,
+                tolerance=self.mask_answer_tolerance,
+            )
+            total = total + mask_weight * guidance.mean()
+            components.update(metrics)
+        else:
+            components.update(
+                {
+                    key: main.detach().new_zeros(())
+                    for key in (
+                        "mask_answer_loss",
+                        "reader_reliable_fraction",
+                        "reader_visual_gain",
+                        "predicted_answer_loss",
+                        "mask_answer_active_fraction",
+                    )
+                }
+            )
+        components["effective_mask_answer_weight"] = main.detach().new_tensor(
+            mask_weight
+        )
         return total, components
+
+
+def mask_answer_statistics(output, *, reader_margin, tolerance):
+    """One detached reliability decision per image; preserve original-batch averaging.
+
+    A reader must prefer GT to the full image before guiding a predicted mask.
+    The hinge stops pushing once predicted-region CE reaches the GT reference
+    within tolerance. Invalid GT answers/regions never contribute to guidance.
+    """
+    reference, _, valid = answer_statistics(output)
+    full, _, _ = answer_statistics(output["full_answer"])
+    predicted, _, _ = answer_statistics(output["predicted_answer"])
+    gain = full.detach() - reference.detach()
+    reliable = valid & (gain > reader_margin)
+    gap = F.relu(predicted - reference.detach() - tolerance)
+    loss = gap * reliable.to(gap.dtype)
+    return loss, {
+        "mask_answer_loss": loss.mean().detach(),
+        "reader_reliable_fraction": reliable.float().mean(),
+        "reader_visual_gain": (gain * valid).mean(),
+        "predicted_answer_loss": (predicted.detach() * valid).mean(),
+        "mask_answer_active_fraction": (reliable & (gap.detach() > 0)).float().mean(),
+    }

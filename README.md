@@ -1,52 +1,81 @@
-# GT-region answer token supervision
+# Mask-conditioned answer supervision
 
-A641,283-parameter two-layer width128 Transformer reads a16x16 ordered GT-region grid from shared192-scale features. It predicts complete UTF-8 answers, using259 byte/special symbols, without global mean pooling or answer-embedding regression. Missing/unanswerable and >64-byte answers are skipped, not silently truncated. Teacher forcing is confined to this head.
+Branch: `exp/mask-conditioned-answer`, from token supervision commit `cb805f8`. Start a fresh 20-epoch experiment from pretrained CLIP. No teacher checkpoint, external reader or old experiment checkpoint is required.
 
-## Architecture and supervision
+## Architecture
 
-The original I336 CLIP + I768 detail pyramid, Q conditioning and mask losses are unchanged. The head reads shared192-scale features after mask prediction. GT Answer/region never enter the grounding path. Auxiliary gradients update shared features. There is no extra VLM, image encoder, latent answer or scope selector.
+The main question-only pyramid is unchanged: CLIP I336 + detail CNN I768 + Q -> I768 mask logits. The training-only reader adds **739,587 parameters**. Standard eval removes it before GPU transfer; inference requires only I+Q.
 
-New config keys: answer_weight=0.05, answer_warmup_epochs=2, answer_ramp_epochs=3. Other optimizer/freeze/config options remain available through train.py --help. fp_weight is inactive for Dice. Standard eval drops the answer head. Both new experiments require fresh training; old experiment artifacts stay unchanged.
+A two-layer width-128 Transformer reads 32-channel decoder features at scale 192, area-pooled to a fixed full-image 32x32 grid. GT and predicted reads use identical positions, without GT-dependent cropping. Mask coverage becomes a normalized log attention prior. Byte teacher forcing uses a 64-byte limit; missing, unanswerable and overlength answers are skipped, not truncated. Reader math stays float32 under AMP.
 
-## Complete Kaggle guide
+```text
+Image + Q -> Pyramid -> Final logits -> segmentation + auxiliary mask losses
+                |            |
+                |            +-> soft mask -> fixed reader -> mask-answer hinge
+                |                               ^
+                +-> detached decoder feature ---+
+                |
+                +-> feature + GT mask -> trainable reader -> answer CE
+                +-> feature + full mask -> no-gradient reader reference
+```
 
-# GT-region answer token supervision
+For each image:
 
-Branch `exp/answer-token-supervision`, based on pyramid commit `ddfdce1`. Enable Internet and2 T4 GPUs. Train20 fresh epochs from pretrained CLIP; no parent/teacher checkpoint or external VLM is required. The grounder remains the original large pyramid; only the additional head is small. T4 VRAM/runtime have not been measured. Start with an empty outputs directory.
+- `C_gt`: GT-region answer CE trains the reader and shared features.
+- `C_full`: detached full-image answer CE.
+- `C_pred`: predicted-region answer CE. Reader weights and input feature are detached, but mask gradients stay live. This uses `torch.func.functional_call`, with no extra model copy or mutation of DDP parameter flags.
+- `reliable = valid_GT_answer_and_region AND (C_full - C_gt > reader_margin)`.
+- `L_mask = reliable * relu(C_pred - stopgrad(C_gt) - mask_answer_tolerance)`.
+- Total loss is original segmentation/auxiliary losses + scheduled `answer_weight * mean(C_gt)` + scheduled `mask_answer_weight * mean(L_mask)`.
 
-## 1. Setup
+Means count original images, not just valid/reliable examples, preserving DDP and partial accumulation weighting. The reliability decision is detached. It measures region informativeness, not guaranteed answer correctness. The hinge stops pushing when the predicted-region read reaches the GT reference within tolerance.
+
+Normalization removes absolute mask mass as a reader cue, but cannot guarantee that expansion will never help. Segmentation still determines correct extent. Fixed-grid pooling preserves tiny GT coverage but cannot recover lost image detail. The decoder features are already Q-conditioned and may carry context beyond the selected region; this method is not proof of causal localization. Benefits remain experimental.
+
+## Kaggle setup
+
+Enable Internet and two GPUs. Use a fresh output directory. Local tests are CPU-only; GPU memory/runtime are not measured. All outputs remain directly under `outputs`.
+
+Python cell:
 
 ```python
-!git clone --single-branch --branch exp/answer-token-supervision https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+!git clone --single-branch --branch exp/mask-conditioned-answer https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
 %cd /kaggle/working/VizWiz-VQA-Grounding
 !uv sync --frozen
 ```
 
-## 2. Paths and one config
-
-All files remain directly under outputs. JSON overrides flags, then defaults.
+Python cell:
 
 ```python
 import json
 import os
 from pathlib import Path
 
-os.environ['DATA_ROOT'] = '/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz'
-os.environ['RUN_ROOT'] = 'outputs'
-os.environ['RUN_NAME'] = 'answer_token_supervision_ep20_seed42'
-os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['MPLBACKEND'] = 'Agg'
-root = Path(os.environ['RUN_ROOT'])
-(root / 'configs').mkdir(parents=True, exist_ok=True)
-config = {'overlap_loss': 'dice', 'overlap_weight': 0.5, 'fp_weight': 0.7, 'aux96_weight': 0.1, 'aux192_weight': 0.2, 'aux384_weight': 0.3, 'answer_weight': 0.05, 'answer_warmup_epochs': 2, 'answer_ramp_epochs': 3}
-(root / 'configs/answer.json').write_text(json.dumps(config, indent=2))
+os.environ["DATA_ROOT"] = "/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz"
+os.environ["RUN_ROOT"] = "outputs"
+os.environ["RUN_NAME"] = "mask_conditioned_answer_ep20_seed42"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MPLBACKEND"] = "Agg"
+root = Path(os.environ["RUN_ROOT"])
+(root / "configs").mkdir(parents=True, exist_ok=True)
+config = {
+    "overlap_loss": "dice", "overlap_weight": 0.5, "fp_weight": 0.7,
+    "aux96_weight": 0.1, "aux192_weight": 0.2, "aux384_weight": 0.3,
+    "answer_weight": 0.01, "answer_warmup_epochs": 0, "answer_ramp_epochs": 1,
+    "mask_answer_weight": 0.01,
+    "mask_answer_warmup_epochs": 5, "mask_answer_ramp_epochs": 5,
+    "reader_margin": 0.05, "mask_answer_tolerance": 0.05,
+}
+(root / "configs/answer.json").write_text(json.dumps(config, indent=2))
 ```
 
-## 3. Preflight
+Config > explicit flags > defaults. Loss controls belong in JSON; optimizer/freeze controls also support flags. `fp_weight` has no effect with Dice.
 
-Both ranks must pass. This checks execution/gradients, not accuracy. Preflight updates are discarded. GPU memory is reported here before full training.
+## Preflight
 
-```python
+Both ranks must pass. Full-strength guidance is exercised even though normal training warms it up. Updates are discarded; no checkpoint is written. This checks execution/gradients, not accuracy.
+
+```bash
 %%bash
 set -euo pipefail
 uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
@@ -55,14 +84,13 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
     --gradient-checkpointing \
     --freeze-vision-encoder False --freeze-text-encoder True \
     --config "$RUN_ROOT/configs/answer.json"
-
 ```
 
-## 4. Train20 epochs
+## Train 20 epochs
 
-Global microbatch2 is1 image/GPU; accumulation2 gives effective batch4. Use batch4/accumulation1 if preflight fits. Vision fine-tunes; text stays frozen. Adam1e-5/no schedule matches the pyramid recipe. Answer loss is disabled for epochs1–2 and ramps in epochs3–5. No internal validation runs every epoch.
+Global microbatch 2 is one image/GPU; accumulation 2 gives effective batch 4. If memory permits, preflight with batch 4, then use batch 4 / accumulation 1. Vision fine-tunes; text is frozen. No internal per-epoch validation runs.
 
-```python
+```bash
 %%bash
 set -euo pipefail
 uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
@@ -77,62 +105,33 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
     --gradient-checkpointing \
     --seed 42 --save-every 10 \
     --config "$RUN_ROOT/configs/answer.json"
-
 ```
 
-## 5. Four evaluations
+Epochs 1-5 train segmentation and the GT reader. Epochs 6-10 ramp mask guidance from 0.002 to 0.01; epochs 11-20 use full configured weights. The reader keeps learning from GT; only its use on predicted masks has detached weights.
 
-Native mean per-image IoU is primary; global foreground IoU is separate. Masks are native size. Eval removes the auxiliary head before GPU transfer. Inputs are I+Q only. Select checkpoints on validation, never test.
+## Four evaluations
 
-```python
+Validation/test at epoch 10/20 go into four separate folders. Batch 4 is for eval; reduce if necessary. Reports include native mean IoU and separate global foreground IoU. Local test metrics require test GT. Select checkpoints/settings on validation, not test.
+
+```bash
 %%bash
 set -euo pipefail
-uv run --frozen eval.py \
-    --checkpoint "$RUN_ROOT/checkpoint_epoch10.pt" \
-    --dataset val --data-root "$DATA_ROOT" \
-    --batch-size 4 --num-workers 2 \
-    --output-dir "$RUN_ROOT/eval_val_ep10"
-
+for epoch in 10 20; do
+    for split in val test; do
+        uv run --frozen eval.py \
+            --checkpoint "$RUN_ROOT/checkpoint_epoch${epoch}.pt" \
+            --dataset "$split" --data-root "$DATA_ROOT" \
+            --batch-size 4 --num-workers 2 \
+            --output-dir "$RUN_ROOT/eval_${split}_ep${epoch}"
+    done
+done
 ```
 
-```python
-%%bash
-set -euo pipefail
-uv run --frozen eval.py \
-    --checkpoint "$RUN_ROOT/checkpoint_epoch10.pt" \
-    --dataset test --data-root "$DATA_ROOT" \
-    --batch-size 4 --num-workers 2 \
-    --output-dir "$RUN_ROOT/eval_test_ep10"
+## Diagnostics in the same session
 
-```
+Mask analysis is CPU-only. Answer diagnostic reuses I+Q grounding features, then uses GT validation masks/answers for GT-region, predicted-region, full-image and zero-visual reads. Byte accuracy is teacher-forced, not free-generation VQA accuracy.
 
-```python
-%%bash
-set -euo pipefail
-uv run --frozen eval.py \
-    --checkpoint "$RUN_ROOT/checkpoint_epoch20.pt" \
-    --dataset val --data-root "$DATA_ROOT" \
-    --batch-size 4 --num-workers 2 \
-    --output-dir "$RUN_ROOT/eval_val_ep20"
-
-```
-
-```python
-%%bash
-set -euo pipefail
-uv run --frozen eval.py \
-    --checkpoint "$RUN_ROOT/checkpoint_epoch20.pt" \
-    --dataset test --data-root "$DATA_ROOT" \
-    --batch-size 4 --num-workers 2 \
-    --output-dir "$RUN_ROOT/eval_test_ep20"
-
-```
-
-## 6. Diagnostics
-
-Mask analysis is CPU-only. The auxiliary diagnostic reuses one image encoding to compare GT-region, full-image and zero-visual predictions. Grounding is computed first using I+Q. Byte accuracy is teacher-forced, not free-generation VQA accuracy. Dense class accuracy includes background; inspect foreground accuracy and vocabulary coverage separately. Near-identical GT/zero-visual scores suggest the head ignores image content.
-
-```python
+```bash
 %%bash
 set -euo pipefail
 for epoch in 10 20; do
@@ -140,38 +139,40 @@ for epoch in 10 20; do
         --predictions "$RUN_ROOT/eval_val_ep${epoch}" \
         --data-root "$DATA_ROOT" \
         --output-dir "$RUN_ROOT/diagnostic_ep${epoch}"
+    uv run --frozen diagnose_answers.py \
+        --checkpoint "$RUN_ROOT/checkpoint_epoch${epoch}.pt" \
+        --data-root "$DATA_ROOT" \
+        --batch-size 4 --num-workers 2 \
+        --output-dir "$RUN_ROOT/answer_diagnostic_ep${epoch}"
 done
-uv run --frozen diagnose_answers.py \
-    --checkpoint "$RUN_ROOT/checkpoint_epoch20.pt" \
-    --data-root "$DATA_ROOT" \
-    --batch-size 4 --num-workers 2 \
-    --output-dir "$RUN_ROOT/answer_diagnostic_ep20"
-
 ```
 
-## 7. Download ZIP without checkpoints
+Inspect `history.jsonl`: answer loss/accuracy/valid fraction, `mask_answer_loss`, `reader_reliable_fraction`, `mask_answer_active_fraction`, `reader_visual_gain`, `predicted_answer_loss` and effective weights. Fractions count all images. A low reliable/active fraction means limited guidance, not automatically a bug. Check size-group IoU, precision/recall and mask area; answer loss alone is not evidence of success.
 
-Includes config, run_config, history, four evaluations and diagnostics. Download .pt checkpoints separately from Kaggle Outputs; keep the selected checkpoint.
+## ZIP without checkpoints
+
+Python cell:
 
 ```python
-import os
-from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
-root = Path(os.environ['RUN_ROOT'])
-archive = root / (os.environ['RUN_NAME'] + '.zip')
-with ZipFile(archive, 'w', compression=ZIP_DEFLATED) as bundle:
-    for path in sorted(root.rglob('*')):
-        if path.is_file() and path.suffix.lower() not in {'.pt', '.zip', '.tmp'}:
+root = Path(os.environ["RUN_ROOT"])
+archive = root / (os.environ["RUN_NAME"] + ".zip")
+with ZipFile(archive, "w", compression=ZIP_DEFLATED) as bundle:
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and path.suffix.lower() not in {".pt", ".zip", ".tmp"}:
             bundle.write(path, path.relative_to(root))
 print(archive)
-
 ```
 
-## Controls and resume
+Download `.pt` checkpoints separately and keep the selected one.
 
-For a matched no-answer control, change only answer_weight to0 and use a fresh run/session. Resume only this branch's full checkpoint with --resume-checkpoint; repeat original settings and set a larger total num-epochs. Annotation hashes, architecture and vocabulary must match. Old pyramid/latent/scope checkpoints are not valid resumes.
+## Controls and checkpoint compatibility
 
-Loss reduction: mean valid targets within each image, then mean original images. Invalid answers contribute zero; answer_valid_fraction reports coverage. This matches DDP and partial accumulation-window sample weighting.
+- First run defaults above.
+- To isolate mask guidance, set only `mask_answer_weight=0` and train fresh. The fixed-grid GT reader still learns; this differs from the earlier cropped token-reader branch.
+- To disable all answer supervision, set both `answer_weight=0` and `mask_answer_weight=0`. A fresh untrained reader must not guide masks with its own training disabled.
+- Resume only this branch's full checkpoint with `--resume-checkpoint` and original settings. `--num-epochs` is the total desired epochs. Architecture/settings/annotation hashes must match.
+- Old checkpoints remain valid on their original branches, but cannot resume this experiment. This branch needs fresh training.
 
-Answer loss supervises shared representations, not the predicted mask directly. Improvements and visual dependence are hypotheses. Compare size groups and an answer_weight0 control before attributing gains to Answer. CPU synthetic tests do not establish T4 performance or accuracy.
+CPU checks validate execution, gradient routing, checkpoint and evaluation behavior, not CUDA memory fit, runtime or improved accuracy. Full train + eval + diagnostics can still exceed a session's runtime budget.

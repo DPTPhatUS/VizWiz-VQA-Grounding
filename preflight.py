@@ -48,7 +48,11 @@ def checked_step(
             loss, _ = objective(
                 wrapped,
                 batch,
-                epoch=objective.answer_warmup_epochs + objective.answer_ramp_epochs,
+                epoch=max(
+                    objective.answer_warmup_epochs + objective.answer_ramp_epochs,
+                    objective.mask_answer_warmup_epochs
+                    + objective.mask_answer_ramp_epochs,
+                ),
             )
         if rank_counts([not bool(torch.isfinite(loss))])[0]:
             raise FloatingPointError(

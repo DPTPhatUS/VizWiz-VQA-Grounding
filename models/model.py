@@ -10,11 +10,11 @@ from models.image_encoder import ImageEncoder, TinyVision
 from models.mask_decoder import DetailDecoder
 from models.text_encoder import TextEncoder, masked_mean
 
-EXPERIMENT = "answer-token-supervision-v1"
+EXPERIMENT = "mask-conditioned-answer-v1"
 
 
 class GroundingModel(nn.Module):
-    """336 CLIP view + 768 CNN view + Q -> 768 logits; never consumes an answer."""
+    """I+Q mask grounder; GT answers enter training-only reader views."""
 
     def __init__(self, tiny: bool = False, gradient_checkpointing: bool = False):
         super().__init__()
@@ -68,9 +68,11 @@ class GroundingModel(nn.Module):
             "auxiliary_heads": [96, 192, 384],
             "refiner": "signed-logit-residual",
             "normalization": "clip-rgb-both-views",
-            "answer_supervision": "gt-region-autoregressive-utf8",
+            "answer_supervision": "reliable-fixed-reader-mask-guidance",
             "answer_feature_scale": 192,
             "answer_max_bytes": 64,
+            "answer_grid_size": 4 if tiny else 32,
+            "answer_attention": "normalized-log-mask-prior",
         }
         # Construct after the parent to preserve its seeded initialization.
         self.answer_head = AnswerHead(12 if tiny else 32, tiny=tiny)
@@ -133,6 +135,17 @@ class GroundingModel(nn.Module):
             output.update(
                 self.answer_head(answer_feature, batch["mask"], batch["answer_text"])
             )
+            if batch.get("mask_answer_supervision", False):
+                # The final mask is the sole live input of this auxiliary view.
+                output["predicted_answer"] = self.answer_head.supervise_mask(
+                    answer_feature, final.float().sigmoid(), batch["answer_text"]
+                )
+                with torch.no_grad():
+                    output["full_answer"] = self.answer_head(
+                        answer_feature.detach(),
+                        torch.ones_like(batch["mask"]),
+                        batch["answer_text"],
+                    )
         if batch.get("inspect_answer", False):
             output["answer_features"] = answer_feature
         return output

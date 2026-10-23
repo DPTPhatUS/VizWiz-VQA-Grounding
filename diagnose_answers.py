@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 from dataset import VizWizGroundingDataset, make_loader
-from losses import answer_statistics
+from losses import TRAINING_DEFAULTS, answer_statistics
 from models.model import GroundingModel
 from utils import (
     checkpoint_model_kwargs,
@@ -44,6 +44,10 @@ def main(argv=None):
         detail_size=model.detail_size,
         include_answers=True,
     )
+    settings = {
+        **TRAINING_DEFAULTS,
+        **saved.get("run_config", {}).get("training_config", {}),
+    }
     rows = []
     with torch.inference_mode():
         for batch in make_loader(dataset, args, args.batch_size):
@@ -54,6 +58,7 @@ def main(argv=None):
             views = {
                 "gt_region": batch["mask"],
                 "full_image": torch.ones_like(batch["mask"]),
+                "predicted_region": output["logits"].float().sigmoid(),
                 "zero_visual": batch["mask"],
             }
             stats = {}
@@ -70,6 +75,20 @@ def main(argv=None):
                         "teacher_forced_accuracy": float(accuracy[i]),
                         "valid": bool(valid[i]),
                     }
+                gain = row["full_image"]["ce"] - row["gt_region"]["ce"]
+                row["reader_visual_gain"] = gain
+                row["reader_reliable"] = (
+                    row["gt_region"]["valid"] and gain > settings["reader_margin"]
+                )
+                row["mask_answer_gap"] = max(
+                    0.0,
+                    row["predicted_region"]["ce"]
+                    - row["gt_region"]["ce"]
+                    - settings["mask_answer_tolerance"],
+                )
+                row["guidance_active"] = (
+                    row["reader_reliable"] and row["mask_answer_gap"] > 0
+                )
                 rows.append(row)
     valid = [r for r in rows if r["gt_region"]["valid"]]
     report = {
@@ -81,8 +100,16 @@ def main(argv=None):
                 key: sum(r[name][key] for r in valid) / len(valid) if valid else None
                 for key in ("ce", "teacher_forced_accuracy")
             }
-            for name in ("gt_region", "full_image", "zero_visual")
+            for name in ("gt_region", "full_image", "predicted_region", "zero_visual")
         },
+        "reader_margin": settings["reader_margin"],
+        "mask_answer_tolerance": settings["mask_answer_tolerance"],
+        "reader_reliable_fraction": sum(r["reader_reliable"] for r in rows) / len(rows)
+        if rows
+        else None,
+        "guidance_active_fraction": sum(r["guidance_active"] for r in rows) / len(rows)
+        if rows
+        else None,
         "interpretation": "Auxiliary teacher-forced byte accuracy, not free-generation VQA accuracy. GT/answer used only for this diagnostic; grounding logits were computed first from I+Q.",
     }
     out.mkdir(parents=True, exist_ok=True)
