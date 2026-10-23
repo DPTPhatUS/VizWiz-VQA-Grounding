@@ -22,10 +22,15 @@ def read_checkpoint(path):
 
 
 def checkpoint_model_kwargs(saved):
+    from answer_data import vocabulary_digest
     from models.model import EXPERIMENT
 
     state = saved["model_state_dict"]
     key = "refiner.correction.weight"
+    if "answer_head.classifier.weight" not in state:
+        raise ValueError(
+            "Use a dense-answer-supervision checkpoint; other experiments are not valid resumes"
+        )
     if key not in state or "detail_pyramid.encoder.0.0.0.weight" not in state:
         raise ValueError(
             "Use a question-guided-detail-pyramid checkpoint; older experiments belong to their original branches"
@@ -41,7 +46,24 @@ def checkpoint_model_kwargs(saved):
             raise ValueError("Checkpoint belongs to a different experiment")
         if "tiny" in config and config["tiny"] != tiny:
             raise ValueError("Checkpoint tiny metadata disagrees with tensors")
-    return {"tiny": tiny}
+    config = saved.get("experiment_config") or saved.get("run_config", {}).get(
+        "experiment_config", {}
+    )
+    vocabulary = config.get("answer_vocabulary")
+    if (
+        not isinstance(vocabulary, list)
+        or not vocabulary
+        or not all(isinstance(x, str) for x in vocabulary)
+    ):
+        raise ValueError(
+            "Dense checkpoints require saved train-answer vocabulary metadata"
+        )
+    digest = state.get("answer_head.vocabulary_hash")
+    if digest is None or bytes(digest.tolist()) != vocabulary_digest(vocabulary):
+        raise ValueError("Answer vocabulary metadata does not match checkpoint tensors")
+    if state["answer_head.classifier.weight"].shape[0] != len(vocabulary) + 1:
+        raise ValueError("Classifier size does not match answer vocabulary")
+    return {"tiny": tiny, "answer_vocabulary": vocabulary}
 
 
 def load_model_weights(model, saved):

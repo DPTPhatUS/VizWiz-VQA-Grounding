@@ -1,9 +1,6 @@
 """Short real-backbone forward/backward/DDP check before a full Kaggle run."""
 
 import argparse
-from train import resolve_training_arguments
-from train import TRAINING_DEFAULTS
-from training_options import TrainingArgumentParser, TrainingControls
 import json
 import os
 import time
@@ -13,15 +10,26 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DistributedSampler
 
+from answer_data import build_answer_vocabulary
 from dataset import VizWizGroundingDataset, make_loader
 from losses import SegmentationObjective
 from models.model import GroundingModel
-from train import seed_everything
+from train import TRAINING_DEFAULTS, resolve_training_arguments, seed_everything
+from training_options import TrainingArgumentParser, TrainingControls
 from utils import to_device
 
 
 def checked_step(
-    model, wrapped, objective, batch, optimizer, scaler, device, *, max_scale_retries=8, training_controls=None
+    model,
+    wrapped,
+    objective,
+    batch,
+    optimizer,
+    scaler,
+    device,
+    *,
+    max_scale_retries=8,
+    training_controls=None,
 ):
     """Require one successful update; let AMP calibrate without hiding broken gradients."""
     world = dist.get_world_size() if dist.is_initialized() else 1
@@ -37,7 +45,12 @@ def checked_step(
         with torch.autocast(
             device.type, dtype=torch.float16, enabled=scaler.is_enabled()
         ):
-            loss, _ = objective(wrapped, batch)
+            # Exercise the auxiliary loss at full weight, even though training warms it up.
+            loss, _ = objective(
+                wrapped,
+                batch,
+                epoch=objective.answer_warmup_epochs + objective.answer_ramp_epochs,
+            )
         if rank_counts([not bool(torch.isfinite(loss))])[0]:
             raise FloatingPointError(
                 "Preflight forward loss is nonfinite on at least one rank"
@@ -89,15 +102,15 @@ def checked_step(
                 raise RuntimeError("AMP overflow did not reduce the loss scale")
             print(
                 json.dumps(
-                    dict(
-                        event="amp_loss_scale_backoff",
-                        rank=dist.get_rank() if dist.is_initialized() else 0,
-                        previous_scale=previous,
-                        next_scale=scaler.get_scale(),
-                        retry=attempt + 1,
-                        nonfinite_parameters=nonfinite[:3],
-                        optimizer_update=False,
-                    )
+                    {
+                        "event": "amp_loss_scale_backoff",
+                        "rank": dist.get_rank() if dist.is_initialized() else 0,
+                        "previous_scale": previous,
+                        "next_scale": scaler.get_scale(),
+                        "retry": attempt + 1,
+                        "nonfinite_parameters": nonfinite[:3],
+                        "optimizer_update": False,
+                    }
                 ),
                 flush=True,
             )
@@ -148,7 +161,10 @@ def main(argv=None):
     try:
         seed_everything(42)
         model = (
-            GroundingModel(gradient_checkpointing=args.gradient_checkpointing)
+            GroundingModel(
+                gradient_checkpointing=args.gradient_checkpointing,
+                answer_vocabulary=build_answer_vocabulary(args.data_root),
+            )
             .to(device)
             .train()
         )
@@ -202,19 +218,20 @@ def main(argv=None):
             torch.cuda.synchronize(device)
         print(
             json.dumps(
-                dict(
-                    rank=rank,
-                    status="passed",
-                    steps=args.steps,
-                    amp_scale_retries=scale_retries,
-                    final_loss_scale=scaler.get_scale(),
-                    device=str(device),
-                    seconds=time.perf_counter() - start,
-                    peak_allocated_gib=torch.cuda.max_memory_allocated(device) / 2**30
+                {
+                    "rank": rank,
+                    "status": "passed",
+                    "steps": args.steps,
+                    "amp_scale_retries": scale_retries,
+                    "final_loss_scale": scaler.get_scale(),
+                    "device": str(device),
+                    "seconds": time.perf_counter() - start,
+                    "peak_allocated_gib": torch.cuda.max_memory_allocated(device)
+                    / 2**30
                     if device.type == "cuda"
                     else None,
-                    interpretation="Execution/gradient check, not an accuracy result; no checkpoints written.",
-                )
+                    "interpretation": "Execution/gradient check, not an accuracy result; no checkpoints written.",
+                }
             ),
             flush=True,
         )

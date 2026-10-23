@@ -4,18 +4,24 @@ import torch
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
+from models.answer_head import AnswerHead
 from models.detail_pyramid import DetailPyramid, HighResolutionRefiner
 from models.image_encoder import ImageEncoder, TinyVision
 from models.mask_decoder import DetailDecoder
 from models.text_encoder import TextEncoder, masked_mean
 
-EXPERIMENT = "question-guided-detail-pyramid-v1"
+EXPERIMENT = "dense-answer-supervision-v1"
 
 
 class GroundingModel(nn.Module):
     """336 CLIP view + 768 CNN view + Q -> 768 logits; never consumes an answer."""
 
-    def __init__(self, tiny: bool = False, gradient_checkpointing: bool = False):
+    def __init__(
+        self,
+        tiny: bool = False,
+        gradient_checkpointing: bool = False,
+        answer_vocabulary=None,
+    ):
         super().__init__()
         self.image_encoder = TinyVision() if tiny else ImageEncoder()
         self.text_encoder = TextEncoder(tiny)
@@ -67,7 +73,17 @@ class GroundingModel(nn.Module):
             "auxiliary_heads": [96, 192, 384],
             "refiner": "signed-logit-residual",
             "normalization": "clip-rgb-both-views",
+            "answer_supervision": "sampled-dense-answer-classes",
+            "answer_feature_scale": 192,
+            "answer_vocabulary": list(answer_vocabulary or []),
+            "answer_points": {
+                "foreground": 64,
+                "hard_background": 32,
+                "uniform_background": 32,
+            },
         }
+        # Construct after the parent to preserve its seeded initialization.
+        self.answer_head = AnswerHead(12 if tiny else 32, answer_vocabulary, tiny=tiny)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -118,11 +134,23 @@ class GroundingModel(nn.Module):
             (detail_image - self.image_mean) / self.image_std, self._run
         )
         detail_question = self.question_projection(question)
-        logits, semantic, auxiliary = self.decoder(
+        logits, semantic, auxiliary, answer_feature = self.decoder(
             (*features[:3], fused), question, detail, detail_question, self._run
         )
         final = self._run(self.refiner, logits, semantic, detail[-1], detail_question)
-        return {"logits": final, "auxiliary_logits": auxiliary}
+        output = {"logits": final, "auxiliary_logits": auxiliary}
+        if self.training and batch.get("answer_supervision", False):
+            output.update(
+                self.answer_head(
+                    answer_feature,
+                    batch["mask"],
+                    batch["answer_text"],
+                    prediction=final,
+                )
+            )
+        if batch.get("inspect_answer", False):
+            output["answer_features"] = answer_feature
+        return output
 
     @classmethod
     def from_checkpoint(cls, path, device="cpu"):
