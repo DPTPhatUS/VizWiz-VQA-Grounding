@@ -1,13 +1,6 @@
 """Train the question-guided detail pyramid with native-resolution evaluation kept separate."""
 
 import argparse
-from training_options import (
-    TrainingArgumentParser,
-    TrainingControls,
-    recipe_config,
-    public_arguments,
-    restore_control_arguments,
-)
 import hashlib
 import json
 import math
@@ -26,6 +19,13 @@ from tqdm.auto import tqdm
 from dataset import VizWizGroundingDataset, make_loader
 from losses import TRAINING_DEFAULTS, SegmentationObjective
 from models.model import EXPERIMENT, GroundingModel
+from training_options import (
+    TrainingArgumentParser,
+    TrainingControls,
+    public_arguments,
+    recipe_config,
+    restore_control_arguments,
+)
 from utils import (
     checkpoint_model_kwargs,
     load_model_weights,
@@ -251,6 +251,7 @@ def _train(args, rank, world, distributed, device):
             "train.py",
             "training_options.py",
             "models/model.py",
+            "models/affinity_transport.py",
             "models/image_encoder.py",
             "models/text_encoder.py",
             "models/detail_pyramid.py",
@@ -363,7 +364,7 @@ def _train(args, rank, world, distributed, device):
                         "epoch": epoch + 1,
                         "model_state_dict": unwrap(model).state_dict(),
                         "training_controls": controls.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
                         "scaler_state_dict": scaler.state_dict(),
                         "experiment_config": unwrap(model).experiment_config,
                         "run_config": run_config,

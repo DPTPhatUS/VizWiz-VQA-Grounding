@@ -5,6 +5,8 @@ import math
 import torch
 from torch.nn import functional as F
 
+from models.affinity_transport import affinity_loss
+
 TRAINING_DEFAULTS = {
     "overlap_loss": "dice",
     "overlap_weight": 0.5,
@@ -12,6 +14,8 @@ TRAINING_DEFAULTS = {
     "aux96_weight": 0.1,
     "aux192_weight": 0.2,
     "aux384_weight": 0.3,
+    "coarse_weight": 0.2,
+    "affinity_weight": 0.05,
 }
 
 
@@ -62,25 +66,30 @@ class SegmentationObjective:
         aux96_weight=0.1,
         aux192_weight=0.2,
         aux384_weight=0.3,
+        coarse_weight=0.2,
+        affinity_weight=0.05,
     ):
         if overlap_loss not in {"dice", "tversky"}:
             raise ValueError("overlap_loss must be dice or tversky")
-        for name, value in dict(
-            overlap_weight=overlap_weight,
-            fp_weight=fp_weight,
-            aux96_weight=aux96_weight,
-            aux192_weight=aux192_weight,
-            aux384_weight=aux384_weight,
-        ).items():
+        for name, value in {
+            "overlap_weight": overlap_weight,
+            "fp_weight": fp_weight,
+            "aux96_weight": aux96_weight,
+            "aux192_weight": aux192_weight,
+            "aux384_weight": aux384_weight,
+            "coarse_weight": coarse_weight,
+            "affinity_weight": affinity_weight,
+        }.items():
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
         if not 0 < fp_weight < 1:
             raise ValueError("fp_weight must be strictly between zero and one")
-        self.loss_kwargs = dict(
-            overlap_loss=overlap_loss,
-            overlap_weight=overlap_weight,
-            fp_weight=fp_weight,
-        )
+        self.coarse_weight, self.affinity_weight = coarse_weight, affinity_weight
+        self.loss_kwargs = {
+            "overlap_loss": overlap_loss,
+            "overlap_weight": overlap_weight,
+            "fp_weight": fp_weight,
+        }
         self.auxiliary_weights = dict(
             zip(("96", "192", "384"), (aux96_weight, aux192_weight, aux384_weight))
         )
@@ -102,4 +111,18 @@ class SegmentationObjective:
             loss = segmentation_loss(logits, target, **self.loss_kwargs)
             total = total + weight * loss
             components[f"aux{name}_loss"] = loss.detach()
+        coarse = segmentation_loss(
+            output["coarse_logits"], batch["mask"], **self.loss_kwargs
+        )
+        pair = affinity_loss(output["affinity_logits"], batch["mask"])
+        total = total + self.coarse_weight * coarse + self.affinity_weight * pair
+        components.update(
+            coarse_segmentation=coarse.detach(),
+            affinity_loss=pair.detach(),
+            mean_logit_movement=(
+                output["logits"].detach() - output["coarse_logits"].detach()
+            )
+            .abs()
+            .mean(),
+        )
         return total, components
