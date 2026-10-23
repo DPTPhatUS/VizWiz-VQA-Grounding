@@ -4,7 +4,7 @@ Branch `exp/area-calibrated-pyramid`; parent pyramid `ddfdce1`. Fresh training, 
 
 ## Design and limits
 
-The main decoder learns pixel scores. A small area controller reads a 4x4 layout of decoder features, the Q feature and detached mask statistics. It predicts a bounded correction to logit foreground area. A differentiable scalar-bias solve enforces mean(sigmoid(final_logits)) = predicted_area on the model output grid. The solver preserves within-image pixel ordering. Its backward uses implicit derivatives, not an unrolled solve. Initialization reproduces the parent logits within float32 tolerance. The area loss is smooth L1 on logit area; it emphasizes multiplicative errors on small regions. GT area is a training target only. Inference predicts area from I+Q.
+The main decoder learns pixel scores. An independent small area controller reads a 4x4 layout of decoder features and the Q feature. It predicts logit foreground area directly, without receiving current mask probabilities or area statistics. This avoids learning an identity correction on overly accurate training masks. A differentiable scalar-bias solve enforces mean(sigmoid(final_logits)) = predicted_area on the model output grid. The solver preserves within-image pixel ordering. Its backward uses implicit derivatives, not an unrolled solve. The zero-initialized last area layer starts with a neutral 0.5 soft-area prior, not a dataset-derived prior; segmentation and area supervision learn the image-specific area from scratch. The area loss is smooth L1 on logit area; it emphasizes multiplicative errors on small regions. GT area is a training target only. Inference predicts area from I+Q.
 
 This separates *which pixels rank higher* from *how much foreground to predict*. It cannot rescue a wrong spatial ranking, and predicted soft area is not the binary mask area. The constraint is on the model grid, not guaranteed after native resizing. A wrong area estimate can hurt a large region; there is no accuracy-preservation guarantee.
 
@@ -14,7 +14,7 @@ Related work: [RankSEG, JMLR 2023](https://arxiv.org/html/2206.13086v3) separate
 ```text
 Image + Q -> pyramid -> raw final logits --------------------+
                 |                                          |
-                +-> decoder feature + Q + mask statistics    |
+                +-> decoder feature + Q (no mask statistics)    |
                                   |                         |
                          small area controller              |
                                   |                         |
@@ -25,7 +25,7 @@ Image + Q -> pyramid -> raw final logits --------------------+
                                          final mask
 ```
 
-The module constructor takes feature-channel/question dimensions and accepts rectangular spatial grids. It has no CLIP-specific imports, patch count or fixed image size. The experiment adapter is currently wired to the existing 336/768 CLIP pyramid. Trying a different backbone still requires its feature/preprocessing adapter; multiple trained backbones are not validated.
+The added module has **18,081 parameters** in this pyramid adapter. The module constructor takes feature-channel/question dimensions and accepts rectangular spatial grids. It has no CLIP-specific imports, patch count or fixed image size. The experiment adapter is currently wired to the existing 336/768 CLIP pyramid. Trying a different backbone still requires its feature/preprocessing adapter; multiple trained backbones are not validated.
 
 Training uses the original final/auxiliary segmentation losses plus coarse segmentation (weight 0.2) and logit-area loss (weight 0.1). The coarse loss protects the uncorrected predictor during joint training; it does not ensure no regression. Compare both final-vs-coarse within this run and final-vs-independent parent. These are different comparisons.
 

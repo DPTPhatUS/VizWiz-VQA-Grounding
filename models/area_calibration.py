@@ -51,7 +51,7 @@ def project_foreground_mass(scores, area):
 
 
 class AreaCalibration(nn.Module):
-    """Predict an image-specific mass correction from any decoder feature + Q.
+    """Predict image-specific foreground mass from any decoder feature + Q.
 
     Constructor dimensions are the only backbone adapters. No CLIP/ViT names,
     patch counts, square-grid assumptions, or fixed input resolution occur here.
@@ -62,25 +62,18 @@ class AreaCalibration(nn.Module):
         self.visual = nn.Sequential(nn.Conv2d(feature_channels, width, 1), nn.GELU())
         self.question = nn.Sequential(nn.Linear(question_dim, width), nn.GELU())
         self.area = nn.Sequential(
-            nn.Linear(width * 17 + 17, width * 4), nn.GELU(), nn.Linear(width * 4, 1)
+            nn.Linear(width * 17, width * 4), nn.GELU(), nn.Linear(width * 4, 1)
         )
         nn.init.zeros_(self.area[-1].weight)
         nn.init.zeros_(self.area[-1].bias)
         self.register_buffer("format_version", torch.tensor(1))
 
     def forward(self, logits, feature, question):
-        # Detach score statistics: area is learned from features/Q, while the
-        # projected segmentation gradient learns relative pixel scores.
-        probability = logits.detach().float().sigmoid()
-        base_area = probability.mean((1, 2, 3)).clamp(1e-6, 1 - 1e-6)
-        base_prior = torch.logit(base_area)
+        # Predict extent independently: do not let near-perfect train masks
+        # teach a trivial identity correction that cannot transfer to validation.
         visual = F.adaptive_avg_pool2d(self.visual(feature), (4, 4)).flatten(1)
-        layout = F.adaptive_avg_pool2d(probability, (4, 4)).flatten(1)
-        descriptor = torch.cat(
-            (visual, self.question(question), layout, base_prior[:, None]), 1
-        )
-        correction = 6 * self.area(descriptor).float().squeeze(1).tanh()
-        area_logit = base_prior + correction
+        descriptor = torch.cat((visual, self.question(question)), 1)
+        area_logit = self.area(descriptor).float().squeeze(1)
         predicted_area = area_logit.sigmoid().clamp(1e-6, 1 - 1e-6)
         calibrated = project_foreground_mass(logits, predicted_area)
         return {

@@ -68,7 +68,7 @@ class GroundingModel(nn.Module):
             "auxiliary_heads": [96, 192, 384],
             "refiner": "signed-logit-residual",
             "normalization": "clip-rgb-both-views",
-            "calibration": "implicit-foreground-mass-v1",
+            "calibration": "independent-foreground-mass-v1",
             "calibration_width": 8 if tiny else 16,
         }
 
