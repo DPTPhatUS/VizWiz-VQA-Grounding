@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from torch.func import functional_call
 from torch.nn import functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from answer_data import BOS, EOS, MAX_ANSWER_BYTES, VOCAB_SIZE, answer_bytes
 
@@ -42,7 +43,13 @@ class AnswerHead(nn.Module):
         nn.init.normal_(self.answer_position, std=0.02)
 
     def forward(self, feature, mask, answers):
-        with torch.autocast(feature.device.type, enabled=False):
+        # CUDA fused SDPA backward can fail LSE alignment for variable-length
+        # answer queries with differentiable additive mask priors. Scope the
+        # reference backend to this small reader; leave backbone attention intact.
+        with (
+            torch.autocast(feature.device.type, enabled=False),
+            sdpa_kernel(SDPBackend.MATH),
+        ):
             return self._read(feature.float(), mask.float(), answers)
 
     def _read(self, feature, mask, answers):

@@ -6,7 +6,7 @@ Branch: `exp/mask-conditioned-answer`, from token supervision commit `cb805f8`. 
 
 The main question-only pyramid is unchanged: CLIP I336 + detail CNN I768 + Q -> I768 mask logits. The training-only reader adds **739,587 parameters**. Standard eval removes it before GPU transfer; inference requires only I+Q.
 
-A two-layer width-128 Transformer reads 32-channel decoder features at scale 192, area-pooled to a fixed full-image 32x32 grid. GT and predicted reads use identical positions, without GT-dependent cropping. Mask coverage becomes a normalized log attention prior. Byte teacher forcing uses a 64-byte limit; missing, unanswerable and overlength answers are skipped, not truncated. Reader math stays float32 under AMP.
+A two-layer width-128 Transformer reads 32-channel decoder features at scale 192, area-pooled to a fixed full-image 32x32 grid. GT and predicted reads use identical positions, without GT-dependent cropping. Mask coverage becomes a normalized log attention prior. Byte teacher forcing uses a 64-byte limit; missing, unanswerable and overlength answers are skipped, not truncated. Reader math stays float32 under AMP and uses the reference MATH attention backend, avoiding fused CUDA backward alignment failures with variable-length answer queries and differentiable mask priors. Backbone attention is unchanged.
 
 ```text
 Image + Q -> Pyramid -> Final logits -> segmentation + auxiliary mask losses
