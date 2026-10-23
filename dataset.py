@@ -10,6 +10,8 @@ from PIL import Image, ImageOps
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms.functional import to_tensor
 
+from answer_data import answer_from_record
+
 
 def image_views(
     image: Image.Image, image_size: int = 336, detail_size: int = 768
@@ -26,10 +28,15 @@ def image_views(
 
 
 class VizWizGroundingDataset(Dataset):
-    def __init__(self, root, split, image_size=336, *, detail_size=768):
+    def __init__(
+        self, root, split, image_size=336, *, detail_size=768, include_answers=False
+    ):
         if split not in {"train", "val", "test"}:
             raise ValueError("Expected train, val or test split")
         self.root, self.split = Path(root), split
+        if split == "test" and include_answers:
+            raise ValueError("Test answers must never be requested")
+        self.include_answers = split == "train" or include_answers
         self.image_size, self.detail_size = image_size, detail_size
         self.records = json.loads((self.root / f"{split}_grounding.json").read_text())
         self.names = list(self.records)
@@ -67,6 +74,8 @@ class VizWizGroundingDataset(Dataset):
         )
         if self.split != "train":
             result["original_mask"] = (to_tensor(mask) > 0.5).float()
+        if self.include_answers:
+            result["answer_text"] = answer_from_record(self.records[name])
         return result
 
 
@@ -91,16 +100,16 @@ def seed_worker(worker_id):
 
 
 def make_loader(dataset, args, batch_size, sampler=None, shuffle=False, generator=None):
-    kwargs = dict(
-        batch_size=batch_size,
-        sampler=sampler,
-        shuffle=shuffle,
-        num_workers=args.num_workers,
-        collate_fn=collate_samples,
-        pin_memory=str(args.device).startswith("cuda"),
-        worker_init_fn=seed_worker,
-        generator=generator,
-    )
+    kwargs = {
+        "batch_size": batch_size,
+        "sampler": sampler,
+        "shuffle": shuffle,
+        "num_workers": args.num_workers,
+        "collate_fn": collate_samples,
+        "pin_memory": str(args.device).startswith("cuda"),
+        "worker_init_fn": seed_worker,
+        "generator": generator,
+    }
     if args.num_workers:
         kwargs["prefetch_factor"] = 2
     return DataLoader(dataset, **kwargs)

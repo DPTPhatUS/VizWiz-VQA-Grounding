@@ -34,6 +34,8 @@ def eval_main(argv=None):
     config = saved["run_config"]
     model = GroundingModel(**checkpoint_model_kwargs(saved))
     load_model_weights(model, saved)
+    # The auxiliary head is not part of deployed grounding or test-time VRAM.
+    model.answer_head = None
     device = torch.device(args.device)
     model.to(device)
     dataset = VizWizGroundingDataset(

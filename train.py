@@ -1,13 +1,6 @@
 """Train the question-guided detail pyramid with native-resolution evaluation kept separate."""
 
 import argparse
-from training_options import (
-    TrainingArgumentParser,
-    TrainingControls,
-    recipe_config,
-    public_arguments,
-    restore_control_arguments,
-)
 import hashlib
 import json
 import math
@@ -26,6 +19,13 @@ from tqdm.auto import tqdm
 from dataset import VizWizGroundingDataset, make_loader
 from losses import TRAINING_DEFAULTS, SegmentationObjective
 from models.model import EXPERIMENT, GroundingModel
+from training_options import (
+    TrainingArgumentParser,
+    TrainingControls,
+    public_arguments,
+    recipe_config,
+    restore_control_arguments,
+)
 from utils import (
     checkpoint_model_kwargs,
     load_model_weights,
@@ -163,6 +163,14 @@ def _train(args, rank, world, distributed, device):
     restore_control_arguments(args, checkpoint)
     options = checkpoint_model_kwargs(checkpoint) if checkpoint else {}
     settings = resolve_training_arguments(args, checkpoint)
+    annotation_hash = hashlib.sha256(
+        (Path(args.data_root) / "train_grounding.json").read_bytes()
+    ).hexdigest()
+    if (
+        checkpoint
+        and checkpoint["run_config"].get("train_annotation_sha256") != annotation_hash
+    ):
+        raise ValueError("Resume training annotation differs from checkpoint")
     seed_everything(args.seed)
     out = Path(args.output_dir)
     history_path = out / "history.jsonl"
@@ -239,6 +247,9 @@ def _train(args, rank, world, distributed, device):
         tiny=unwrap(model).experiment_config["tiny"],
     )
     run_config["optimization_config"] = controls.config
+    run_config["train_annotation_sha256"] = hashlib.sha256(
+        (Path(args.data_root) / "train_grounding.json").read_bytes()
+    ).hexdigest()
     run_config.update(
         gradient_clip_norm=1.0,
         gradient_clip_scope="all-trainable",
@@ -259,6 +270,8 @@ def _train(args, rank, world, distributed, device):
             "dataset.py",
             "metrics.py",
             "utils.py",
+            "answer_data.py",
+            "models/answer_head.py",
         )
     }
     if rank == 0:
@@ -363,7 +376,7 @@ def _train(args, rank, world, distributed, device):
                         "epoch": epoch + 1,
                         "model_state_dict": unwrap(model).state_dict(),
                         "training_controls": controls.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
                         "scaler_state_dict": scaler.state_dict(),
                         "experiment_config": unwrap(model).experiment_config,
                         "run_config": run_config,
