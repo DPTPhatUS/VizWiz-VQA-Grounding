@@ -1,6 +1,8 @@
 """Batch transfer and strict checkpoints for the question-guided detail pyramid."""
 
+import errno
 import os
+import shutil
 from pathlib import Path
 
 import torch
@@ -57,9 +59,43 @@ def load_model_weights(model, saved):
     model.load_state_dict(saved["model_state_dict"], strict=True)
 
 
+def checkpoint_storage_bytes(value):
+    """Count unique tensor storages, including optimizer moments and shared views."""
+    storages = {}
+
+    def visit(item):
+        if torch.is_tensor(item):
+            storage = item.untyped_storage()
+            storages[(str(storage.device), storage.data_ptr(), storage.nbytes())] = (
+                storage.nbytes()
+            )
+        elif isinstance(item, dict):
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, (tuple, list)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return sum(storages.values())
+
+
 def save_checkpoint(saved, path):
     path = Path(path)
     temporary = path.with_suffix(path.suffix + ".tmp")
+    payload_bytes = checkpoint_storage_bytes(saved)
+    required = payload_bytes + max(64 * 1024**2, payload_bytes // 20)
+    available = shutil.disk_usage(path.parent).free
+    if available < required:
+        raise OSError(
+            errno.ENOSPC,
+            f"Not enough free disk space for {path.name}: "
+            f"{available / 1024**3:.2f} GiB free, approximately "
+            f"{required / 1024**3:.2f} GiB required for the new atomic write. "
+            "Existing checkpoints are unchanged. Free disk space or use a fresh session; "
+            "no checkpoints are deleted automatically.",
+            str(path),
+        )
     try:
         torch.save(saved, temporary, _use_new_zipfile_serialization=False)
         os.replace(temporary, path)

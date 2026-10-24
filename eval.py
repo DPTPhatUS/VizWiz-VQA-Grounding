@@ -12,6 +12,42 @@ from models.model import GroundingModel
 from utils import checkpoint_model_kwargs, load_model_weights, read_checkpoint
 
 
+def write_evaluation_metrics(
+    model, scores, pixel_totals, output, config, *, dataset, checkpoint=None, epoch=None
+):
+    """Share the native-resolution export format with in-memory validation."""
+    if not scores:
+        raise ValueError("Evaluation produced no samples")
+    summary = {
+        **global_iou_summary(pixel_totals),
+        "num_samples": len(scores),
+        "mean_iou": sum(scores.values()) / len(scores),
+        "dataset": dataset,
+        "metric_resolution": "original",
+        "text_mode": "question",
+        "checkpoint": str(checkpoint) if checkpoint is not None else None,
+        "grounding_mode": "question",
+        "training_config": config.get("training_config"),
+        "objective_version": config.get("objective_version"),
+        "optimization_config": config.get("optimization_config"),
+        "effective_batch_size": config.get("effective_batch_size"),
+        "seed": config.get("seed"),
+        "world_size": config.get("world_size"),
+        "training_protocol": config.get("group_protocol"),
+        "source_sha256": config.get("source_sha256"),
+        "experiment_config": model.experiment_config,
+        "inference_precision": "float32",
+        "threshold_logit": 0,
+        "empty_union_iou": 1,
+    }
+    if epoch is not None:
+        summary["epoch"] = epoch
+    (Path(output) / "metrics.json").write_text(
+        json.dumps({"summary": summary, "per_sample": scores}, indent=2)
+    )
+    return summary
+
+
 def eval_main(argv=None):
     parser = argparse.ArgumentParser(
         description="Question-only evaluation using saved model architecture"
@@ -46,30 +82,14 @@ def eval_main(argv=None):
     out.mkdir(parents=True, exist_ok=True)
     pixel_totals = {}
     scores = evaluate(model, loader, device, out, pixel_totals=pixel_totals)
-    summary = {
-        **global_iou_summary(pixel_totals),
-        "num_samples": len(scores),
-        "mean_iou": sum(scores.values()) / len(scores),
-        "dataset": args.dataset,
-        "metric_resolution": "original",
-        "text_mode": "question",
-        "checkpoint": str(args.checkpoint),
-        "grounding_mode": "question",
-        "training_config": config.get("training_config"),
-        "objective_version": config.get("objective_version"),
-        "optimization_config": config.get("optimization_config"),
-        "effective_batch_size": config.get("effective_batch_size"),
-        "seed": config.get("seed"),
-        "world_size": config.get("world_size"),
-        "training_protocol": config.get("group_protocol"),
-        "source_sha256": config.get("source_sha256"),
-        "experiment_config": model.experiment_config,
-        "inference_precision": "float32",
-        "threshold_logit": 0,
-        "empty_union_iou": 1,
-    }
-    (out / "metrics.json").write_text(
-        json.dumps({"summary": summary, "per_sample": scores}, indent=2)
+    summary = write_evaluation_metrics(
+        model,
+        scores,
+        pixel_totals,
+        out,
+        config,
+        dataset=args.dataset,
+        checkpoint=args.checkpoint,
     )
     print(json.dumps(summary), flush=True)
 
