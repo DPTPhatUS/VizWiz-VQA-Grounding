@@ -144,3 +144,41 @@ checkpoints, and removes a partial .tmp on a failed write. Available space may
 still change during the operation. Disk errors are shared over a CPU control
 group so another GPU does not sit in NCCL waiting for a rank-zero save failure.
 CPU tests do not establish Kaggle disk fit or GPU performance.
+
+## Analyze the existing epoch-5/10/15 checkpoints (no more training)
+
+These complete checkpoints remain compatible. Stopping at epoch15 is valid for
+analysis; report the actual training duration and do not label it epoch20. A
+cross-method comparison at different durations is descriptive, not a matched
+20-epoch comparison. Keep all three checkpoints outside the writable outputs
+folder when possible (for example attach their dataset to Kaggle).
+
+After the Setup cells, set the actual directory containing all three .pt files:
+
+```python
+os.environ['LOVASZ_CKPT_ROOT'] = '/kaggle/input/YOUR_LOVASZ_CHECKPOINTS'
+os.environ['RUN_NAME'] = 'per_image_lovasz_existing_ep5_10_15_seed42'
+```
+
+Run evaluation/diagnostics only, without running the Train cell:
+
+```bash
+%%bash
+set -euo pipefail
+for epoch in 5 10 15; do
+    checkpoint="$LOVASZ_CKPT_ROOT/checkpoint_epoch${epoch}.pt"
+    test -f "$checkpoint"
+    uv run --frozen eval.py --checkpoint "$checkpoint" \
+        --dataset val --data-root "$DATA_ROOT" --batch-size 4 --num-workers 2 \
+        --output-dir "$RUN_ROOT/eval_val_ep${epoch}"
+    uv run --frozen diagnose.py --predictions "$RUN_ROOT/eval_val_ep${epoch}" \
+        --data-root "$DATA_ROOT" --output-dir "$RUN_ROOT/diagnostic_ep${epoch}"
+done
+```
+
+Use batch1 if evaluation batch4 exceeds memory. Evaluation folders must be new
+or empty. Then run the ZIP cell above; it excludes all .pt files. This analysis
+needs no epoch20 checkpoint and creates no new model checkpoints. Select using
+validation; a test export, if needed and locally annotated, can use the selected
+saved checkpoint separately. Keep the fresh-run save-every10 recipe for future
+runs; it does not invalidate existing epoch5/15 checkpoints.
