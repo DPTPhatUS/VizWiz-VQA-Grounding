@@ -19,6 +19,7 @@ from dataset import VizWizGroundingDataset, collate_samples, seed_worker
 from losses import TRAINING_DEFAULTS, SegmentationObjective
 from models.model import GroundingModel
 from train import seed_everything
+from training.parent_preservation import ParentPreservation
 from training.projection import constrained_step, gradient_vector, parameter_vector
 from training.size_groups import GROUP_NAMES, BalancedGroupBatches, mask_groups
 from training.size_objective import resolve_group_weights
@@ -37,7 +38,7 @@ from utils import (
     to_device,
 )
 
-VERSION = "size-weighted-updates-v1"
+VERSION = "parent-preserving-updates-v1"
 LOSS_DEFAULTS = {**TRAINING_DEFAULTS, "overlap_loss": "dice"}
 
 
@@ -54,6 +55,18 @@ def parser(preflight=False):
     result.add_argument("--data-root", required=True)
     result.add_argument("--output-dir", default="outputs")
     result.add_argument("--num-epochs", type=int, default=5)
+    result.add_argument(
+        "--preservation-mode",
+        choices=("none", "foreground", "parameters"),
+        default="foreground",
+        help="Training-only parent preservation",
+    )
+    result.add_argument(
+        "--preservation-strength",
+        type=float,
+        default=None,
+        help="Defaults: foreground=1, parameter L2-SP=0.01, none=0",
+    )
     result.add_argument(
         "--focus-alpha",
         type=float,
@@ -97,9 +110,9 @@ def file_hash(path):
 
 
 def collect_gradient(model, batches, objective, controls, scaler, device, group):
-    """Stream microbatches and reduce one mean group gradient across DDP ranks."""
+    """Stream per-group backward passes and retain segmentation/preservation diagnostics."""
     controls.optimizer.zero_grad(set_to_none=True)
-    total = 0.0
+    totals = [0.0] * 5
     for index, batch in enumerate(batches):
         batch = to_device(batch, device)
         area = batch["mask"].float().mean((1, 2, 3))
@@ -116,7 +129,7 @@ def collect_gradient(model, batches, objective, controls, scaler, device, group)
             with torch.autocast(
                 device.type, dtype=torch.float16, enabled=scaler.is_enabled()
             ):
-                loss, _ = objective(model, batch)
+                loss, components = objective(model, batch)
             bad = (~torch.isfinite(loss)).to(torch.int32)
             if dist.is_initialized():
                 dist.all_reduce(bad, op=dist.ReduceOp.MAX)
@@ -125,10 +138,24 @@ def collect_gradient(model, batches, objective, controls, scaler, device, group)
                     "Nonfinite group forward loss on at least one rank"
                 )
             scaler.scale(loss / len(batches)).backward()
-        total += float(loss.detach()) / len(batches)
+        zero = loss.detach().new_zeros(())
+        values = (
+            torch.stack(
+                [
+                    loss.detach(),
+                    components.get("base_objective", loss.detach()),
+                    components.get("preservation_loss", zero),
+                    components.get("protected_foreground_fraction", zero),
+                    components.get("preservation_active_fraction", zero),
+                ]
+            )
+            .double()
+            .tolist()
+        )
+        totals = [total + value / len(batches) for total, value in zip(totals, values)]
     vector = gradient_vector(controls.parameters, scaler.get_scale())
     controls.optimizer.zero_grad(set_to_none=True)
-    return vector, total
+    return vector, totals
 
 
 def one_update(
@@ -140,31 +167,60 @@ def one_update(
     device,
     project,
     group_weights=(0.5, 0.5, 0.0),
+    preservation=None,
 ):
-    gradients, losses = [], []
+    gradients, records = [], []
     for group, batches in enumerate(group_batches):
-        gradient, loss = collect_gradient(
+        gradient, statistics = collect_gradient(
             model, batches, objective, controls, scaler, device, group
         )
         gradients.append(gradient)
-        losses.append(loss)
+        records.append(statistics)
+    gradients = torch.stack(gradients)
+    extra, parameter_penalty = (
+        preservation.parameter_regularizer()
+        if preservation is not None
+        else (None, 0.0)
+    )
     metrics = constrained_step(
         controls,
         scaler,
-        torch.stack(gradients),
+        gradients,
         project=project,
         group_weights=group_weights,
+        additive_gradient=extra,
     )
+    records = torch.tensor(records, device=device, dtype=torch.float64)
     if dist.is_initialized():
-        tensor = torch.tensor(losses, device=device, dtype=torch.float64)
-        dist.all_reduce(tensor)
-        losses = (tensor / dist.get_world_size()).tolist()
-    metrics.update({"loss_" + name: loss for name, loss in zip(GROUP_NAMES, losses)})
-    metrics["macro_group_loss"] = sum(losses) / 3
-    metrics["train_loss"] = sum(
-        weight * loss for weight, loss in zip(group_weights, losses)
+        dist.all_reduce(records)
+        records /= dist.get_world_size()
+    losses, base, keep, coverage, active = records.T.tolist()
+    metrics.update({"loss_" + name: loss for name, loss in zip(GROUP_NAMES, base)})
+    metrics["macro_group_loss"] = sum(base) / 3
+    metrics["segmentation_objective"] = sum(
+        w * loss for w, loss in zip(group_weights, base)
+    )
+    strength = preservation.strength if preservation is not None else 0.0
+    foreground_penalty = strength * sum(
+        w * loss for w, loss in zip(group_weights, keep)
+    )
+    metrics["preservation_loss"] = parameter_penalty if extra is not None else keep[2]
+    metrics["preservation_weighted_loss"] = (
+        strength * parameter_penalty + foreground_penalty
+    )
+    metrics["protected_foreground_fraction"] = coverage[2]
+    metrics["preservation_active_fraction"] = active[2]
+    metrics["train_loss"] = (
+        sum(w * loss for w, loss in zip(group_weights, losses))
+        + strength * parameter_penalty
     )
     metrics["proposal_loss"] = metrics["train_loss"]
+    if extra is not None:
+        base_gradient = sum(w * g for w, g in zip(group_weights, gradients))
+        metrics["parameter_distance_l2"] = math.sqrt(2 * parameter_penalty)
+        metrics["preservation_gradient_ratio"] = float(
+            extra.double().norm() / base_gradient.double().norm().clamp_min(1e-20)
+        )
     return metrics
 
 
@@ -187,6 +243,8 @@ def execute(args, rank, world, device, preflight):
             "lr",
             "project_updates",
             "focus_alpha",
+            "preservation_mode",
+            "preservation_strength",
             "gradient_checkpointing",
         ):
             if getattr(args, key) != saved["run_config"][key]:
@@ -219,6 +277,18 @@ def execute(args, rank, world, device, preflight):
     )
     start = saved["epoch"] if args.resume_checkpoint else 0
     controls = TrainingControls(model, args, saved if args.resume_checkpoint else None)
+    if args.resume_checkpoint and "preservation_state" not in saved:
+        raise ValueError(
+            "Resume requires the original parent-preservation reference state"
+        )
+    preservation = ParentPreservation(
+        model,
+        controls.parameters,
+        args.preservation_mode,
+        args.preservation_strength,
+        saved.get("preservation_state") if args.resume_checkpoint else None,
+    )
+    objective = preservation.objective(objective)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     if args.resume_checkpoint:
         controls.optimizer.load_state_dict(saved["optimizer_state_dict"])
@@ -288,6 +358,7 @@ def execute(args, rank, world, device, preflight):
         "projection": args.project_updates,
         "constraint_relative_tolerance": 1e-6,
         "focus_alpha": args.focus_alpha,
+        "preservation": preservation.metadata,
         "natural_weights": list(natural_weights),
         "proposal_weights": list(proposal_weights),
         "initial_checkpoint": initial,
@@ -317,6 +388,7 @@ def execute(args, rank, world, device, preflight):
             "training/group_trainer.py",
             "training/size_groups.py",
             "training/size_objective.py",
+            "training/parent_preservation.py",
             "training/projection.py",
             "train.py",
             "training_options.py",
@@ -388,6 +460,7 @@ def execute(args, rank, world, device, preflight):
                     device,
                     args.project_updates,
                     proposal_weights,
+                    preservation,
                 )
                 if not preflight or metrics["optimizer_update"]:
                     break
@@ -444,6 +517,7 @@ def execute(args, rank, world, device, preflight):
                         {
                             "epoch": epoch + 1,
                             "model_state_dict": raw.state_dict(),
+                            "preservation_state": preservation.state_dict(),
                             "optimizer_state_dict": controls.optimizer.state_dict(),
                             "scaler_state_dict": scaler.state_dict(),
                             "training_controls": controls.state_dict(),
@@ -478,6 +552,18 @@ def run_main(argv=None, *, preflight=False):
         for k, d in (("RANK", 0), ("WORLD_SIZE", 1), ("LOCAL_RANK", 0))
     ]
     args.world_size = world
+    if args.preservation_strength is None:
+        args.preservation_strength = {
+            "none": 0.0,
+            "foreground": 1.0,
+            "parameters": 0.01,
+        }[args.preservation_mode]
+    if not math.isfinite(args.preservation_strength) or args.preservation_strength < 0:
+        raise ValueError("preservation-strength must be finite and nonnegative")
+    if args.preservation_mode == "none" and args.preservation_strength != 0:
+        raise ValueError("Preservation mode none requires zero strength")
+    if args.preservation_mode != "none" and args.project_updates:
+        raise ValueError("Parent preservation experiments require --no-project-updates")
     if bool(args.init_checkpoint) == bool(args.resume_checkpoint):
         raise ValueError("Choose exactly one initialization or resume checkpoint")
     if (

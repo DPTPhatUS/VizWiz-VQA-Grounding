@@ -1,35 +1,67 @@
-# Size-weighted pyramid: two five-epoch continuations in one Kaggle session
+# Parent-preserving pyramid: C and D in one Kaggle session
 
-Branch: `exp/size-weighted-pyramid`, based on scale-constrained-pyramid at
-`2e2b200`. Use `train_group.py` and `preflight_group.py`, not `train.py`.
-The model, inference, image normalization and balanced sampler are unchanged.
-There are no new inference parameters, answer heads, or validation-derived
-training targets. Both runs use frozen vision/text encoders and train CNN/decoder.
+Branch: `exp/parent-preserving-pyramid`, from size-weighted-pyramid at3cbe644.
+Run C then D sequentially in one session. Use train_group.py/preflight_group.py,
+not train.py. Both use run B's mild-focus objective (focus_alpha0.25), the SAME
+original pyramid epoch20, frozen vision/text, BCE+Dice, Adam and no projection.
+They do NOT initialize from B's trained result or from one another.
 
-## Question and two configurations
+## Two different preservation hypotheses
 
-The old proposal was50% small +50% medium +0% large. These runs test whether
-including direct large-group supervision retains small/medium gains without
-losing large-region recall. This is a hypothesis, not an established improvement.
+| Run folder | Mode | Strength | Additional training-only state |
+|---|---|---:|---|
+| foreground (C) | foreground | 1.0 | Frozen copy of the post-encoder body |
+| parameters (D) | parameters | 0.01 | Initial values of trainable parameters |
 
-Let p be the three group frequencies measured from TRAIN masks, q=(0.5,0.5,0):
+Both inherit weights w=(1-alpha)*p+alpha*(0.5,0.5,0), alpha0.25. Frequencies p
+come from TRAIN masks only. For249/1676/4569 images, weights are approximately
+15.38%/31.86%/52.77%. Balanced sampling and data order remain the same as B.
 
-    weights = (1 - focus_alpha) * p + focus_alpha * q
+### C: retain correct parent foreground on large-GT images
 
-| Run | focus_alpha | Weights for the current249/1676/4569 train groups |
-|---|---:|---|
-| natural | 0 | approximately3.83% /25.81% /70.36% |
-| mild_focus | 0.25 | approximately15.38% /31.86% /52.77% |
+For each training image with >=10% foreground on the resized training mask,
+K contains GT-foreground pixels where parent logit>0. Student probabilities p
+are penalized only if they fall BELOW parent probabilities t:
 
-Weights are computed from actual counts, not hardcoded rounded percentages.
-Groups are <1%,1-10%,>=10% on the nearest-resized training-mask grid, as before.
-The sampler still draws equally from all three groups. Run A is a stratified
-estimate of the natural-frequency objective; it is NOT the original pyramid's
-sampling/encoder recipe. Alpha1 recovers the old50/50/0 objective if needed.
+    keep(image) = mean over K of relu(t-p)^2
+    L_C = w_small*L_small + w_medium*L_medium
+          + w_large*(L_large + 1.0*keep)
 
-Projection is OFF in both configs. The known FP32 projection rejection path is
-not used. This experiment does not claim to repair hard projection. All other
-training settings and the parent checkpoint are the same between A and B.
+Empty K gives zero. Normalize per image before averaging images. Teacher false
+positives, missed foreground and smaller-GT images are not protected. Increasing
+student confidence above parent is allowed. GT segmentation supervision stays
+active at all final/auxiliary heads. This is not a guarantee of preserving recall:
+it constrains probabilities at selected pixels, not the entire predicted shape.
+
+CLIP vision/text execute ONCE per image. Their frozen outputs are shared with a
+frozen parent copy of CNN/fusion/decoder/refiner, built only from post-encoder
+modules (about6.65M parameters for the full pyramid). CNN branches are separate;
+student CNN features cannot stand in for the original parent's CNN. The parent
+has no gradient and is never included in model/DDP/optimizer state keys.
+
+### D: L2-SP anchor around the parent
+
+For trainable student parameters only, store their initial parent values theta0:
+
+    anchor = 0.5 * sum over trainable parameters of (theta-theta0)^2
+    L_D = L_B + 0.01*anchor
+
+This is a SUM, not parameter-mean MSE. The exact extra gradient0.01*(theta-theta0)
+is added ONCE per optimizer update, before gradient clipping/Adam and with correct
+AMP unscaling. It is not ordinary weight decay toward zero, and it is not
+multiplied by the number of groups, accumulation steps or GPUs. No parent forward
+or second model is constructed for D.
+
+The two strengths are predeclared starting values, not tuned optima. C and D have
+different units; their coefficients are not directly comparable. Anchor magnitude
+may need reevaluation if the trainable parameter scale/count changes. The ideas
+are motivated by [Learning without Forgetting](https://arxiv.org/abs/1606.09282)
+and [L2-SP](https://proceedings.mlr.press/v80/li18a.html); the selective foreground
+variant is a task-specific hypothesis, not a demonstrated result from those papers.
+
+Inference is still ONE original student pyramid, with unchanged state-dict keys,
+architecture, normalization and no answer input. Both training-only references
+are discarded by normal evaluation/inference.
 
 ## Cell 1 — Fresh session and environment
 
@@ -38,7 +70,7 @@ original pyramid checkpoint dataset. Keep that checkpoint under /kaggle/input;
 do not copy it into outputs. No notebook file is generated by this guide.
 
 ```python
-!git clone --single-branch --branch exp/size-weighted-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+!git clone --single-branch --branch exp/parent-preserving-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
 %cd /kaggle/working/VizWiz-VQA-Grounding
 !uv sync --frozen
 ```
@@ -46,7 +78,7 @@ do not copy it into outputs. No notebook file is generated by this guide.
 If already cloned on this branch, use `!git pull --ff-only` then
 `!uv sync --frozen` instead. Complete dependency setup before torchrun.
 
-## Cell 2 — Paths and the two configs
+## Cell 2 — Paths and C/D configs
 
 ```python
 import json
@@ -56,7 +88,7 @@ from pathlib import Path
 os.environ['DATA_ROOT'] = '/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz'
 os.environ['PYRAMID_CKPT'] = '/kaggle/input/datasets/khoahoang0512/vizwiz-question-guided-detail-pyramid/checkpoint_epoch20.pt'
 os.environ['RUN_ROOT'] = 'outputs'
-os.environ['RUN_NAME'] = 'size_weighted_pyramid_two_runs_ep5_seed42'
+os.environ['RUN_NAME'] = 'parent_preserving_pyramid_CD_ep5_seed42'
 os.environ['EVAL_BATCH'] = '4'
 os.environ['EVAL_TEST'] = '1'  # Set0 to skip test evaluation if local GT is unavailable.
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -69,7 +101,7 @@ if not parent.is_file():
         print(path)
     raise FileNotFoundError(f'Set PYRAMID_CKPT to the original pyramid epoch20: {parent}')
 root = Path(os.environ['RUN_ROOT'])
-for run in ('natural', 'mild_focus'):
+for run in ('foreground', 'parameters'):
     folder = root / run
     if folder.exists() and any(folder.iterdir()):
         raise ValueError(f'Use a fresh run folder: {folder}')
@@ -81,30 +113,31 @@ common = {
     'aux192_weight': 0.2,
     'aux384_weight': 0.3,
     'project_updates': False,
+    'focus_alpha': 0.25,
 }
-for run, alpha in (('natural', 0.0), ('mild_focus', 0.25)):
-    config = {**common, 'focus_alpha': alpha}
+for run, strength in (('foreground', 1.0), ('parameters', 0.01)):
+    config = {**common, 'preservation_mode': run, 'preservation_strength': strength}
     path = root / 'configs' / f'{run}.json'
     path.write_text(json.dumps(config, indent=2))
     print(path, config)
 ```
 
-Config > explicit CLI flags > defaults. Change only focus_alpha between the two
-runs. Use the original question-guided-detail-pyramid epoch20, NOT a scale or
+Config > explicit CLI flags > defaults. Keep focus_alpha=0.25 for both runs. Change only the preservation mode/strength
+between these C/D configs. Use the original question-guided-detail-pyramid epoch20, NOT a scale or
 Lovasz continuation checkpoint. Each run initializes model weights from this
 same parent and starts its own fresh optimizer, AMP scaler and epoch counter.
 
-## Cell 3 — A then B: preflight, train, evaluate and diagnostic
+## Cell 3 — C then D: preflight, train, evaluate and diagnostic
 
 This single cell runs both experiments SEQUENTIALLY. Each command is a fresh
-process, releasing its GPU allocations on exit. B never initializes from A.
-Two GPUs train one model; evaluation then uses one GPU. Batch6 is global over
+process, releasing its GPU allocations on exit. D never initializes from C.
+Two GPUs train one student; evaluation then uses one GPU. Batch6 is global over
 three groups and two ranks, one image/group/GPU before accumulation.
 
 ```bash
 %%bash
 set -euo pipefail
-for run in natural mild_focus; do
+for run in foreground parameters; do
     config="$RUN_ROOT/configs/${run}.json"
     run_dir="$RUN_ROOT/$run"
     common=(
@@ -153,15 +186,19 @@ again from the same parent. CUDA training uses AMP; evaluation uses FP32 and the
 original native-resolution threshold/IoU rules. If eval batch4 exceeds memory,
 set EVAL_BATCH=1. Test metrics need local GT; do not select a run using test.
 No validation is performed inside training; the script evaluates at the end.
+C uses the shared training-autocast encoder features for its reference forward;
+the probability penalty is computed in FP32. This is not a cached FP32 parent
+evaluation mask, so near-threshold selections can differ slightly from eval.py.
 
 Each run has five ADDITIONAL epochs after parent20 (25 total training epochs).
 Expected checkpoints are ONLY:
 
-- outputs/natural/checkpoint_epoch5.pt
-- outputs/mild_focus/checkpoint_epoch5.pt
+- outputs/foreground/checkpoint_epoch5.pt
+- outputs/parameters/checkpoint_epoch5.pt
 
-There is no duplicate model_final file. Old scale/per-image branches are not
-changed. The disk-space estimator and coordinated CPU-group disk-error handling
+There is no duplicate model_final file. Old A/B, scale and per-image branches are not changed.
+The full checkpoints also store the original training-only parent references;
+they add only post-encoder reference tensors, not a second backbone. The disk-space estimator and coordinated CPU-group disk-error handling
 are retained. Both frozen backbones are still stored in each full checkpoint,
 so enough disk is still required; no checkpoints are deleted automatically.
 A single session is the intended workflow, but real Kaggle runtime/VRAM fit has
@@ -179,16 +216,19 @@ protocols = []
 def percent(value):
     return round(100 * value, 4) if value is not None else None
 
-for run in ('natural', 'mild_focus'):
+for run in ('foreground', 'parameters'):
     folder = root / run
     metrics = json.loads((folder / 'eval_val_ep5/metrics.json').read_text())
     diagnostic = json.loads((folder / 'diagnostic_ep5/summary.json').read_text())
     summary = metrics['summary']
     protocol = summary['training_protocol']
-    assert summary['objective_version'] == 'size-weighted-updates-v1'
+    assert summary['objective_version'] == 'parent-preserving-updates-v1'
     assert protocol['projection'] is False
-    expected_alpha = 0.0 if run == 'natural' else 0.25
-    assert protocol['focus_alpha'] == expected_alpha
+    assert protocol['focus_alpha'] == 0.25
+    preservation = protocol['preservation']
+    assert preservation['mode'] == run
+    expected_strength = 1.0 if run == 'foreground' else 0.01
+    assert preservation['strength'] == expected_strength
     protocols.append(protocol)
     weights = protocol['proposal_weights']
     test_path = folder / 'eval_test_ep5/metrics.json'
@@ -196,6 +236,9 @@ for run in ('natural', 'mild_focus'):
     rows.append({
         'run': run,
         'focus_alpha': protocol['focus_alpha'],
+        'preservation_mode': preservation['mode'],
+        'preservation_strength': preservation['strength'],
+        'reference_parameters_training_only': preservation['training_only_reference_parameters'],
         'small_weight': weights[0],
         'medium_weight': weights[1],
         'large_weight': weights[2],
@@ -204,9 +247,12 @@ for run in ('natural', 'mild_focus'):
         'small_miou_pct': percent(diagnostic['by_gt_area']['small_lt_1pct']['mean_iou']),
         'medium_miou_pct': percent(diagnostic['by_gt_area']['medium_1_to_10pct']['mean_iou']),
         'large_miou_pct': percent(diagnostic['by_gt_area']['large_ge_10pct']['mean_iou']),
+        'large_recall_pct': percent(diagnostic['by_gt_area']['large_ge_10pct']['mean_recall']),
+        'small_precision_pct': percent(diagnostic['by_gt_area']['small_lt_1pct']['mean_precision']),
+        'medium_precision_pct': percent(diagnostic['by_gt_area']['medium_1_to_10pct']['mean_precision']),
         'test_miou_pct': percent(test.get('mean_iou')),
     })
-for key in ('initial_checkpoint', 'mask_group_sha256', 'group_counts', 'updates_per_epoch'):
+for key in ('initial_checkpoint', 'mask_group_sha256', 'group_counts', 'updates_per_epoch', 'proposal_weights'):
     assert protocols[0][key] == protocols[1][key], f'Run mismatch: {key}'
 comparison = root / 'two_run_comparison.csv'
 with comparison.open('w', newline='') as handle:
@@ -216,11 +262,11 @@ with comparison.open('w', newline='') as handle:
 print(comparison.read_text())
 ```
 
-Compare both with the existing scale control+5 (same parent/frozen encoders and
-50/50/0 objective), not only parent20. Use validation to assess whether large
-recall is retained while small/medium IoU improves. Run A alone is not the
-original pyramid baseline: sampling and freeze policy differ. No winner or
-multi-seed improvement is assumed before these runs.
+Compare C and D against run B (mild_focus+5 from size-weighted-pyramid),
+which has the same parent, frozen encoders, sampler, weights and optimizer but no
+preservation. The older scale control has different50/50/0 weights and cannot
+isolate preservation alone. Use validation for selection; test is descriptive.
+Inspect large recall alongside both smaller groups' IoU/precision.
 
 ## Cell 5 — ZIP both result folders, excluding all checkpoints
 
@@ -241,33 +287,54 @@ The ZIP includes configs, histories, resolved weights/provenance in metrics,
 validation masks, CPU diagnostics, optional test masks and comparison CSV. It
 contains no .pt, partial .tmp or nested ZIP files.
 
-## Resume, compatibility and defaults
+## Logs, references and compatibility
 
-Only one new weighting flag is introduced: `--focus-alpha` (default0.25), also
-available as focus_alpha in JSON. Default projection on THIS branch is false.
-The resolved weights and alpha are saved in histories, checkpoints and eval
-metadata. train_loss/proposal_loss describe the weighted objective;
-macro_group_loss retains the unweighted mean for diagnostics.
+New config/CLI options are preservation_mode (--preservation-mode) and
+preservation_strength (--preservation-strength). Modes: none/foreground/parameters.
+Defaults: foreground, strength1.0 (parameters defaults0.01 if not specified;
+none defaults0). Setting strength0 disables reference allocation and reproduces
+the unregularized B path. Both prescribed modes require frozen encoders and no
+projection. focus_alpha remains0.25 in C and D.
 
-Existing model weights retain the same state-dict layout and inference behavior.
-Full optimizer resume requires size-weighted-updates-v1 with the same alpha,
-loss, sampler/batch, optimizer/freezing, seed and GPU count. Old scale checkpoints
-may initialize weights but cannot silently resume this new objective protocol.
-Use the parent20 checkpoint for the prescribed A/B comparison.
+- loss_small/medium/large fields: original segmentation objective, including aux.
+- segmentation_objective: group-weighted segmentation term.
+- train_loss/proposal_loss: full objective including the preservation term.
+- preservation_loss: C's raw mean keep loss on large images, or D's half-sum L2.
+- preservation_weighted_loss: its actual contribution to the total objective.
+- protected_foreground_fraction: fraction of GT foreground selected by C's parent.
+- preservation_active_fraction: fraction of large images with protected pixels.
+- parameter_distance_l2 and preservation_gradient_ratio: D's movement from parent
+  and anchor-gradient norm divided by segmentation-gradient norm before clipping.
 
-If A completes and B fails, A's files remain. After resolving the error, run
-Cell3 with `for run in mild_focus; do` instead of rerunning A. Use a new B output
-folder if it has history from the failed attempt; update later paths consistently.
-No intermediate checkpoint exists before epoch5 in this storage-limited recipe.
-If interrupted before5, that run must restart from the parent unless you chose a
-different save schedule. Do not initialize B from A's checkpoint.
+Check C coverage/activity to see whether the reference has usable foreground.
+Check D's gradient ratio to identify a negligible or dominating anchor. A negative
+result with one strength does not reject every setting of that mechanism.
 
-For future continuation of a completed A/B run, replace --init-checkpoint with
---resume-checkpoint pointing to THAT run's full checkpoint, keep the original
-config/seed/batch, and set num-epochs to the total additional-epoch target (not
-the original parent's epoch number). Changing focus_alpha on resume is rejected.
+Full checkpoints contain preservation_state separately from model_state_dict.
+C saves the original reference head, D saves the original parameter anchors;
+neither reference is reset to the student on resume. Resume does not require the
+original parent file to remain mounted. Evaluation loads only student state and
+ignores preservation_state. Parent checkpoint and old inference masks remain
+compatible with the new encode/decode refactor.
+
+Full optimizer resume requires parent-preserving-updates-v1 with the same mode,
+strength, alpha, loss, sampler/batch, optimizer/freezing, seed and GPU count. Old
+A/B/scale checkpoints can initialize compatible model weights but cannot silently
+resume this protocol. Use the ORIGINAL parent20 for the C/D comparison.
+
+If C completes and D fails, keep C's results. After resolving the error, run
+Cell3 with `for run in parameters; do` instead of rerunning C. Use a fresh D output
+folder if a failed attempt left history; update later paths consistently.
+No intermediate checkpoint exists before epoch5. An interrupted run without a
+full checkpoint must restart from parent. Do not initialize D from C.
+
+For later continuation of a completed C/D run, replace --init-checkpoint with
+--resume-checkpoint for THAT run, keep its config, and set num-epochs to the total
+additional-epoch target. The saved original parent reference is restored along
+with optimizer/scaler. A missing reference or changed preservation mode/strength
+is rejected. No files are automatically deleted.
 
 CPU synthetic/autograd/DDP checks validate implementation contracts; they do not
-establish GPU fit, speed, accuracy gains or transfer across datasets/backbones.
-The weighting math is independent of feature channels/resolution; a new backbone
-still needs the normal model/preprocessing adapter. No new annotations are used.
+establish GPU fit, speed, accuracy gains or transfer. C adds a post-encoder forward
+on large training images; D has no reference forward. Neither adds inference
+parameters. Backbone adapters still need their usual shape/preprocessing work.

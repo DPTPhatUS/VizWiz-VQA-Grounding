@@ -79,6 +79,7 @@ def constrained_step(
     project=True,
     tolerance=1e-6,
     group_weights=(0.5, 0.5, 0.0),
+    additive_gradient=None,
 ):
     """Take an optimizer proposal, then apply a feasible realized parameter update.
 
@@ -91,6 +92,12 @@ def constrained_step(
         raise ValueError("Expected one gradient vector for each of three groups")
     parameters = controls.parameters
     finite = torch.isfinite(gradients).all()
+    if additive_gradient is not None:
+        if additive_gradient.shape != gradients.shape[1:]:
+            raise ValueError(
+                "Additive gradient must match the flattened trainable vector"
+            )
+        finite = finite & torch.isfinite(additive_gradient).all()
     if dist.is_initialized():
         flag = (~finite).to(torch.int32)
         dist.all_reduce(flag, op=dist.ReduceOp.MAX)
@@ -102,6 +109,8 @@ def constrained_step(
         + gradients[1] * weights[1]
         + gradients[2] * weights[2]
     )
+    if additive_gradient is not None:
+        proposal_gradient = proposal_gradient + additive_gradient
     position = 0
     for parameter in parameters:
         count = parameter.numel()
