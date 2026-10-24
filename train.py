@@ -1,13 +1,6 @@
 """Train the question-guided detail pyramid with native-resolution evaluation kept separate."""
 
 import argparse
-from training_options import (
-    TrainingArgumentParser,
-    TrainingControls,
-    recipe_config,
-    public_arguments,
-    restore_control_arguments,
-)
 import hashlib
 import json
 import math
@@ -24,8 +17,15 @@ from torch.utils.data import DistributedSampler
 from tqdm.auto import tqdm
 
 from dataset import VizWizGroundingDataset, make_loader
-from losses import TRAINING_DEFAULTS, SegmentationObjective
-from models.model import EXPERIMENT, GroundingModel
+from losses import OBJECTIVE_VERSION, TRAINING_DEFAULTS, SegmentationObjective
+from models.model import GroundingModel
+from training_options import (
+    TrainingArgumentParser,
+    TrainingControls,
+    public_arguments,
+    recipe_config,
+    restore_control_arguments,
+)
 from utils import (
     checkpoint_model_kwargs,
     load_model_weights,
@@ -75,7 +75,7 @@ def resolve_training_arguments(args, saved=None):
     settings = dict(TRAINING_DEFAULTS)
     if saved is not None:
         run = saved["run_config"]
-        if run.get("objective_version") != EXPERIMENT:
+        if run.get("objective_version") != OBJECTIVE_VERSION:
             raise ValueError("Resume requires the same detail-pyramid objective")
         settings.update(run["training_config"])
         if any(settings[key] != value for key, value in requested.items()):
@@ -225,7 +225,7 @@ def _train(args, rank, world, distributed, device):
         math.ceil(len(train_loader) / getattr(args, "gradient_accumulation_steps", 1)),
         start,
     )
-    version = EXPERIMENT
+    version = OBJECTIVE_VERSION
     run_config = dict(
         public_arguments(args),
         training_config=settings,
@@ -363,7 +363,7 @@ def _train(args, rank, world, distributed, device):
                         "epoch": epoch + 1,
                         "model_state_dict": unwrap(model).state_dict(),
                         "training_controls": controls.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
                         "scaler_state_dict": scaler.state_dict(),
                         "experiment_config": unwrap(model).experiment_config,
                         "run_config": run_config,

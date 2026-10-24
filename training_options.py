@@ -263,7 +263,8 @@ class TrainingControls:
                 # This CLIP layer only normalizes unused pooled CLS; keep it out of DDP.
                 if not policy and kind == "vision":
                     for part_name, part in module.named_modules():
-                        if part_name.endswith("vision_model.post_layernorm"):
+                        # CLIP pooling is nested in older Transformers and flat in newer versions.
+                        if part_name.rsplit(".", 1)[-1] == "post_layernorm":
                             part.requires_grad_(False)
                 if (
                     not policy
