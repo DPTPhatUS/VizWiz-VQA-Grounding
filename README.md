@@ -278,3 +278,187 @@ the model (use a new diagnostic output directory):
 uv run diagnose.py --predictions outputs/eval_val_ep20 \
     --data-root /path/to/vizwiz --output-dir outputs/diagnostic_global_iou_ep20
 ```
+
+## Continue the original pyramid: epoch 20 to 40
+
+This is the next baseline run. Use `exp/question-guided-detail-pyramid`, not the
+Lovasz or scale-constrained branches. Continue the ORIGINAL vision-trainable,
+text-frozen pyramid with its natural sampling and BCE+Dice objective. Do not
+freeze vision or introduce a new optimizer/loss during this continuation.
+
+### Cell R1 — Fresh Kaggle session
+
+Enable Internet and two GPUs. Attach the dataset containing the original full
+`checkpoint_epoch20.pt`. The weights-only `model_final_epoch20.pt` cannot resume
+optimizer/AMP state. Start with a fresh `outputs` directory in this session.
+
+```python
+!git clone --single-branch --branch exp/question-guided-detail-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+%cd /kaggle/working/VizWiz-VQA-Grounding
+!uv sync --frozen
+```
+
+If already cloned on this branch, use `!git pull --ff-only` and `!uv sync --frozen`
+instead of cloning again.
+
+### Cell R2 — Read the saved training settings
+
+The checkpoint path below is the original pyramid dataset used in the previous
+session. Edit it if your Kaggle mount differs. This cell reads metadata on CPU;
+it does not initialize CLIP or change the checkpoint.
+
+```python
+import gc
+import json
+import os
+from pathlib import Path
+from utils import read_checkpoint, checkpoint_model_kwargs
+
+os.environ['DATA_ROOT'] = '/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz'
+os.environ['RUN_ROOT'] = 'outputs'
+os.environ['RUN_NAME'] = 'question_guided_detail_pyramid_ep40_seed42'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MPLBACKEND'] = 'Agg'
+os.environ['RESUME_CKPT'] = '/kaggle/input/datasets/khoahoang0512/vizwiz-question-guided-detail-pyramid/checkpoint_epoch20.pt'
+
+checkpoint_path = Path(os.environ['RESUME_CKPT'])
+if not checkpoint_path.is_file():
+    print('Available checkpoints:')
+    for candidate in sorted(Path('/kaggle/input').rglob('*.pt')):
+        print(candidate)
+    raise FileNotFoundError(f'Set RESUME_CKPT to the original pyramid checkpoint: {checkpoint_path}')
+
+saved = read_checkpoint(checkpoint_path)
+checkpoint_model_kwargs(saved)
+assert saved.get('epoch') == 20, 'This continuation starts at epoch 20.'
+assert 'optimizer_state_dict' in saved, 'Use a full checkpoint, not final raw weights.'
+run = saved['run_config']
+controls = saved.get('training_controls') or {}
+optimization = controls.get('config', run.get('optimization_config', {}))
+assert optimization.get('lr_scheduler', 'none') == 'none', 'This guide extends a constant-LR run only.'
+assert optimization.get('warmup_ratio', 0.0) == 0.0, 'Do not extend a fixed warmup/schedule budget here.'
+assert run['world_size'] == 2, 'Use the same GPU count as the original run.'
+
+for variable, value in {
+    'RESUME_BATCH': run['batch_size'],
+    'RESUME_ACCUMULATION': run['gradient_accumulation_steps'],
+    'RESUME_LR': run['lr'],
+    'RESUME_SEED': run['seed'],
+}.items():
+    os.environ[variable] = str(value)
+
+root = Path(os.environ['RUN_ROOT'])
+root.mkdir(parents=True, exist_ok=True)
+assert not (root / 'history.jsonl').exists() and not any(root.glob('*.pt')), 'Use a fresh session/output directory.'
+metadata = {
+    'resume_checkpoint': str(checkpoint_path),
+    'start_epoch': saved['epoch'],
+    'target_epoch': 40,
+    'batch_size': run['batch_size'],
+    'gradient_accumulation_steps': run['gradient_accumulation_steps'],
+    'lr': run['lr'],
+    'seed': run['seed'],
+    'world_size': run['world_size'],
+    'training_config': run['training_config'],
+    'optimization_config': optimization,
+    'gradient_checkpointing': run.get('gradient_checkpointing', False),
+}
+(root / 'continuation.json').write_text(json.dumps(metadata, indent=2))
+print(json.dumps(metadata, indent=2))
+del saved, run, controls, optimization
+gc.collect()
+```
+
+No new loss JSON is needed: resume restores the saved objective. Encoder policy,
+optimizer controls and gradient-checkpointing settings are restored from the
+checkpoint where present; legacy full checkpoints retain the historical recipe.
+Do not append freeze flags or reuse a scale/Lovasz config. If this is a different
+scheduled run, the trainer rejects extending its fixed update budget; this guide
+does not reset or silently stretch that schedule.
+
+### Cell R3 — Train epochs 21–40
+
+```bash
+%%bash
+set -euo pipefail
+uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
+    --data-root "$DATA_ROOT" \
+    --output-dir "$RUN_ROOT" \
+    --resume-checkpoint "$RESUME_CKPT" \
+    --num-epochs 40 \
+    --batch-size "$RESUME_BATCH" \
+    --gradient-accumulation-steps "$RESUME_ACCUMULATION" \
+    --lr "$RESUME_LR" \
+    --seed "$RESUME_SEED" \
+    --num-workers 2 \
+    --save-every 5
+```
+
+`40` is the TOTAL target, so this runs 20 additional epochs. It restores model,
+optimizer and AMP scaler, plus training-control progress when available. The
+original run has constant LR, so no LR schedule is restarted. Epoch-keyed RNG and
+sampler ordering continue from the saved epoch. No validation runs inside train.
+Full checkpoints are saved at epochs 25/30/35/40 directly under `outputs`.
+The new history contains epochs 21–40; keep the original 1–20 history separately.
+A 40-epoch target fits the same count of training epochs as the original session,
+but training plus evaluation runtime still depends on the Kaggle hardware.
+
+### Cell R4 — Validation and size-group diagnostics
+
+```bash
+%%bash
+set -euo pipefail
+for epoch in 25 30 35 40; do
+    uv run --frozen python eval.py \
+        --checkpoint "$RUN_ROOT/checkpoint_epoch${epoch}.pt" \
+        --dataset val --data-root "$DATA_ROOT" \
+        --batch-size 4 --num-workers 2 --device cuda \
+        --output-dir "$RUN_ROOT/eval_val_ep${epoch}"
+    uv run --frozen python diagnose.py \
+        --predictions "$RUN_ROOT/eval_val_ep${epoch}" \
+        --data-root "$DATA_ROOT" \
+        --output-dir "$RUN_ROOT/diagnostic_ep${epoch}"
+done
+```
+
+If eval batch 4 exceeds memory, use 1; inference and native-resolution metric
+rules remain the same. Compare mean IoU, global IoU and the three GT-size groups
+against the original epoch-20 results. Select checkpoints using validation.
+
+### Cell R5 — Test exports at epochs 30 and 40
+
+```bash
+%%bash
+set -euo pipefail
+for epoch in 30 40; do
+    uv run --frozen python eval.py \
+        --checkpoint "$RUN_ROOT/checkpoint_epoch${epoch}.pt" \
+        --dataset test --data-root "$DATA_ROOT" \
+        --batch-size 4 --num-workers 2 --device cuda \
+        --output-dir "$RUN_ROOT/eval_test_ep${epoch}"
+done
+```
+
+Local test scoring requires annotations and GT masks. Skip this cell if they are
+unavailable; do not use test scores to select a checkpoint. If the session ends
+after training, keep the full checkpoints and evaluate in a separate session.
+
+### Cell R6 — Download results without checkpoint files
+
+```python
+from zipfile import ZipFile, ZIP_DEFLATED
+
+root = Path(os.environ['RUN_ROOT'])
+archive = Path('/kaggle/working') / f"{os.environ['RUN_NAME']}.zip"
+with ZipFile(archive, 'w', ZIP_DEFLATED) as bundle:
+    for path in sorted(root.rglob('*')):
+        if path.is_file() and path.suffix.lower() not in {'.pt', '.tmp', '.zip'}:
+            bundle.write(path, path.relative_to(root))
+print('Download results:', archive)
+print('Keep full .pt checkpoints separately for later resume.')
+```
+
+If interrupted before epoch 40, resume the latest full checkpoint on this branch
+with the SAME total target `--num-epochs 40`, batch, accumulation, LR, seed and GPU
+count. Read that checkpoint's settings as above, adjusting the expected start
+epoch in Cell R2. Use fresh outputs or a history ending at exactly that epoch.
