@@ -147,38 +147,173 @@ CPU tests do not establish Kaggle disk fit or GPU performance.
 
 ## Analyze the existing epoch-5/10/15 checkpoints (no more training)
 
-These complete checkpoints remain compatible. Stopping at epoch15 is valid for
-analysis; report the actual training duration and do not label it epoch20. A
-cross-method comparison at different durations is descriptive, not a matched
-20-epoch comparison. Keep all three checkpoints outside the writable outputs
-folder when possible (for example attach their dataset to Kaggle).
+Run only Cells E1-E6 below in a fresh Kaggle session. Do not run preflight or
+training. These three complete checkpoints remain compatible with this branch.
+One GPU is sufficient; evaluation does not use torchrun. Keep the checkpoints
+in an attached Kaggle dataset under /kaggle/input, without copying them into
+outputs or /kaggle/working. This avoids storing a second copy of the large .pt
+files. Enable Internet for dependency/model setup.
 
-After the Setup cells, set the actual directory containing all three .pt files:
+### Cell E1 — Clone the evaluation branch
 
 ```python
-os.environ['LOVASZ_CKPT_ROOT'] = '/kaggle/input/YOUR_LOVASZ_CHECKPOINTS'
-os.environ['RUN_NAME'] = 'per_image_lovasz_existing_ep5_10_15_seed42'
+!git clone --single-branch --branch exp/per-image-lovasz https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+%cd /kaggle/working/VizWiz-VQA-Grounding
+!uv sync --frozen
 ```
 
-Run evaluation/diagnostics only, without running the Train cell:
+If this branch is already cloned, use `!git pull --ff-only` then
+`!uv sync --frozen` instead of cloning again.
+
+### Cell E2 — Dataset, three checkpoint paths and output directory
+
+Replace YOUR_LOVASZ_CHECKPOINTS with the actual directory containing all three
+files. The missing-file message lists available checkpoint paths if needed.
+Evaluation batch4 is a starting setting; change EVAL_BATCH to1 if it exceeds
+memory. This does not change the model weights or evaluation threshold.
+
+```python
+import json
+import os
+from pathlib import Path
+
+os.environ['DATA_ROOT'] = '/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz'
+os.environ['LOVASZ_CKPT_ROOT'] = '/kaggle/input/YOUR_LOVASZ_CHECKPOINTS'
+os.environ['RUN_ROOT'] = 'outputs'
+os.environ['RUN_NAME'] = 'per_image_lovasz_ep5_10_15_seed42'
+os.environ['EVAL_BATCH'] = '4'
+os.environ['EVAL_WORKERS'] = '2'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MPLBACKEND'] = 'Agg'
+
+root = Path(os.environ['RUN_ROOT'])
+checkpoints = {
+    epoch: Path(os.environ['LOVASZ_CKPT_ROOT']) / f'checkpoint_epoch{epoch}.pt'
+    for epoch in (5, 10, 15)
+}
+missing = [str(path) for path in checkpoints.values() if not path.is_file()]
+if missing:
+    print('Available .pt files:')
+    for path in sorted(Path('/kaggle/input').rglob('*.pt')):
+        print(path)
+    raise FileNotFoundError(f'Correct LOVASZ_CKPT_ROOT; missing files: {missing}')
+for epoch in checkpoints:
+    for folder in (root / f'eval_val_ep{epoch}', root / f'eval_test_ep{epoch}',
+                   root / f'diagnostic_ep{epoch}'):
+        if folder.exists() and any(folder.iterdir()):
+            raise ValueError(f'Use fresh outputs; folder is not empty: {folder}')
+root.mkdir(parents=True, exist_ok=True)
+protocol = {
+    'branch': 'exp/per-image-lovasz',
+    'epochs_evaluated': list(checkpoints),
+    'data_root': os.environ['DATA_ROOT'],
+    'eval_batch_size': int(os.environ['EVAL_BATCH']),
+    'checkpoints': {
+        str(epoch): {'path': str(path), 'size_bytes': path.stat().st_size}
+        for epoch, path in checkpoints.items()
+    },
+}
+(root / 'analysis_protocol.json').write_text(json.dumps(protocol, indent=2))
+print(json.dumps(protocol, indent=2))
+```
+
+### Cell E3 — All three validation evaluations and CPU diagnostics
 
 ```bash
 %%bash
 set -euo pipefail
 for epoch in 5 10 15; do
-    checkpoint="$LOVASZ_CKPT_ROOT/checkpoint_epoch${epoch}.pt"
-    test -f "$checkpoint"
-    uv run --frozen eval.py --checkpoint "$checkpoint" \
-        --dataset val --data-root "$DATA_ROOT" --batch-size 4 --num-workers 2 \
+    uv run --frozen python eval.py \
+        --checkpoint "$LOVASZ_CKPT_ROOT/checkpoint_epoch${epoch}.pt" \
+        --dataset val --data-root "$DATA_ROOT" --device cuda \
+        --batch-size "$EVAL_BATCH" --num-workers "$EVAL_WORKERS" \
         --output-dir "$RUN_ROOT/eval_val_ep${epoch}"
-    uv run --frozen diagnose.py --predictions "$RUN_ROOT/eval_val_ep${epoch}" \
-        --data-root "$DATA_ROOT" --output-dir "$RUN_ROOT/diagnostic_ep${epoch}"
+    uv run --frozen python diagnose.py \
+        --predictions "$RUN_ROOT/eval_val_ep${epoch}" \
+        --data-root "$DATA_ROOT" \
+        --output-dir "$RUN_ROOT/diagnostic_ep${epoch}"
 done
 ```
 
-Use batch1 if evaluation batch4 exceeds memory. Evaluation folders must be new
-or empty. Then run the ZIP cell above; it excludes all .pt files. This analysis
-needs no epoch20 checkpoint and creates no new model checkpoints. Select using
-validation; a test export, if needed and locally annotated, can use the selected
-saved checkpoint separately. Keep the fresh-run save-every10 recipe for future
-runs; it does not invalidate existing epoch5/15 checkpoints.
+Masks are restored to each original GT resolution before thresholding. Each
+validation folder contains PNG masks plus metrics.json (mean IoU/global IoU and
+per-image IoUs). Each diagnostic folder contains summary.json and per_image.csv,
+including groups <1%, 1-10%, >=10%, precision/recall and area ratio. Diagnostics
+need no GPU. No new model checkpoint is written.
+
+### Cell E4 — Optional: test evaluation for all three checkpoints
+
+Run this only if local test annotations AND GT masks are available. Otherwise
+skip this cell; validation analysis, comparison and ZIP still work. Test scores
+are descriptive; choose a checkpoint using validation, not test.
+
+```bash
+%%bash
+set -euo pipefail
+for epoch in 5 10 15; do
+    uv run --frozen python eval.py \
+        --checkpoint "$LOVASZ_CKPT_ROOT/checkpoint_epoch${epoch}.pt" \
+        --dataset test --data-root "$DATA_ROOT" --device cuda \
+        --batch-size "$EVAL_BATCH" --num-workers "$EVAL_WORKERS" \
+        --output-dir "$RUN_ROOT/eval_test_ep${epoch}"
+done
+```
+
+### Cell E5 — Compare the three epochs
+
+```python
+import csv
+
+root = Path(os.environ['RUN_ROOT'])
+rows = []
+def percent(value):
+    return round(100 * value, 4) if value is not None else None
+
+for epoch in (5, 10, 15):
+    metrics = json.loads((root / f'eval_val_ep{epoch}/metrics.json').read_text())
+    diagnostic = json.loads((root / f'diagnostic_ep{epoch}/summary.json').read_text())
+    summary = metrics['summary']
+    test_path = root / f'eval_test_ep{epoch}/metrics.json'
+    test_summary = json.loads(test_path.read_text())['summary'] if test_path.is_file() else {}
+    rows.append({
+        'epoch': epoch,
+        'val_num_samples': summary['num_samples'],
+        'val_miou_pct': percent(summary['mean_iou']),
+        'val_global_iou_pct': percent(summary['global_iou']),
+        'small_miou_pct': percent(diagnostic['by_gt_area']['small_lt_1pct']['mean_iou']),
+        'medium_miou_pct': percent(diagnostic['by_gt_area']['medium_1_to_10pct']['mean_iou']),
+        'large_miou_pct': percent(diagnostic['by_gt_area']['large_ge_10pct']['mean_iou']),
+        'test_miou_pct': percent(test_summary.get('mean_iou')),
+        'test_global_iou_pct': percent(test_summary.get('global_iou')),
+    })
+comparison = root / 'checkpoint_comparison.csv'
+with comparison.open('w', newline='') as handle:
+    writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+    writer.writeheader()
+    writer.writerows(rows)
+print(comparison.read_text())
+```
+
+Inspect both smaller groups and the large group, not only overall mIoU. These
+are results from the same run at epochs5/10/15; do not label them epoch20 or
+claim a matched 20-epoch comparison. A rising curve through15 does not establish
+convergence. Compare methods at the same epoch where available.
+
+### Cell E6 — ZIP results, excluding every checkpoint
+
+```python
+from zipfile import ZIP_DEFLATED, ZipFile
+
+root = Path(os.environ['RUN_ROOT'])
+archive = Path('/kaggle/working') / f"{os.environ['RUN_NAME']}.zip"
+with ZipFile(archive, 'w', compression=ZIP_DEFLATED) as bundle:
+    for path in sorted(root.rglob('*')):
+        if path.is_file() and path.suffix.lower() not in {'.pt', '.tmp', '.zip'}:
+            bundle.write(path, path.relative_to(root))
+print('Download:', archive)
+print('Checkpoint files are excluded; keep the original .pt files separately.')
+```
+
+The ZIP includes comparison/protocol files, validation masks/metrics, all three
+CPU diagnostics, and optional test masks/metrics. It contains no .pt files,
+partial .tmp files or nested ZIP archives. It can be analyzed offline on CPU.
