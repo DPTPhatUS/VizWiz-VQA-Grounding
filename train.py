@@ -1,13 +1,6 @@
-"""Train the question-guided detail pyramid with native-resolution evaluation kept separate."""
+"""Train the detail pyramid with optional native-resolution validation exports."""
 
 import argparse
-from training_options import (
-    TrainingArgumentParser,
-    TrainingControls,
-    recipe_config,
-    public_arguments,
-    restore_control_arguments,
-)
 import hashlib
 import json
 import math
@@ -26,6 +19,13 @@ from tqdm.auto import tqdm
 from dataset import VizWizGroundingDataset, make_loader
 from losses import TRAINING_DEFAULTS, SegmentationObjective
 from models.model import EXPERIMENT, GroundingModel
+from training_options import (
+    TrainingArgumentParser,
+    TrainingControls,
+    public_arguments,
+    recipe_config,
+    restore_control_arguments,
+)
 from utils import (
     checkpoint_model_kwargs,
     load_model_weights,
@@ -33,6 +33,7 @@ from utils import (
     save_checkpoint,
     to_device,
 )
+from validation import validate_epoch
 
 
 def training_parser():
@@ -50,6 +51,24 @@ def training_parser():
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-every", type=int, default=10)
+    parser.add_argument(
+        "--validate-every",
+        type=int,
+        default=0,
+        help="Export validation metrics/masks every N epochs; 0 disables",
+    )
+    parser.add_argument(
+        "--val-batch-size",
+        type=int,
+        default=1,
+        help="Validation batch size per GPU while optimizer stays resident",
+    )
+    parser.add_argument(
+        "--save-final-weights",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also export the final weights-only .pt file",
+    )
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument(
         "--gradient-checkpointing",
@@ -103,6 +122,8 @@ def check_arguments(args):
     if (
         min(args.num_epochs, args.batch_size, args.gradient_accumulation_steps) <= 0
         or args.save_every < 0
+        or args.validate_every < 0
+        or args.val_batch_size <= 0
         or args.num_workers < 0
     ):
         raise ValueError("Invalid epoch, batch, save interval or worker count")
@@ -258,6 +279,8 @@ def _train(args, rank, world, distributed, device):
             "losses.py",
             "dataset.py",
             "metrics.py",
+            "eval.py",
+            "validation.py",
             "utils.py",
         )
     }
@@ -363,7 +386,7 @@ def _train(args, rank, world, distributed, device):
                         "epoch": epoch + 1,
                         "model_state_dict": unwrap(model).state_dict(),
                         "training_controls": controls.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
                         "scaler_state_dict": scaler.state_dict(),
                         "experiment_config": unwrap(model).experiment_config,
                         "run_config": run_config,
@@ -371,7 +394,9 @@ def _train(args, rank, world, distributed, device):
                     checkpoint_path,
                 )
                 print(f"Checkpoint saved: {checkpoint_path}", flush=True)
-    if rank == 0:
+        if args.validate_every and (epoch + 1) % args.validate_every == 0:
+            validate_epoch(unwrap(model), args, device, run_config, epoch + 1)
+    if rank == 0 and args.save_final_weights:
         final_path = out / f"model_final_epoch{args.num_epochs}.pt"
         save_checkpoint(unwrap(model).state_dict(), final_path)
         print(f"Final model saved: {final_path}", flush=True)

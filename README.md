@@ -141,8 +141,8 @@ gives effective batch 4. Memory/runtime have not been measured on Kaggle T4.
 Adam, no weight decay or LR scheduler, clipping at global norm 1, CUDA FP16
 GradScaler, deterministic epoch-keyed seeding and sampler shuffling follow the
 simple existing trainer. Activation checkpointing uses nonreentrant recomputation;
-it changes memory/time, not the intended forward computation. No per-epoch
-validation is run. Output collisions fail rather than overwrite another run.
+it changes memory/time, not the intended forward computation. Validation is
+disabled by default; enable it independently with --validate-every. Output collisions fail rather than overwrite another run.
 
 Full checkpoints are `outputs/checkpoint_epoch10.pt` and `checkpoint_epoch20.pt`.
 Raw final weights are also saved. Full checkpoints include optimizer/scaler,
@@ -391,14 +391,22 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
     --lr "$RESUME_LR" \
     --seed "$RESUME_SEED" \
     --num-workers 2 \
-    --save-every 5
+    --save-every 10 \
+    --validate-every 5 \
+    --val-batch-size 1 \
+    --no-save-final-weights
 ```
 
 `40` is the TOTAL target, so this runs 20 additional epochs. It restores model,
 optimizer and AMP scaler, plus training-control progress when available. The
 original run has constant LR, so no LR schedule is restarted. Epoch-keyed RNG and
-sampler ordering continue from the saved epoch. No validation runs inside train.
-Full checkpoints are saved at epochs 25/30/35/40 directly under `outputs`.
+sampler ordering continue from the saved epoch. Validation runs every 5 epochs
+inside train, in FP32, and exports masks/metrics at 25/30/35/40. Each GPU uses
+validation batch 1 while the optimizer remains resident. No padded/repeated
+validation samples are counted. Full checkpoints are saved ONLY at epochs 30/40
+directly under `outputs`; no duplicate final weights file is written.
+Epochs 25/35 have predictions/metrics but no weights to resume or deploy. Choose
+a deployable checkpoint from the saved epochs, or rerun to recover another epoch.
 The new history contains epochs 21–40; keep the original 1–20 history separately.
 A 40-epoch target fits the same count of training epochs as the original session,
 but training plus evaluation runtime still depends on the Kaggle hardware.
@@ -409,11 +417,6 @@ but training plus evaluation runtime still depends on the Kaggle hardware.
 %%bash
 set -euo pipefail
 for epoch in 25 30 35 40; do
-    uv run --frozen python eval.py \
-        --checkpoint "$RUN_ROOT/checkpoint_epoch${epoch}.pt" \
-        --dataset val --data-root "$DATA_ROOT" \
-        --batch-size 4 --num-workers 2 --device cuda \
-        --output-dir "$RUN_ROOT/eval_val_ep${epoch}"
     uv run --frozen python diagnose.py \
         --predictions "$RUN_ROOT/eval_val_ep${epoch}" \
         --data-root "$DATA_ROOT" \
@@ -421,8 +424,9 @@ for epoch in 25 30 35 40; do
 done
 ```
 
-If eval batch 4 exceeds memory, use 1; inference and native-resolution metric
-rules remain the same. Compare mean IoU, global IoU and the three GT-size groups
+Validation masks already exist after Cell R3, including epochs without a saved
+checkpoint. Cell R4 runs CPU diagnostics only; do not rerun eval.py into these
+nonempty folders. Compare mean IoU, global IoU and the three GT-size groups
 against the original epoch-20 results. Select checkpoints using validation.
 
 ### Cell R5 — Test exports at epochs 30 and 40
@@ -439,6 +443,7 @@ for epoch in 30 40; do
 done
 ```
 
+Standalone test evaluation uses batch 4; reduce it to 1 if needed.
 Local test scoring requires annotations and GT masks. Skip this cell if they are
 unavailable; do not use test scores to select a checkpoint. If the session ends
 after training, keep the full checkpoints and evaluate in a separate session.
@@ -462,3 +467,14 @@ If interrupted before epoch 40, resume the latest full checkpoint on this branch
 with the SAME total target `--num-epochs 40`, batch, accumulation, LR, seed and GPU
 count. Read that checkpoint's settings as above, adjusting the expected start
 epoch in Cell R2. Use fresh outputs or a history ending at exactly that epoch.
+
+### Optional validation and storage controls
+
+`--validate-every N` exports native-resolution validation masks and metrics every
+N completed epochs (`0`, the default, disables it). `--val-batch-size` is per GPU
+and defaults to 1 because training optimizer state remains in VRAM.
+`--save-every` independently controls full resumable checkpoints.
+`--no-save-final-weights` suppresses the extra final raw-weights file; it does not
+suppress scheduled full checkpoints. Defaults preserve the prior training path.
+Validation uses unpadded rank shards, restores module modes/RNG, and does not
+perform optimizer updates or best-checkpoint selection.
