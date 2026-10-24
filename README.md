@@ -35,6 +35,15 @@ root = Path(os.environ['RUN_ROOT'])
 config = {'overlap_loss': 'dice', 'overlap_weight': 0.5, 'fp_weight': 0.7, 'aux96_weight': 0.1, 'aux192_weight': 0.2, 'aux384_weight': 0.3}
 (root / 'configs/objective.json').write_text(json.dumps(config, indent=2))
 os.environ['PYRAMID_CKPT'] = '/kaggle/input/YOUR_PYRAMID_DATASET/checkpoint_epoch20.pt'
+# Replace the placeholder with your trained parent pyramid checkpoint.
+checkpoint = Path(os.environ['PYRAMID_CKPT'])
+if not checkpoint.is_file():
+    print("Available .pt files under /kaggle/input:")
+    for candidate in sorted(Path('/kaggle/input').rglob('*.pt')):
+        print(candidate)
+    raise FileNotFoundError(
+        f"Set PYRAMID_CKPT to the exact trained parent checkpoint path: {checkpoint}"
+    )
 ```
 
 JSON > explicit flags > defaults. Loss/optimizer/freezing options can share the config. fp_weight is inactive for Dice/Lovasz.

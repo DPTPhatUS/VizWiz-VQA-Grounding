@@ -444,8 +444,15 @@ def run_main(argv=None, *, preflight=False):
     if preflight and args.steps < 2:
         raise ValueError("Preflight needs at least2 steps")
     for name in ("init_checkpoint", "resume_checkpoint"):
-        if getattr(args, name) and not Path(getattr(args, name)).is_file():
-            raise ValueError(f"{name} does not exist")
+        checkpoint = getattr(args, name)
+        if checkpoint and not Path(checkpoint).is_file():
+            flag = "--" + name.replace("_", "-")
+            raise FileNotFoundError(
+                f"{flag} is not a checkpoint file: {checkpoint!r}. "
+                "On Kaggle, attach the dataset containing the trained checkpoint "
+                "and set PYRAMID_CKPT to its exact .pt path. "
+                "YOUR_PYRAMID_DATASET in the guide is a placeholder."
+            )
     for kind in ("vision", "text"):
         key = f"freeze_{kind}_encoder"
         if getattr(args, key) is None:
