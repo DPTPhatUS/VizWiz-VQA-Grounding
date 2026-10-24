@@ -14,6 +14,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from checkpointing import io_process_group, run_primary_io
 from dataset import VizWizGroundingDataset, collate_samples, seed_worker
 from losses import TRAINING_DEFAULTS, SegmentationObjective
 from models.model import GroundingModel
@@ -62,7 +63,13 @@ def parser(preflight=False):
     result.add_argument("--num-workers", type=int, default=2)
     result.add_argument("--lr", type=float, default=1e-5)
     result.add_argument("--seed", type=int, default=42)
-    result.add_argument("--save-every", type=int, default=5)
+    result.add_argument("--save-every", type=int, default=10)
+    result.add_argument(
+        "--save-final-weights",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Optional extra final weights file; disabled to save disk",
+    )
     result.add_argument(
         "--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True
     )
@@ -285,6 +292,7 @@ def execute(args, rank, world, device, preflight):
             "models/mask_decoder.py",
             "dataset.py",
             "utils.py",
+            "checkpointing.py",
             "metrics.py",
         )
     }
@@ -303,10 +311,7 @@ def execute(args, rank, world, device, preflight):
                 raise ValueError(
                     "History does not end at resumed epoch; use a fresh output directory"
                 )
-        if rank == 0:
-            out.mkdir(parents=True, exist_ok=True)
-        if world > 1:
-            dist.barrier()
+        run_primary_io(lambda: out.mkdir(parents=True, exist_ok=True), args._io_group)
     if rank == 0:
         print(
             json.dumps(
@@ -392,31 +397,39 @@ def execute(args, rank, world, device, preflight):
                 ),
                 flush=True,
             )
-        elif rank == 0:
-            with history.open("a") as handle:
-                handle.write(json.dumps(record) + "\n")
-            if args.save_every and (epoch + 1) % args.save_every == 0:
-                save_checkpoint(
-                    {
-                        "epoch": epoch + 1,
-                        "model_state_dict": raw.state_dict(),
-                        "optimizer_state_dict": controls.optimizer.state_dict(),
-                        "scaler_state_dict": scaler.state_dict(),
-                        "training_controls": controls.state_dict(),
-                        "experiment_config": raw.experiment_config,
-                        "run_config": config,
-                    },
-                    out / f"checkpoint_epoch{epoch + 1}.pt",
-                )
-    if not preflight and rank == 0:
-        save_checkpoint(
-            {
-                "model_state_dict": raw.state_dict(),
-                "experiment_config": raw.experiment_config,
-                "run_config": config,
-            },
-            out / f"model_final_epoch{args.num_epochs}.pt",
-        )
+        else:
+
+            def export_epoch(record=record, epoch=epoch):
+                with history.open("a") as handle:
+                    handle.write(json.dumps(record) + "\n")
+                if args.save_every and (epoch + 1) % args.save_every == 0:
+                    save_checkpoint(
+                        {
+                            "epoch": epoch + 1,
+                            "model_state_dict": raw.state_dict(),
+                            "optimizer_state_dict": controls.optimizer.state_dict(),
+                            "scaler_state_dict": scaler.state_dict(),
+                            "training_controls": controls.state_dict(),
+                            "experiment_config": raw.experiment_config,
+                            "run_config": config,
+                        },
+                        out / f"checkpoint_epoch{epoch + 1}.pt",
+                    )
+
+            run_primary_io(export_epoch, args._io_group)
+    if not preflight and args.save_final_weights:
+
+        def export_final():
+            save_checkpoint(
+                {
+                    "model_state_dict": raw.state_dict(),
+                    "experiment_config": raw.experiment_config,
+                    "run_config": config,
+                },
+                out / f"model_final_epoch{args.num_epochs}.pt",
+            )
+
+        run_primary_io(export_final, args._io_group)
     if world > 1:
         dist.barrier()
 
@@ -465,8 +478,13 @@ def run_main(argv=None, *, preflight=False):
         torch.cuda.set_device(device)
     if world > 1:
         dist.init_process_group("nccl" if device.type == "cuda" else "gloo")
+    args._io_group = None
     try:
+        if world > 1 and not preflight:
+            args._io_group = io_process_group()
         execute(args, rank, world, device, preflight)
     finally:
         if dist.is_initialized():
+            if args._io_group is not None:
+                dist.destroy_process_group(args._io_group)
             dist.destroy_process_group()

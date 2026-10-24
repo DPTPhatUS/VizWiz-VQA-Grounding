@@ -77,7 +77,7 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 train_group.py \
     --lr 0.00001 --optimizer adam --weight-decay 0 \
     --lr-scheduler none --warmup-ratio 0 \
     --freeze-vision-encoder True --freeze-text-encoder True \
-    --gradient-checkpointing --seed 42 --save-every 5 \
+    --gradient-checkpointing --seed 42 --save-every 10 --no-save-final-weights \
     --config "$RUN_ROOT/configs/objective.json"
 ```
 
@@ -89,12 +89,12 @@ Adam moments retain the proposed update's gradients; projection controls realize
 
 ## Evaluation and diagnostic
 
-No validation runs internally. Check val at5/10/15/20; test10/20 is descriptive, not a selection criterion. Test metrics require local GT. Native mean IoU and global foreground IoU are separate. Reduce eval batch size if needed.
+No validation runs internally. Evaluate the saved epoch10/20 checkpoints only; test10/20 is descriptive, not a selection criterion. Test metrics require local GT. Native mean IoU and global foreground IoU are separate. Reduce eval batch size if needed.
 
 ```bash
 %%bash
 set -euo pipefail
-for epoch in 5 10 15 20; do
+for epoch in 10 20; do
     uv run --frozen eval.py --checkpoint "$RUN_ROOT/checkpoint_epoch${epoch}.pt" \
         --dataset val --data-root "$DATA_ROOT" --batch-size 4 --num-workers 2 \
         --output-dir "$RUN_ROOT/eval_val_ep${epoch}"
@@ -108,7 +108,7 @@ for epoch in 10 20; do
 done
 ```
 
-If validation selects epoch5/15, evaluate that checkpoint on test separately. Report <1%,1-10%,>=10%, overall mean/global IoU, precision/recall and area ratio; do not hide either smaller group behind a pooled score.
+No epoch5/15 checkpoints are created by this recipe. Both projected/control runs use identical save/evaluation schedules. Report <1%,1-10%,>=10%, overall mean/global IoU, precision/recall and area ratio; do not hide either smaller group behind a pooled score.
 
 ## ZIP without checkpoints
 
@@ -129,3 +129,24 @@ Download checkpoints separately. Session duration is unmeasured.
 ## Compatibility
 
 Old parent weights remain valid for evaluation with identical predictions. Other architectures stay on their branches. Full resume requires this objective/protocol, original optimizer/sampler/batch/world-size/mode and `--resume-checkpoint`. num-epochs is the final total. Initialization from weights is not optimizer resume. No existing experiment or result archive is changed.
+
+## Checkpoint storage and execution risks
+
+The guide saves ONLY full checkpoint_epoch10.pt and checkpoint_epoch20.pt.
+Default save interval is10; extra final raw weights are disabled by default.
+Do not reuse an old command/config setting save_every5 or save_final_weights=true.
+This policy does not delete old files already present. Full checkpoints still
+contain both frozen backbones; freezing only reduces optimizer-state storage.
+Use a fresh output/session with enough free disk for the next atomic write.
+The writer estimates tensor storage plus a safety margin, retains previous
+checkpoints, and coordinates disk failures on a CPU group rather than leaving
+peers waiting in NCCL. Available disk can change; fit is not guaranteed.
+Checkpoint spacing/output changes do not alter gradients, projection, optimizer
+updates or the resume protocol.
+
+The method itself may not improve validation. Sampled first-order constraints
+do not guarantee validation IoU, and strongly conflicting groups can leave
+very small updates. Inspect optimizer_update/overflow alongside update_ratio,
+projection_rejected and qp_zero_fallback. A near-zero update_ratio with otherwise
+successful optimizer updates suggests stalled learning, not a successful model.
+Compare against the same-parent, same-duration unprojected control.
