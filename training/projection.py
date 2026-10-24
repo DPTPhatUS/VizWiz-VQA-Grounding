@@ -5,6 +5,8 @@ from itertools import combinations
 import torch
 import torch.distributed as dist
 
+from training.size_objective import validate_group_weights
+
 
 @torch.no_grad()
 def parameter_vector(parameters):
@@ -69,13 +71,24 @@ def project_displacement(proposal, gradients):
 
 
 @torch.no_grad()
-def constrained_step(controls, scaler, gradients, *, project=True, tolerance=1e-6):
+def constrained_step(
+    controls,
+    scaler,
+    gradients,
+    *,
+    project=True,
+    tolerance=1e-6,
+    group_weights=(0.5, 0.5, 0.0),
+):
     """Take an optimizer proposal, then apply a feasible realized parameter update.
 
     Adam moments retain proposal gradients; each future realized step is projected
     again. Overflow skips the optimizer. A rounding violation rejects weight motion
     but retains the successful optimizer proposal's moments and schedule progress.
     """
+    weights = validate_group_weights(group_weights)
+    if gradients.ndim != 2 or gradients.shape[0] != 3:
+        raise ValueError("Expected one gradient vector for each of three groups")
     parameters = controls.parameters
     finite = torch.isfinite(gradients).all()
     if dist.is_initialized():
@@ -84,7 +97,11 @@ def constrained_step(controls, scaler, gradients, *, project=True, tolerance=1e-
         finite = flag == 0
     if not bool(finite) and not scaler.is_enabled():
         raise FloatingPointError("Nonfinite group gradient")
-    proposal_gradient = gradients[0] * 0.5 + gradients[1] * 0.5
+    proposal_gradient = (
+        gradients[0] * weights[0]
+        + gradients[1] * weights[1]
+        + gradients[2] * weights[2]
+    )
     position = 0
     for parameter in parameters:
         count = parameter.numel()

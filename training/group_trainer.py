@@ -1,4 +1,4 @@
-"""Balanced size-group training with optional constraints on actual Adam updates."""
+"""Size-weighted pyramid continuation with natural or mild-focus objectives."""
 
 import argparse
 import hashlib
@@ -21,6 +21,7 @@ from models.model import GroundingModel
 from train import seed_everything
 from training.projection import constrained_step, gradient_vector, parameter_vector
 from training.size_groups import GROUP_NAMES, BalancedGroupBatches, mask_groups
+from training.size_objective import resolve_group_weights
 from training_options import (
     TrainingArgumentParser,
     TrainingControls,
@@ -36,7 +37,7 @@ from utils import (
     to_device,
 )
 
-VERSION = "scale-constrained-updates-v1"
+VERSION = "size-weighted-updates-v1"
 LOSS_DEFAULTS = {**TRAINING_DEFAULTS, "overlap_loss": "dice"}
 
 
@@ -52,7 +53,13 @@ def parser(preflight=False):
     )
     result.add_argument("--data-root", required=True)
     result.add_argument("--output-dir", default="outputs")
-    result.add_argument("--num-epochs", type=int, default=20)
+    result.add_argument("--num-epochs", type=int, default=5)
+    result.add_argument(
+        "--focus-alpha",
+        type=float,
+        default=0.25,
+        help="Blend natural group frequencies with small/medium focus; 0 is natural",
+    )
     result.add_argument(
         "--batch-size",
         type=int,
@@ -63,7 +70,7 @@ def parser(preflight=False):
     result.add_argument("--num-workers", type=int, default=2)
     result.add_argument("--lr", type=float, default=1e-5)
     result.add_argument("--seed", type=int, default=42)
-    result.add_argument("--save-every", type=int, default=10)
+    result.add_argument("--save-every", type=int, default=5)
     result.add_argument(
         "--save-final-weights",
         action=argparse.BooleanOptionalAction,
@@ -74,7 +81,7 @@ def parser(preflight=False):
         "--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True
     )
     result.add_argument(
-        "--project-updates", action=argparse.BooleanOptionalAction, default=True
+        "--project-updates", action=argparse.BooleanOptionalAction, default=False
     )
     if preflight:
         result.add_argument("--steps", type=int, default=3)
@@ -124,7 +131,16 @@ def collect_gradient(model, batches, objective, controls, scaler, device, group)
     return vector, total
 
 
-def one_update(model, group_batches, objective, controls, scaler, device, project):
+def one_update(
+    model,
+    group_batches,
+    objective,
+    controls,
+    scaler,
+    device,
+    project,
+    group_weights=(0.5, 0.5, 0.0),
+):
     gradients, losses = [], []
     for group, batches in enumerate(group_batches):
         gradient, loss = collect_gradient(
@@ -133,15 +149,22 @@ def one_update(model, group_batches, objective, controls, scaler, device, projec
         gradients.append(gradient)
         losses.append(loss)
     metrics = constrained_step(
-        controls, scaler, torch.stack(gradients), project=project
+        controls,
+        scaler,
+        torch.stack(gradients),
+        project=project,
+        group_weights=group_weights,
     )
     if dist.is_initialized():
         tensor = torch.tensor(losses, device=device, dtype=torch.float64)
         dist.all_reduce(tensor)
         losses = (tensor / dist.get_world_size()).tolist()
     metrics.update({"loss_" + name: loss for name, loss in zip(GROUP_NAMES, losses)})
-    metrics["train_loss"] = sum(losses) / 3
-    metrics["proposal_loss"] = (losses[0] + losses[1]) / 2
+    metrics["macro_group_loss"] = sum(losses) / 3
+    metrics["train_loss"] = sum(
+        weight * loss for weight, loss in zip(group_weights, losses)
+    )
+    metrics["proposal_loss"] = metrics["train_loss"]
     return metrics
 
 
@@ -163,6 +186,7 @@ def execute(args, rank, world, device, preflight):
             "world_size",
             "lr",
             "project_updates",
+            "focus_alpha",
             "gradient_checkpointing",
         ):
             if getattr(args, key) != saved["run_config"][key]:
@@ -204,6 +228,15 @@ def execute(args, rank, world, device, preflight):
         args.data_root, "train", model.image_size, detail_size=model.detail_size
     )
     groups, digest = mask_groups(dataset)
+    natural_weights, proposal_weights = resolve_group_weights(
+        list(map(len, groups)), args.focus_alpha
+    )
+    if (
+        args.resume_checkpoint
+        and tuple(saved["run_config"]["group_protocol"]["proposal_weights"])
+        != proposal_weights
+    ):
+        raise ValueError("Resume group objective weights changed")
     if (
         args.resume_checkpoint
         and saved["run_config"]["group_protocol"]["mask_group_sha256"] != digest
@@ -254,7 +287,9 @@ def execute(args, rank, world, device, preflight):
         "sampling": "balanced-cyclic-shuffled",
         "projection": args.project_updates,
         "constraint_relative_tolerance": 1e-6,
-        "proposal_weights": [0.5, 0.5, 0.0],
+        "focus_alpha": args.focus_alpha,
+        "natural_weights": list(natural_weights),
+        "proposal_weights": list(proposal_weights),
         "initial_checkpoint": initial,
         "updates_per_epoch": sampler.steps,
     }
@@ -281,6 +316,7 @@ def execute(args, rank, world, device, preflight):
             "preflight_group.py",
             "training/group_trainer.py",
             "training/size_groups.py",
+            "training/size_objective.py",
             "training/projection.py",
             "train.py",
             "training_options.py",
@@ -351,6 +387,7 @@ def execute(args, rank, world, device, preflight):
                     scaler,
                     device,
                     args.project_updates,
+                    proposal_weights,
                 )
                 if not preflight or metrics["optimizer_update"]:
                     break
@@ -452,6 +489,8 @@ def run_main(argv=None, *, preflight=False):
         raise ValueError(
             "Use positive epochs/accumulation, nonnegative workers/save interval and global batch divisible by3*world"
         )
+    if not math.isfinite(args.focus_alpha) or not 0 <= args.focus_alpha <= 1:
+        raise ValueError("focus-alpha must be finite and in [0, 1]")
     if not math.isfinite(args.lr) or args.lr <= 0:
         raise ValueError("LR must be finite and positive")
     if preflight and args.steps < 2:
