@@ -1,4 +1,4 @@
-"""Continue the size-weighted pyramid with train-only context crops."""
+"""Run controlled crop-dose, retention and large-image recall continuations."""
 
 from training.group_trainer import run_main
 

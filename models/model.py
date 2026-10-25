@@ -79,7 +79,8 @@ class GroundingModel(nn.Module):
             return checkpoint(block, *inputs, use_reentrant=False)
         return block(*inputs)
 
-    def forward(self, batch: dict) -> dict:
+    def encode_inputs(self, batch: dict):
+        """Encode visual/text streams once; training may reuse their frozen outputs."""
         image, detail_image = batch["image"], batch["detail_image"]
         if image.shape[1:] != (3, self.image_size, self.image_size):
             raise ValueError(
@@ -99,6 +100,11 @@ class GroundingModel(nn.Module):
             batch["question_text"] if "question_text" in batch else batch["text"]
         )
         text = self.text_encoder(questions)
+        return features, text
+
+    def decode_features(self, batch, features, text):
+        """Run the original trainable pyramid body on already encoded features."""
+        detail_image = batch["detail_image"]
         question = masked_mean(text.tokens, text.valid_mask)
         projected = self.text_proj(text.tokens)
         tokens = features[-1].flatten(2).transpose(1, 2).to(projected.dtype)
@@ -123,6 +129,14 @@ class GroundingModel(nn.Module):
         )
         final = self._run(self.refiner, logits, semantic, detail[-1], detail_question)
         return {"logits": final, "auxiliary_logits": auxiliary}
+
+    def forward(self, batch: dict) -> dict:
+        features, text = self.encode_inputs(batch)
+        output = self.decode_features(batch, features, text)
+        if batch.get("_return_backbone", False):
+            output["backbone_features"] = features
+            output["backbone_text"] = text
+        return output
 
     @classmethod
     def from_checkpoint(cls, path, device="cpu"):

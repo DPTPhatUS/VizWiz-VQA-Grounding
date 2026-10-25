@@ -1,4 +1,4 @@
-"""Check context-crop group gradients and resumed optimizer updates before training."""
+"""Check crop-support gradients, frozen references and resumed updates before training."""
 
 from training.group_trainer import run_main
 

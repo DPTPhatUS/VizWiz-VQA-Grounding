@@ -1,4 +1,4 @@
-"""Train-only context crops on the frozen, size-weighted pyramid continuation."""
+"""Controlled crop-dose, foreground-retention and large-image recall experiments."""
 
 import argparse
 import hashlib
@@ -20,6 +20,7 @@ from losses import TRAINING_DEFAULTS, SegmentationObjective
 from models.model import GroundingModel
 from train import seed_everything
 from training.context_crop import ContextCrop
+from training.crop_support import RECIPES, CropSupportObjective
 from training.projection import constrained_step, gradient_vector, parameter_vector
 from training.size_groups import GROUP_NAMES, BalancedGroupBatches, mask_groups
 from training.size_objective import resolve_group_weights
@@ -38,7 +39,7 @@ from utils import (
     to_device,
 )
 
-VERSION = "context-crop-updates-v1"
+VERSION = "crop-support-updates-v1"
 BASE_VERSION = "size-weighted-updates-v1"
 LOSS_DEFAULTS = {**TRAINING_DEFAULTS, "overlap_loss": "dice"}
 
@@ -50,7 +51,7 @@ def parser(preflight=False):
         required=True,
         help="Full B epoch5 checkpoint, or this experiment's own full checkpoint",
     )
-    result.add_argument("--crop-probability", type=float, default=0.25)
+    result.add_argument("--variant", choices=tuple(RECIPES), default="retain")
     result.add_argument("--data-root", required=True)
     result.add_argument("--output-dir", default="outputs")
     result.add_argument("--num-epochs", type=int, default=10)
@@ -99,7 +100,7 @@ def file_hash(path):
 def collect_gradient(model, batches, objective, controls, scaler, device, group):
     """Stream microbatches and reduce one mean group gradient across DDP ranks."""
     controls.optimizer.zero_grad(set_to_none=True)
-    total = 0.0
+    statistics = [0.0] * 7
     for index, batch in enumerate(batches):
         batch = to_device(batch, device)
         area = batch.get("source_area_fraction")
@@ -118,7 +119,7 @@ def collect_gradient(model, batches, objective, controls, scaler, device, group)
             with torch.autocast(
                 device.type, dtype=torch.float16, enabled=scaler.is_enabled()
             ):
-                loss, _ = objective(model, batch)
+                loss, components = objective(model, batch)
             bad = (~torch.isfinite(loss)).to(torch.int32)
             if dist.is_initialized():
                 dist.all_reduce(bad, op=dist.ReduceOp.MAX)
@@ -127,10 +128,27 @@ def collect_gradient(model, batches, objective, controls, scaler, device, group)
                     "Nonfinite group forward loss on at least one rank"
                 )
             scaler.scale(loss / len(batches)).backward()
-        total += float(loss.detach()) / len(batches)
+        values = [loss.detach()] + [
+            torch.as_tensor(
+                components.get(key, loss.detach() if key == "base_objective" else 0.0),
+                device=device,
+            ).detach()
+            for key in (
+                "base_objective",
+                "retention_term",
+                "recall_delta",
+                "support_fraction",
+                "protected_coverage",
+                "retention_shortfall",
+            )
+        ]
+        statistics = [
+            a + b / len(batches)
+            for a, b in zip(statistics, torch.stack(values).double().tolist())
+        ]
     vector = gradient_vector(controls.parameters, scaler.get_scale())
     controls.optimizer.zero_grad(set_to_none=True)
-    return vector, total
+    return vector, statistics
 
 
 def one_update(
@@ -143,13 +161,13 @@ def one_update(
     project,
     group_weights=(0.5, 0.5, 0.0),
 ):
-    gradients, losses = [], []
+    gradients, records = [], []
     for group, batches in enumerate(group_batches):
-        gradient, loss = collect_gradient(
+        gradient, statistics = collect_gradient(
             model, batches, objective, controls, scaler, device, group
         )
         gradients.append(gradient)
-        losses.append(loss)
+        records.append(statistics)
     metrics = constrained_step(
         controls,
         scaler,
@@ -157,16 +175,26 @@ def one_update(
         project=project,
         group_weights=group_weights,
     )
+    statistics = torch.tensor(records, device=device, dtype=torch.float64)
     if dist.is_initialized():
-        tensor = torch.tensor(losses, device=device, dtype=torch.float64)
-        dist.all_reduce(tensor)
-        losses = (tensor / dist.get_world_size()).tolist()
-    metrics.update({"loss_" + name: loss for name, loss in zip(GROUP_NAMES, losses)})
-    metrics["macro_group_loss"] = sum(losses) / 3
-    metrics["train_loss"] = sum(
-        weight * loss for weight, loss in zip(group_weights, losses)
-    )
+        dist.all_reduce(statistics)
+        statistics /= dist.get_world_size()
+    losses, base, retain, recall, eligible, coverage, shortfall = statistics.T.tolist()
+    metrics.update({"loss_" + name: loss for name, loss in zip(GROUP_NAMES, base)})
+    metrics["macro_group_loss"] = sum(base) / 3
+    for name, values in (
+        ("base_segmentation_objective", base),
+        ("retention_objective_contribution", retain),
+        ("recall_objective_delta", recall),
+        ("train_loss", losses),
+    ):
+        metrics[name] = sum(
+            weight * value for weight, value in zip(group_weights, values)
+        )
     metrics["proposal_loss"] = metrics["train_loss"]
+    metrics["support_fraction_large"] = eligible[2]
+    metrics["protected_coverage_large"] = coverage[2]
+    metrics["retention_shortfall_large"] = shortfall[2]
     if "crop_applied" in group_batches[0][0]:
         statistics = []
         for batches in group_batches:
@@ -223,9 +251,13 @@ def execute(args, rank, world, device, preflight):
     ):
         if getattr(args, key) != saved["run_config"][key]:
             raise ValueError(f"Resume {key} differs from checkpoint")
-    crop = ContextCrop(args.crop_probability)
-    if not entering and saved["run_config"].get("context_crop") != crop.config:
-        raise ValueError("Resume crop policy differs from checkpoint")
+    recipe = RECIPES[args.variant]
+    crop = ContextCrop(recipe.crop_probability)
+    if not entering and (
+        saved["run_config"].get("context_crop") != crop.config
+        or saved["run_config"].get("support_recipe") != recipe.config
+    ):
+        raise ValueError("Resume crop/support policy differs from checkpoint")
     options = checkpoint_model_kwargs(saved)
     requested = recipe_config(args, LOSS_DEFAULTS)
     settings = {
@@ -250,6 +282,11 @@ def execute(args, rank, world, device, preflight):
         or not controls.config["freeze_text_encoder"]
     ):
         raise ValueError("This controlled continuation keeps both encoders frozen")
+    if not entering and not isinstance(saved.get("support_state"), dict):
+        raise ValueError("Resume is missing the original support-reference state")
+    objective = CropSupportObjective(
+        objective, model, recipe, saved.get("support_state") if not entering else None
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     controls.optimizer.load_state_dict(saved["optimizer_state_dict"])
     if saved.get("scaler_state_dict"):
@@ -326,6 +363,8 @@ def execute(args, rank, world, device, preflight):
         "constraint_relative_tolerance": 1e-6,
         "focus_alpha": args.focus_alpha,
         "context_crop": crop.config,
+        "support_recipe": recipe.config,
+        "reference_parameters_training_only": objective.reference_parameters,
         "natural_weights": list(natural_weights),
         "proposal_weights": list(proposal_weights),
         "initial_checkpoint": initial,
@@ -335,6 +374,7 @@ def execute(args, rank, world, device, preflight):
         **public_arguments(args),
         "objective_version": VERSION,
         "context_crop": crop.config,
+        "support_recipe": recipe.config,
         "augmentation_origin": augmentation_origin,
         "training_config": settings,
         "experiment_config": raw.experiment_config,
@@ -358,6 +398,7 @@ def execute(args, rank, world, device, preflight):
             "training/size_groups.py",
             "training/size_objective.py",
             "training/context_crop.py",
+            "training/crop_support.py",
             "training/projection.py",
             "train.py",
             "training_options.py",
@@ -489,6 +530,7 @@ def execute(args, rank, world, device, preflight):
                             "model_state_dict": raw.state_dict(),
                             "optimizer_state_dict": controls.optimizer.state_dict(),
                             "scaler_state_dict": scaler.state_dict(),
+                            "support_state": objective.state_dict(),
                             "training_controls": controls.state_dict(),
                             "experiment_config": raw.experiment_config,
                             "run_config": config,
@@ -530,7 +572,7 @@ def run_main(argv=None, *, preflight=False):
         raise ValueError(
             "Use positive epochs/accumulation, nonnegative workers/save interval and global batch divisible by3*world"
         )
-    ContextCrop(args.crop_probability)
+    ContextCrop(RECIPES[args.variant].crop_probability)
     if args.project_updates:
         raise ValueError("Context-crop experiment requires projection disabled")
     if not math.isfinite(args.focus_alpha) or not 0 <= args.focus_alpha <= 1:
