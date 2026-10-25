@@ -1,4 +1,4 @@
-"""Check real group gradients, optimizer proposals and projection before training."""
+"""Check context-crop group gradients and resumed optimizer updates before training."""
 
 from training.group_trainer import run_main
 

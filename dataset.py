@@ -26,9 +26,14 @@ def image_views(
 
 
 class VizWizGroundingDataset(Dataset):
-    def __init__(self, root, split, image_size=336, *, detail_size=768):
+    def __init__(
+        self, root, split, image_size=336, *, detail_size=768, train_transform=None
+    ):
         if split not in {"train", "val", "test"}:
             raise ValueError("Expected train, val or test split")
+        if train_transform is not None and split != "train":
+            raise ValueError("Training augmentation cannot be used on val/test")
+        self.train_transform = train_transform
         self.root, self.split = Path(root), split
         self.image_size, self.detail_size = image_size, detail_size
         self.records = json.loads((self.root / f"{split}_grounding.json").read_text())
@@ -50,6 +55,22 @@ class VizWizGroundingDataset(Dataset):
         # Masks are annotations in the upright coordinate system, not EXIF-tagged photos.
         if image.size != mask.size:
             raise ValueError(f"Upright image/mask dimensions differ for {name}")
+        original_size = (image.height, image.width)
+        augmentation = {}
+        if self.train_transform is not None:
+            source_mask = mask.resize(
+                (self.detail_size, self.detail_size), Image.Resampling.NEAREST
+            )
+            histogram = source_mask.histogram()
+            source_area = sum(histogram[128:]) / self.detail_size**2
+            image, mask, augmentation = self.train_transform(image, mask)
+            augmentation = {
+                key: torch.tensor(value, dtype=torch.float64)
+                for key, value in augmentation.items()
+            }
+            augmentation["source_area_fraction"] = torch.tensor(
+                source_area, dtype=torch.float64
+            )
         question = str(self.records[name].get("question") or "").strip()
         result = image_views(image, self.image_size, self.detail_size)
         result.update(
@@ -63,8 +84,9 @@ class VizWizGroundingDataset(Dataset):
             ).float(),
             question_text=f"Q: {question}",
             filename=name,
-            original_size=(image.height, image.width),
+            original_size=original_size,
         )
+        result.update(augmentation)
         if self.split != "train":
             result["original_mask"] = (to_tensor(mask) > 0.5).float()
         return result

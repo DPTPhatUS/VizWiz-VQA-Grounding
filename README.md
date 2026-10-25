@@ -1,40 +1,71 @@
-# Size-weighted pyramid: resume A/B from +5 to +10
+# Context-crop pyramid: one additional Kaggle run
 
-Branch: `exp/size-weighted-pyramid`. This session continues the completed
-`natural` (A) and `mild_focus` (B) runs independently, preserving their optimizer,
-AMP scaler, frozen encoders, loss, sampling, seed and learning rate.
-Use `train_group.py`, not `train.py`.
+Branch: `exp/context-crop-pyramid`, from `exp/size-weighted-pyramid` at `e89dc65`.
+This tests TRAIN-ONLY scale/context augmentation, with no new network modules,
+loss terms, inference crops, answer input or inference parameters.
 
-`--num-epochs 10` is the final continuation counter: train epochs6-10 only.
-Including the original pyramid's20epochs, this reaches30total epochs.
-Do not pass30, use `--init-checkpoint`, or initialize B from A.
-The original parent20 file is not needed for this session.
+Start from the FULL B/mild_focus checkpoint at counter5. Keep its model,
+optimizer, AMP scaler, frozen vision/text, weighted BCE+Dice, balanced sampler,
+LR1e-5, seed42 and update count. Train counters6-10 (five more epochs;30total
+including the original parent20). Compare with B continued to10 WITHOUT crops
+on `exp/size-weighted-pyramid`, not only with B5 or original parent20.
 
-The existing resume implementation already supports this constant-LR extension;
-no model, objective, checkpoint-format or default behavior change is required.
+## What changes
+
+For each sampled TRAIN image, attempt a crop with probability0.25. Other samples
+use the complete image. If a valid crop exists:
+
+1. Derive the foreground bounding extent from the existing TRAIN mask.
+2. Choose a source-aspect-ratio window, retaining ALL GT components and context.
+3. Jitter the window position while retaining the padded foreground extent.
+4. Crop native upright RGB and mask using the SAME coordinates, BEFORE creating
+   the336RGB and768detail views. Existing RGB normalization and mask-nearest
+   resizing stay unchanged. Question text is unchanged.
+
+The scale is shared between width/height (integer rounding aside). Let r be the
+larger of bbox-width/image-width and bbox-height/image-height. The lower side
+fraction is max(0.35,1.5*r, padded bbox extent); the upper is min(0.9,max(0.5,3*r)).
+Sample uniformly between these limits. Pad the bbox by25% of its width/height
+on available sides. Position is random among valid integer windows, not forced
+to put the object at the center. Retain all GT pixels BEFORE normal mask resize.
+
+Empty GT, a foreground extent too wide for this policy, or infeasible context
+falls back to the full image. Disjoint masks must ALL fit; do not crop one
+component and silently remove the others. Large images often fall back, so25%
+is the attempted rate, not a promise that25% of all draws are cropped.
+
+Group membership and weights use the UNCROPPED nearest-resized TRAIN mask.
+A crop can make an originally small object occupy a larger fraction, but it
+still contributes to its original group's objective. Train data order, frequency
+weights and number of model forwards per update remain the same as B.
+A crop REPLACES one training view; there is no extra crop model or extra forward.
+
+Val/test always use full images with their normal native-resolution metrics.
+GT-dependent crop selection is training augmentation only. The risk is learning
+crop-specific context/position shortcuts; unchanged full-image validation is the
+test of transfer. This does not promise recovery of detail missing in the photo.
+The general context/detail motivation is related to
+[HRDA](https://arxiv.org/abs/2204.13132), but this is not the HRDA architecture.
 
 ## Cell 1 — Setup
 
-Use a fresh Kaggle session with Internet and two GPUs. Attach VizWiz and the
-TWO FULL A/B `checkpoint_epoch5.pt` files, keeping their folder names if possible.
-The previous results ZIP intentionally excludes checkpoints; it cannot resume
-training. Raw model weights and C/D checkpoints are also not valid substitutes.
+Fresh Kaggle session: Internet, two GPUs, VizWiz dataset and the FULL B epoch5
+checkpoint attached. The results ZIP excludes .pt and cannot resume training.
+The original parent20, A/natural, C/D and raw final weights are not substitutes.
 
 ```python
-!git clone --single-branch --branch exp/size-weighted-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+!git clone --single-branch --branch exp/context-crop-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
 %cd /kaggle/working/VizWiz-VQA-Grounding
 !uv sync --frozen
 ```
 
 If already cloned on this branch, use `!git pull --ff-only` and `!uv sync --frozen`.
-No notebook file or separate personal guide is required.
 
-## Cell 2 — Locate A/B and restore their configurations
+## Cell 2 — Select B5 and write the crop config
 
-This identifies A/B from checkpoint metadata, not folder names. Set INPUT_ROOT
-to a narrower mounted dataset folder if several copies are attached. If multiple
-valid A or B files remain, set the corresponding path in `selected` explicitly.
-Only load checkpoints you trust.
+Auto-detect by checkpoint metadata. Set B_CKPT explicitly if multiple B5 files
+are mounted. Only load checkpoints you trust. INPUT_ROOT can be narrowed to the
+attached checkpoint dataset, avoiding unrelated files.
 
 ```python
 import gc
@@ -45,212 +76,193 @@ from utils import read_checkpoint
 
 os.environ['DATA_ROOT'] = '/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz'
 os.environ['INPUT_ROOT'] = '/kaggle/input'
+os.environ['B_CKPT'] = ''  # Optional exact full B/mild_focus checkpoint_epoch5.pt.
 os.environ['RUN_ROOT'] = 'outputs'
-os.environ['RUN_NAME'] = 'size_weighted_pyramid_two_runs_ep10_seed42'
+os.environ['RUN_NAME'] = 'context_crop_pyramid_ep10_seed42'
 os.environ['EVAL_BATCH'] = '4'
-os.environ['EVAL_TEST'] = '1'  # Use0 if local test GT is unavailable.
+os.environ['EVAL_TEST'] = '1'  # Set0 when local test GT is unavailable.
+os.environ['CONTROL_RESULTS_ZIP'] = ''  # Optional completed A/B+10 results ZIP.
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MPLBACKEND'] = 'Agg'
 
-selected = {'natural': '', 'mild_focus': ''}  # Optional exact checkpoint paths.
-candidates = {run: [] for run in selected}
-explicit = {str(Path(path)) for path in selected.values() if path}
-paths = sorted(set(Path(os.environ['INPUT_ROOT']).rglob('checkpoint_epoch5.pt'))
-               | {Path(path) for path in explicit})
-metadata = {}
+paths = ([Path(os.environ['B_CKPT'])] if os.environ['B_CKPT'] else
+         sorted(Path(os.environ['INPUT_ROOT']).rglob('checkpoint_epoch5.pt')))
+choices = []
 for path in paths:
     saved = read_checkpoint(path)
-    run_config = saved.get('run_config', {})
-    alpha = run_config.get('focus_alpha')
-    if (saved.get('epoch') == 5
-            and run_config.get('objective_version') == 'size-weighted-updates-v1'
-            and alpha in (0.0, 0.25)):
-        run = 'natural' if alpha == 0.0 else 'mild_focus'
-        candidates[run].append(path)
-        metadata[str(path)] = {
-            'epoch': saved['epoch'],
-            'has_optimizer': bool(saved.get('optimizer_state_dict', {}).get('state')),
-            'has_scaler': 'scaler_state_dict' in saved,
-            'run_config': run_config,
-            'controls': saved.get('training_controls', {}).get('config'),
-        }
+    config = saved.get('run_config', {})
+    if (saved.get('epoch') == 5 and config.get('focus_alpha') == 0.25
+            and config.get('objective_version') == 'size-weighted-updates-v1'):
+        assert saved.get('optimizer_state_dict', {}).get('state'), 'Use a full checkpoint.'
+        assert 'scaler_state_dict' in saved
+        choices.append((path, config, saved.get('training_controls', {}).get('config')))
     del saved
     gc.collect()
-
+if len(choices) != 1:
+    raise ValueError(f'Select exactly one B5 checkpoint using B_CKPT: {[str(x[0]) for x in choices]}')
+path, source_config, controls = choices[0]
+assert controls is not None, 'Missing saved optimizer/freezing controls.'
+for key, expected in {
+    'batch_size': 6, 'gradient_accumulation_steps': 1, 'world_size': 2,
+    'seed': 42, 'lr': 0.00001, 'gradient_checkpointing': True,
+    'project_updates': False,
+}.items():
+    assert source_config[key] == expected, key
+for key, expected in {
+    'optimizer': 'adam', 'lr': 0.00001, 'weight_decay': 0.0,
+    'lr_scheduler': 'none', 'warmup_ratio': 0.0,
+    'freeze_vision_encoder': True, 'freeze_text_encoder': True,
+}.items():
+    assert controls[key] == expected, key
+os.environ['B_CKPT'] = str(path)
 root = Path(os.environ['RUN_ROOT'])
-for run, expected_alpha in (('natural', 0.0), ('mild_focus', 0.25)):
-    choices = [Path(selected[run])] if selected[run] else candidates[run]
-    if len(choices) != 1:
-        raise ValueError(f'Select exactly one {run} checkpoint: {choices}')
-    path = choices[0]
-    info = metadata.get(str(path))
-    if info is None:
-        raise ValueError(f'Not a compatible A/B epoch5 checkpoint: {path}')
-    config = info['run_config']
-    assert info['has_optimizer'] and info['has_scaler'], 'Use full training checkpoints.'
-    assert config['focus_alpha'] == expected_alpha, f'Wrong checkpoint for {run}'
-    assert config['batch_size'] == 6 and config['gradient_accumulation_steps'] == 1
-    assert config['world_size'] == 2 and config['seed'] == 42
-    assert config['lr'] == 0.00001 and config['gradient_checkpointing'] is True
-    assert config['project_updates'] is False
-    controls = info['controls']
-    assert controls is not None, 'Missing saved optimizer/freezing controls.'
-    for key, expected in {
-        'optimizer': 'adam', 'lr': 0.00001, 'weight_decay': 0.0,
-        'lr_scheduler': 'none', 'warmup_ratio': 0.0,
-        'freeze_vision_encoder': True, 'freeze_text_encoder': True,
-    }.items():
-        assert controls[key] == expected, f'{run}: unexpected {key}'
-    folder = root / run
-    if folder.exists() and any(folder.iterdir()):
-        raise ValueError(f'Use a fresh output folder: {folder}')
-    os.environ[f'{run.upper()}_CKPT'] = str(path)
-    selected[run] = str(path)
-
-left, right = [metadata[selected[run]]['run_config'] for run in selected]
-for key in ('training_config', 'optimization_config', 'train_annotation_sha256',
-            'experiment_config'):
-    assert left[key] == right[key], f'A/B mismatch: {key}'
-for key in ('initial_checkpoint', 'mask_group_sha256', 'group_counts',
-            'sampling', 'updates_per_epoch'):
-    assert left['group_protocol'][key] == right['group_protocol'][key], key
+folder = root / 'context_crop'
+if folder.exists() and any(folder.iterdir()):
+    raise ValueError(f'Use a fresh run folder: {folder}')
 (root / 'configs').mkdir(parents=True, exist_ok=True)
-for run in selected:
-    config = metadata[selected[run]]['run_config']
-    settings = {**config['training_config'], 'focus_alpha': config['focus_alpha'],
-                'project_updates': False}
-    (root / 'configs' / f'{run}.json').write_text(json.dumps(settings, indent=2))
+config = {
+    **source_config['training_config'], 'focus_alpha': 0.25,
+    'project_updates': False, 'crop_probability': 0.25,
+}
+(root / 'configs/context_crop.json').write_text(json.dumps(config, indent=2))
 (root / 'continuation.json').write_text(json.dumps({
-    'start_counter': 5, 'target_counter': 10, 'total_parent_epochs': 20,
-    'checkpoints': selected, 'saved_metadata': metadata,
+    'source_checkpoint': str(path), 'source_counter': 5, 'target_counter': 10,
+    'source_config': source_config, 'optimizer_controls': controls,
 }, indent=2))
-print(json.dumps(selected, indent=2))
+print('B5 checkpoint:', path)
+print('Training config:', config)
 ```
 
-Config overrides CLI, then defaults. Here loss settings are copied from each
-checkpoint, and the trainer verifies that resume settings/data match. Each run
-continues its OWN optimizer and epoch-indexed sampling; nothing is reset to A/B's
-initial parent. Both encoders remain frozen; only CNN/fusion/decoder train.
+Only one new flag: `--crop-probability` (default0.25), also available in JSON.
+Config > explicit CLI > defaults. To run a no-crop control on this branch,
+change crop_probability in the JSON to0; an explicit flag cannot override JSON.
+The prescribed run uses0.25. Remaining crop geometry is fixed, versioned and
+saved in metadata rather than exposed as many new flags.
 
-## Cell 3 — One session: A then B, train and evaluate
-
-Each command is a separate process. Preflight uses a temporary in-memory copy
-of the resumed state; its updates are discarded. Training reloads the mounted
-checkpoint. No checkpoint is copied to outputs.
+## Cell 3 — Preflight, train, evaluate and diagnostic
 
 ```bash
 %%bash
 set -euo pipefail
-for run in natural mild_focus; do
-    checkpoint_var="${run^^}_CKPT"
-    checkpoint="${!checkpoint_var}"
-    run_dir="$RUN_ROOT/$run"
-    common=(
-        --data-root "$DATA_ROOT"
-        --resume-checkpoint "$checkpoint"
-        --config "$RUN_ROOT/configs/${run}.json"
-        --batch-size 6
-        --gradient-accumulation-steps 1
-        --lr 0.00001
-        --optimizer adam
-        --weight-decay 0
-        --lr-scheduler none
-        --warmup-ratio 0
-        --freeze-vision-encoder True
-        --freeze-text-encoder True
-        --no-project-updates
-        --gradient-checkpointing
-        --seed 42
-    )
-    uv run --frozen torchrun --standalone --nproc_per_node=2 preflight_group.py \
-        "${common[@]}" --num-workers 0 --steps 3
-    uv run --frozen torchrun --standalone --nproc_per_node=2 train_group.py \
-        "${common[@]}" --output-dir "$run_dir" \
-        --num-epochs 10 --num-workers 2 \
-        --save-every 10 --no-save-final-weights
-
-    # Evaluate both counters using the same checkout and native-resolution rules.
-    for epoch in 5 10; do
-        eval_checkpoint="$checkpoint"
-        if [[ "$epoch" == '10' ]]; then
-            eval_checkpoint="$run_dir/checkpoint_epoch10.pt"
-        fi
+run_dir="$RUN_ROOT/context_crop"
+common=(
+    --data-root "$DATA_ROOT"
+    --resume-checkpoint "$B_CKPT"
+    --config "$RUN_ROOT/configs/context_crop.json"
+    --batch-size 6
+    --gradient-accumulation-steps 1
+    --lr 0.00001
+    --optimizer adam
+    --weight-decay 0
+    --lr-scheduler none
+    --warmup-ratio 0
+    --freeze-vision-encoder True
+    --freeze-text-encoder True
+    --no-project-updates
+    --gradient-checkpointing
+    --seed 42
+)
+uv run --frozen torchrun --standalone --nproc_per_node=2 preflight_group.py \
+    "${common[@]}" --num-workers 0 --steps 3
+uv run --frozen torchrun --standalone --nproc_per_node=2 train_group.py \
+    "${common[@]}" --output-dir "$run_dir" \
+    --num-epochs 10 --num-workers 2 \
+    --save-every 10 --no-save-final-weights
+for epoch in 5 10; do
+    checkpoint="$B_CKPT"
+    if [[ "$epoch" == '10' ]]; then
+        checkpoint="$run_dir/checkpoint_epoch10.pt"
+    fi
+    uv run --frozen python eval.py \
+        --checkpoint "$checkpoint" --dataset val --data-root "$DATA_ROOT" \
+        --device cuda --batch-size "$EVAL_BATCH" --num-workers 2 \
+        --output-dir "$run_dir/eval_val_ep${epoch}"
+    uv run --frozen python diagnose.py \
+        --predictions "$run_dir/eval_val_ep${epoch}" --data-root "$DATA_ROOT" \
+        --output-dir "$run_dir/diagnostic_ep${epoch}"
+    if [[ "$EVAL_TEST" == '1' ]]; then
         uv run --frozen python eval.py \
-            --checkpoint "$eval_checkpoint" --dataset val \
-            --data-root "$DATA_ROOT" --device cuda \
-            --batch-size "$EVAL_BATCH" --num-workers 2 \
-            --output-dir "$run_dir/eval_val_ep${epoch}"
-        uv run --frozen python diagnose.py \
-            --predictions "$run_dir/eval_val_ep${epoch}" --data-root "$DATA_ROOT" \
-            --output-dir "$run_dir/diagnostic_ep${epoch}"
-        if [[ "$EVAL_TEST" == '1' ]]; then
-            uv run --frozen python eval.py \
-                --checkpoint "$eval_checkpoint" --dataset test \
-                --data-root "$DATA_ROOT" --device cuda \
-                --batch-size "$EVAL_BATCH" --num-workers 2 \
-                --output-dir "$run_dir/eval_test_ep${epoch}"
-        fi
-    done
+            --checkpoint "$checkpoint" --dataset test --data-root "$DATA_ROOT" \
+            --device cuda --batch-size "$EVAL_BATCH" --num-workers 2 \
+            --output-dir "$run_dir/eval_test_ep${epoch}"
+    fi
 done
 ```
 
-No validation runs inside training. This evaluates after training, at+5 and+10,
-with FP32 inference. Test metrics require local GT; select recipes/checkpoints
-using validation only. Set EVAL_BATCH=1 if evaluation batch4 exceeds VRAM.
+Preflight updates are discarded; the next process reloads B5 from disk, including
+its optimizer/scaler. Each command exits before the next, releasing GPU state.
+Training uses AMP; evaluation FP32, full images and original mask resolution.
+No validation inside training. Eval batch4 can be changed to1 if it exceeds VRAM.
 
-Only TWO new checkpoint files are written:
+Only ONE new checkpoint is saved: `outputs/context_crop/checkpoint_epoch10.pt`.
+No intermediate6/7/8/9, copied5 or duplicate final weights. No files are deleted.
+The mounted B5 checkpoint stays separate. ZIP excludes checkpoints.
+If interrupted before10, restart from B5 into a fresh output folder. To resume
+this branch's own later full checkpoint, retain the same probability/geometry,
+flags and data; set num-epochs to the final counter. A changed crop policy is
+rejected on resume. Scheduled runs cannot extend a fixed scheduler budget.
 
-- `outputs/natural/checkpoint_epoch10.pt`
-- `outputs/mild_focus/checkpoint_epoch10.pt`
+Intended budget: one5epoch continuation plus evaluation/diagnostics. Actual Kaggle
+runtime, memory and disk fit still require measurement on the user's hardware.
 
-No checkpoints6/7/8/9, copied epoch5 or duplicate final weights are saved.
-No old checkpoints are deleted. Keep the mounted epoch5 files separately.
-If interrupted before10, that run restarts from5. If A completes but B fails,
-rerun Cell3 with `for run in mild_focus; do`, using a fresh B output folder if
-partial history exists. Do not rerun completed A into its existing folder.
-The session budget/VRAM/disk requirements still depend on Kaggle hardware;
-CPU verification does not establish that it fits every session limit.
+## Cell 4 — Compare with B5 and optionally matched B10
 
-## Cell 4 — Compare +5 versus +10
+CONTROL_RESULTS_ZIP may point to the completed
+`size_weighted_pyramid_two_runs_ep10_seed42.zip`. This reads B10 metrics directly
+from the ZIP, without extracting masks or loading another checkpoint/model.
+If it is unavailable, the table is provisional: B5 versus crop10 changes both
+training length and augmentation. B10 is required to isolate augmentation.
 
 ```python
 import csv
+from zipfile import ZipFile
 
 root = Path(os.environ['RUN_ROOT'])
+folder = root / 'context_crop'
 rows = []
-for run in ('natural', 'mild_focus'):
-    baseline = None
-    for epoch in (5, 10):
-        folder = root / run
-        summary = json.loads((folder / f'eval_val_ep{epoch}/metrics.json').read_text())['summary']
-        diagnostic = json.loads((folder / f'diagnostic_ep{epoch}/summary.json').read_text())
-        protocol = summary['training_protocol']
+entries = []
+for name, epoch in [('B5_reference', 5), ('crop10', 10)]:
+    metrics = json.loads((folder / f'eval_val_ep{epoch}/metrics.json').read_text())
+    diagnostic = json.loads((folder / f'diagnostic_ep{epoch}/summary.json').read_text())
+    test_path = folder / f'eval_test_ep{epoch}/metrics.json'
+    test = json.loads(test_path.read_text())['summary'] if test_path.is_file() else {}
+    entries.append((name, epoch, metrics['summary'], diagnostic, test))
+if os.environ['CONTROL_RESULTS_ZIP']:
+    with ZipFile(os.environ['CONTROL_RESULTS_ZIP']) as archive:
+        def read_result(suffix):
+            matches = [name for name in archive.namelist() if name.endswith(suffix)]
+            if len(matches) != 1:
+                raise ValueError(f'Expected one {suffix}, found {matches}')
+            return json.loads(archive.read(matches[0]))
+        summary = read_result('mild_focus/eval_val_ep10/metrics.json')['summary']
+        diagnostic = read_result('mild_focus/diagnostic_ep10/summary.json')
+        test_names = [name for name in archive.namelist()
+                      if name.endswith('mild_focus/eval_test_ep10/metrics.json')]
+        test = json.loads(archive.read(test_names[0]))['summary'] if len(test_names) == 1 else {}
         assert summary['objective_version'] == 'size-weighted-updates-v1'
-        assert protocol['focus_alpha'] == (0.0 if run == 'natural' else 0.25)
-        assert protocol['projection'] is False
-        source = metadata[selected[run]]['run_config']['group_protocol']
-        for key in ('initial_checkpoint', 'mask_group_sha256', 'proposal_weights',
-                    'group_counts', 'updates_per_epoch'):
-            assert protocol[key] == source[key], key
-        values = {
-            'val_miou_pct': 100 * summary['mean_iou'],
-            'val_global_iou_pct': 100 * summary['global_iou'],
-            **{f'{name}_miou_pct': 100 * diagnostic['by_gt_area'][group]['mean_iou']
-               for name, group in [('small', 'small_lt_1pct'),
-                                   ('medium', 'medium_1_to_10pct'),
-                                   ('large', 'large_ge_10pct')]},
-        }
-        if baseline is None:
-            baseline = values
-        row = {'run': run, 'counter': epoch, 'total_training_epochs': 20 + epoch,
-               **values,
-               **{f'{key}_delta_vs_ep5_pp': value - baseline[key]
-                  for key, value in values.items()}}
-        test_path = folder / f'eval_test_ep{epoch}/metrics.json'
-        row['test_miou_pct'] = (100 * json.loads(test_path.read_text())['summary']['mean_iou']
-                                if test_path.is_file() else None)
-        rows.append(row)
-comparison = root / 'continuation_comparison.csv'
+        entries.append(('B10_control', 10, summary, diagnostic, test))
+source = source_config['group_protocol']
+for name, epoch, summary, diagnostic, test in entries:
+    protocol = summary['training_protocol']
+    for key in ('initial_checkpoint', 'mask_group_sha256', 'proposal_weights',
+                'group_counts', 'updates_per_epoch', 'focus_alpha'):
+        assert protocol[key] == source[key], (name, key)
+    assert summary['training_config'] == source_config['training_config']
+    assert summary['optimization_config'] == source_config['optimization_config']
+    if name == 'crop10':
+        assert summary['objective_version'] == 'context-crop-updates-v1'
+        assert protocol['context_crop']['probability'] == config['crop_probability']
+    rows.append({
+        'run': name, 'counter': epoch, 'total_training_epochs': 20 + epoch,
+        'val_miou_pct': 100 * summary['mean_iou'],
+        'val_global_iou_pct': 100 * summary['global_iou'],
+        **{f'{label}_miou_pct': 100 * diagnostic['by_gt_area'][group]['mean_iou']
+           for label, group in [('small', 'small_lt_1pct'),
+                                ('medium', 'medium_1_to_10pct'),
+                                ('large', 'large_ge_10pct')]},
+        'test_miou_pct': 100 * test['mean_iou'] if test else None,
+    })
+comparison = root / 'crop_comparison.csv'
 with comparison.open('w', newline='') as handle:
     writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
     writer.writeheader()
@@ -258,13 +270,12 @@ with comparison.open('w', newline='') as handle:
 print(comparison.read_text())
 ```
 
-Judge whether more training helps each run, including both smaller groups and
-large-region regressions. Keep parent20 as a fixed reference: val65.7663%,
-small19.4521%, medium46.2369%, large79.5730% for the supplied seed42 run.
-Do not automatically extend to+20 or select the best test score. A/B are close
-at+5; neither is a proven multi-seed winner.
+Choose using validation. Inspect both small groups, large regressions, precision,
+recall and native visualizations; do not select using test. B5's supplied seed42
+reference is val66.1693%, small19.5605%, medium47.8303%, large79.4138%.
+A crop10 gain over B5 alone is not evidence that crop augmentation helps.
 
-## Cell 5 — ZIP results, exclude checkpoints
+## Cell 5 — ZIP results without .pt files
 
 ```python
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -276,32 +287,32 @@ with ZipFile(archive, 'w', compression=ZIP_DEFLATED) as bundle:
         if path.is_file() and path.suffix.lower() not in {'.pt', '.tmp', '.zip'}:
             bundle.write(path, path.relative_to(root))
 print('Download results:', archive)
-print('Keep both checkpoint_epoch10.pt files separately for future resume.')
+print('Keep outputs/context_crop/checkpoint_epoch10.pt separately.')
 ```
 
-Includes configs, continuation provenance, history6-10, val/test predictions and
-metrics for5/10, diagnostics and comparison CSV. No .pt/.tmp/nested.zip files.
+Contains configs, source metadata, history6-10, full-image val/test5/10 masks and
+metrics, diagnostics and comparison. No checkpoints or nested ZIPs.
 
-## Objective and compatibility
+## Logs and compatibility
 
-Weights are derived from TRAIN mask frequencies p:
+`train_loss` remains the B weighted segmentation objective (all existing heads).
+It now mixes full/crop targets; its value is not directly a full-image loss.
+`crop_requested_<group>`, `crop_applied_<group>` and
+`crop_input_area_fraction_<group>` report draw-averaged statistics per SOURCE
+size group. `crop_applied_fraction` is the fraction of actual training draws
+cropped across the balanced sampler, not the natural dataset population.
+Low applied rate with requested~0.25 means geometry/context fallback, not that
+probability was ignored. An input-area fraction1 means a full image.
 
-    weights = (1 - focus_alpha) * p + focus_alpha * (0.5, 0.5, 0)
+Checkpoint metadata stores the complete versioned crop policy, original B5 file
+hash, original parent identity, source group mask digest and resolved weights.
+The first B5 import deliberately retains optimizer/scaler and counter5; this is
+an augmentation intervention, NOT a fresh optimizer initialization. Subsequent
+resumes require this branch's policy and exact training settings. Crops0 replay
+the original B update path; C/D optimizer checkpoints are not accepted.
 
-| Run | focus_alpha | Small / medium / large weights (current train set) |
-|---|---:|---|
-| natural (A) |0|3.83% /25.81% /70.36%|
-| mild_focus (B) |0.25|15.38% /31.86% /52.77%|
-
-The balanced sampler is unchanged; A represents the natural-frequency objective
-with stratified sampling, not the original pyramid training recipe.
-`--focus-alpha` defaults0.25; projection defaultsfalse on this branch. JSON takes
-precedence over CLI. Architecture and inference parameters are unchanged.
-Old parent/scale weights remain usable for initialization/inference, but optimizer
-resume requires `size-weighted-updates-v1` with matching loss, alpha, data,
-optimizer, freeze policy, seed, world size, batch and accumulation.
-
-For a fresh A/B experiment, use the same configs/common settings with
-`--init-checkpoint` pointing to original parent20 and `--num-epochs 5 --save-every 5`.
-That is independent initialization with a fresh optimizer, not this continuation.
-Do not use C/D full checkpoints on this branch.
+Model/state-dict keys, preprocessing defaults and inference architecture are
+unchanged. Old B checkpoints evaluate with full images as before. The augmentation
+uses only PIL RGB/masks, not CLIP-specific features; another dataset/backbone still
+needs its normal adapter and independent validation. CPU geometry/gradient/DDP
+checks do not establish GPU fit, accuracy gains or cross-backbone performance.

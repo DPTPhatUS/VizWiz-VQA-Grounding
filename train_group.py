@@ -1,4 +1,4 @@
-"""Train the size-constrained pyramid, or its matched unprojected control."""
+"""Continue the size-weighted pyramid with train-only context crops."""
 
 from training.group_trainer import run_main
 

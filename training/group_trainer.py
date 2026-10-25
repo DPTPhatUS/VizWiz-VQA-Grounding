@@ -1,4 +1,4 @@
-"""Size-weighted pyramid continuation with natural or mild-focus objectives."""
+"""Train-only context crops on the frozen, size-weighted pyramid continuation."""
 
 import argparse
 import hashlib
@@ -19,6 +19,7 @@ from dataset import VizWizGroundingDataset, collate_samples, seed_worker
 from losses import TRAINING_DEFAULTS, SegmentationObjective
 from models.model import GroundingModel
 from train import seed_everything
+from training.context_crop import ContextCrop
 from training.projection import constrained_step, gradient_vector, parameter_vector
 from training.size_groups import GROUP_NAMES, BalancedGroupBatches, mask_groups
 from training.size_objective import resolve_group_weights
@@ -37,23 +38,22 @@ from utils import (
     to_device,
 )
 
-VERSION = "size-weighted-updates-v1"
+VERSION = "context-crop-updates-v1"
+BASE_VERSION = "size-weighted-updates-v1"
 LOSS_DEFAULTS = {**TRAINING_DEFAULTS, "overlap_loss": "dice"}
 
 
 def parser(preflight=False):
     result = TrainingArgumentParser(description=__doc__, recipe_keys=LOSS_DEFAULTS)
-    source = result.add_mutually_exclusive_group(required=True)
-    source.add_argument(
-        "--init-checkpoint",
-        help="Pyramid weights only; start a fresh optimizer and epoch counter",
+    result.add_argument(
+        "--resume-checkpoint",
+        required=True,
+        help="Full B epoch5 checkpoint, or this experiment's own full checkpoint",
     )
-    source.add_argument(
-        "--resume-checkpoint", help="Full checkpoint from this exact group protocol"
-    )
+    result.add_argument("--crop-probability", type=float, default=0.25)
     result.add_argument("--data-root", required=True)
     result.add_argument("--output-dir", default="outputs")
-    result.add_argument("--num-epochs", type=int, default=5)
+    result.add_argument("--num-epochs", type=int, default=10)
     result.add_argument(
         "--focus-alpha",
         type=float,
@@ -70,7 +70,7 @@ def parser(preflight=False):
     result.add_argument("--num-workers", type=int, default=2)
     result.add_argument("--lr", type=float, default=1e-5)
     result.add_argument("--seed", type=int, default=42)
-    result.add_argument("--save-every", type=int, default=5)
+    result.add_argument("--save-every", type=int, default=10)
     result.add_argument(
         "--save-final-weights",
         action=argparse.BooleanOptionalAction,
@@ -102,7 +102,9 @@ def collect_gradient(model, batches, objective, controls, scaler, device, group)
     total = 0.0
     for index, batch in enumerate(batches):
         batch = to_device(batch, device)
-        area = batch["mask"].float().mean((1, 2, 3))
+        area = batch.get("source_area_fraction")
+        if area is None:
+            area = batch["mask"].float().mean((1, 2, 3))
         actual = torch.where(area < 0.01, 0, torch.where(area < 0.1, 1, 2))
         if bool((actual != group).any()):
             raise ValueError("Sampler and loaded target area disagree")
@@ -165,41 +167,72 @@ def one_update(
         weight * loss for weight, loss in zip(group_weights, losses)
     )
     metrics["proposal_loss"] = metrics["train_loss"]
+    if "crop_applied" in group_batches[0][0]:
+        statistics = []
+        for batches in group_batches:
+            statistics.append(
+                [
+                    torch.cat([batch[key].reshape(-1) for batch in batches])
+                    .mean()
+                    .item()
+                    for key in (
+                        "crop_requested",
+                        "crop_applied",
+                        "crop_input_area_fraction",
+                    )
+                ]
+            )
+        statistics = torch.tensor(statistics, device=device, dtype=torch.float64)
+        if dist.is_initialized():
+            dist.all_reduce(statistics)
+            statistics /= dist.get_world_size()
+        for name, values in zip(GROUP_NAMES, statistics.tolist()):
+            for key, value in zip(
+                ("crop_requested", "crop_applied", "crop_input_area_fraction"), values
+            ):
+                metrics[f"{key}_{name}"] = value
+        metrics["crop_applied_fraction"] = float(statistics[:, 1].mean())
     return metrics
 
 
 def execute(args, rank, world, device, preflight):
-    saved = read_checkpoint(args.resume_checkpoint or args.init_checkpoint)
-    if args.resume_checkpoint:
-        if (
-            "optimizer_state_dict" not in saved
-            or saved["run_config"].get("objective_version") != VERSION
-        ):
-            raise ValueError(
-                "Resume requires this exact group-training protocol; use init-checkpoint for weights"
-            )
-        restore_control_arguments(args, saved)
-        for key in (
-            "batch_size",
-            "gradient_accumulation_steps",
-            "seed",
-            "world_size",
-            "lr",
-            "project_updates",
-            "focus_alpha",
-            "gradient_checkpointing",
-        ):
-            if getattr(args, key) != saved["run_config"][key]:
-                raise ValueError(f"Resume {key} differs from checkpoint")
+    saved = read_checkpoint(args.resume_checkpoint)
+    source_version = saved.get("run_config", {}).get("objective_version")
+    entering = source_version == BASE_VERSION
+    if entering and (
+        saved.get("epoch") != 5 or saved["run_config"].get("focus_alpha") != 0.25
+    ):
+        raise ValueError(
+            "Start this experiment from the original B/mild_focus epoch5 checkpoint"
+        )
+    if "optimizer_state_dict" not in saved or source_version not in {
+        VERSION,
+        BASE_VERSION,
+    }:
+        raise ValueError("Use a full size-weighted B epoch5 or context-crop checkpoint")
+    restore_control_arguments(args, saved)
+    for key in (
+        "batch_size",
+        "gradient_accumulation_steps",
+        "seed",
+        "world_size",
+        "lr",
+        "project_updates",
+        "focus_alpha",
+        "gradient_checkpointing",
+    ):
+        if getattr(args, key) != saved["run_config"][key]:
+            raise ValueError(f"Resume {key} differs from checkpoint")
+    crop = ContextCrop(args.crop_probability)
+    if not entering and saved["run_config"].get("context_crop") != crop.config:
+        raise ValueError("Resume crop policy differs from checkpoint")
     options = checkpoint_model_kwargs(saved)
     requested = recipe_config(args, LOSS_DEFAULTS)
     settings = {
         **LOSS_DEFAULTS,
-        **(saved["run_config"]["training_config"] if args.resume_checkpoint else {}),
+        **saved["run_config"]["training_config"],
     }
-    if args.resume_checkpoint and any(
-        settings[key] != value for key, value in requested.items()
-    ):
+    if any(settings[key] != value for key, value in requested.items()):
         raise ValueError("Resume loss configuration differs")
     settings.update(requested)
     objective = SegmentationObjective(**settings)
@@ -209,45 +242,49 @@ def execute(args, rank, world, device, preflight):
     )
     load_model_weights(model, saved)
     model.to(device)
-    initial = (
-        saved["run_config"].get("group_protocol", {}).get("initial_checkpoint")
-        if args.resume_checkpoint
-        else {
-            "path": str(args.init_checkpoint),
-            "sha256": file_hash(args.init_checkpoint),
-        }
-    )
-    start = saved["epoch"] if args.resume_checkpoint else 0
-    controls = TrainingControls(model, args, saved if args.resume_checkpoint else None)
+    initial = saved["run_config"]["group_protocol"]["initial_checkpoint"]
+    start = saved["epoch"]
+    controls = TrainingControls(model, args, saved)
+    if (
+        not controls.config["freeze_vision_encoder"]
+        or not controls.config["freeze_text_encoder"]
+    ):
+        raise ValueError("This controlled continuation keeps both encoders frozen")
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
-    if args.resume_checkpoint:
-        controls.optimizer.load_state_dict(saved["optimizer_state_dict"])
-        if saved.get("scaler_state_dict"):
-            scaler.load_state_dict(saved["scaler_state_dict"])
+    controls.optimizer.load_state_dict(saved["optimizer_state_dict"])
+    if saved.get("scaler_state_dict"):
+        scaler.load_state_dict(saved["scaler_state_dict"])
     dataset = VizWizGroundingDataset(
-        args.data_root, "train", model.image_size, detail_size=model.detail_size
+        args.data_root,
+        "train",
+        model.image_size,
+        detail_size=model.detail_size,
+        train_transform=crop,
     )
     groups, digest = mask_groups(dataset)
     natural_weights, proposal_weights = resolve_group_weights(
         list(map(len, groups)), args.focus_alpha
     )
     if (
-        args.resume_checkpoint
-        and tuple(saved["run_config"]["group_protocol"]["proposal_weights"])
+        tuple(saved["run_config"]["group_protocol"]["proposal_weights"])
         != proposal_weights
     ):
         raise ValueError("Resume group objective weights changed")
-    if (
-        args.resume_checkpoint
-        and saved["run_config"]["group_protocol"]["mask_group_sha256"] != digest
-    ):
+    if saved["run_config"]["group_protocol"]["mask_group_sha256"] != digest:
         raise ValueError("Training masks/group assignments changed on resume")
     annotation = file_hash(Path(args.data_root) / "train_grounding.json")
-    if (
-        args.resume_checkpoint
-        and saved["run_config"]["train_annotation_sha256"] != annotation
-    ):
+    if saved["run_config"]["train_annotation_sha256"] != annotation:
         raise ValueError("Training annotations changed on resume")
+    augmentation_origin = (
+        {
+            "path": str(args.resume_checkpoint),
+            "sha256": file_hash(args.resume_checkpoint),
+            "epoch": start,
+            "objective_version": source_version,
+        }
+        if entering
+        else saved["run_config"]["augmentation_origin"]
+    )
     del saved
     if not preflight and start >= args.num_epochs:
         raise ValueError("num-epochs must exceed the resumed epoch")
@@ -288,6 +325,7 @@ def execute(args, rank, world, device, preflight):
         "projection": args.project_updates,
         "constraint_relative_tolerance": 1e-6,
         "focus_alpha": args.focus_alpha,
+        "context_crop": crop.config,
         "natural_weights": list(natural_weights),
         "proposal_weights": list(proposal_weights),
         "initial_checkpoint": initial,
@@ -296,6 +334,8 @@ def execute(args, rank, world, device, preflight):
     config = {
         **public_arguments(args),
         "objective_version": VERSION,
+        "context_crop": crop.config,
+        "augmentation_origin": augmentation_origin,
         "training_config": settings,
         "experiment_config": raw.experiment_config,
         "tiny": options["tiny"],
@@ -317,6 +357,7 @@ def execute(args, rank, world, device, preflight):
             "training/group_trainer.py",
             "training/size_groups.py",
             "training/size_objective.py",
+            "training/context_crop.py",
             "training/projection.py",
             "train.py",
             "training_options.py",
@@ -335,9 +376,11 @@ def execute(args, rank, world, device, preflight):
     out = Path(args.output_dir)
     history = out / "history.jsonl"
     if not preflight:
-        if not args.resume_checkpoint and (history.exists() or any(out.glob("*.pt"))):
-            raise ValueError("Output already contains a run")
-        if args.resume_checkpoint and history.exists():
+        if not history.exists() and any(out.glob("*.pt")):
+            raise ValueError(
+                "Output contains checkpoints without matching history; use a fresh folder"
+            )
+        if history.exists():
             records = [
                 json.loads(line)
                 for line in history.read_text().splitlines()
@@ -478,8 +521,6 @@ def run_main(argv=None, *, preflight=False):
         for k, d in (("RANK", 0), ("WORLD_SIZE", 1), ("LOCAL_RANK", 0))
     ]
     args.world_size = world
-    if bool(args.init_checkpoint) == bool(args.resume_checkpoint):
-        raise ValueError("Choose exactly one initialization or resume checkpoint")
     if (
         min(args.num_epochs, args.batch_size, args.gradient_accumulation_steps) <= 0
         or args.batch_size % (3 * world)
@@ -489,22 +530,20 @@ def run_main(argv=None, *, preflight=False):
         raise ValueError(
             "Use positive epochs/accumulation, nonnegative workers/save interval and global batch divisible by3*world"
         )
+    ContextCrop(args.crop_probability)
+    if args.project_updates:
+        raise ValueError("Context-crop experiment requires projection disabled")
     if not math.isfinite(args.focus_alpha) or not 0 <= args.focus_alpha <= 1:
         raise ValueError("focus-alpha must be finite and in [0, 1]")
     if not math.isfinite(args.lr) or args.lr <= 0:
         raise ValueError("LR must be finite and positive")
     if preflight and args.steps < 2:
         raise ValueError("Preflight needs at least2 steps")
-    for name in ("init_checkpoint", "resume_checkpoint"):
-        checkpoint = getattr(args, name)
-        if checkpoint and not Path(checkpoint).is_file():
-            flag = "--" + name.replace("_", "-")
-            raise FileNotFoundError(
-                f"{flag} is not a checkpoint file: {checkpoint!r}. "
-                "On Kaggle, attach the dataset containing the trained checkpoint "
-                "and set PYRAMID_CKPT to its exact .pt path. "
-                "YOUR_PYRAMID_DATASET in the guide is a placeholder."
-            )
+    if not Path(args.resume_checkpoint).is_file():
+        raise FileNotFoundError(
+            f"Resume checkpoint not found: {args.resume_checkpoint!r}. "
+            "Attach the full B/mild_focus epoch5 checkpoint and set B_CKPT to its path."
+        )
     for kind in ("vision", "text"):
         key = f"freeze_{kind}_encoder"
         if getattr(args, key) is None:
