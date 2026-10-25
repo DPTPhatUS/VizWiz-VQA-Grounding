@@ -81,7 +81,7 @@ rate because most large GT extents cannot satisfy the context window.
 
 Use a fresh Kaggle session with Internet, two GPUs, VizWiz and the FULL B5
 checkpoint attached. Result ZIPs exclude .pt; raw weights cannot resume Adam.
-Optionally attach previous A/B10 and crop10 RESULTS ZIPs for matched comparison.
+Optionally attach previous A/B10 and crop10 results, extracted OR zipped, for matched comparison.
 Keep checkpoints mounted in /kaggle/input rather than copying into outputs.
 
 ```python
@@ -110,14 +110,27 @@ from utils import read_checkpoint
 SESSION = 1  # Session2: change this to2; all other steps stay the same.
 os.environ['DATA_ROOT'] = '/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz'
 os.environ['INPUT_ROOT'] = '/kaggle/input'
-os.environ['B_CKPT'] = ''  # Optional exact full B/mild_focus checkpoint_epoch5.pt.
+os.environ['B_CKPT'] = '/kaggle/input/datasets/khoahoang0512/vizwiz-size-weighted-pyramid-cp/mild_focus/checkpoint_epoch5.pt'
 os.environ['RUN_ROOT'] = 'outputs'
 os.environ['EVAL_BATCH'] = '4'
 os.environ['EVAL_TEST'] = '1'  # Use0 if local test GT is unavailable.
-os.environ['BASELINE_RESULTS_ZIP'] = ''  # Optional size_weighted_pyramid_two_runs_ep10_seed42.zip.
-os.environ['CROP_RESULTS_ZIP'] = ''  # Optional context_crop_pyramid_ep10_seed42.zip.
+os.environ['BASELINE_RESULTS'] = ''  # Optional exact result directory OR .zip; empty auto-detects below.
+os.environ['CROP_RESULTS'] = ''  # Optional exact result directory OR .zip; empty auto-detects below.
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MPLBACKEND'] = 'Agg'
+# Kaggle may expose uploaded ZIP contents as directories, as in vizwiz-exp.
+for variable, name in (
+    ('BASELINE_RESULTS', 'size_weighted_pyramid_two_runs_ep10_seed42'),
+    ('CROP_RESULTS', 'context_crop_pyramid_ep10_seed42'),
+):
+    if not os.environ[variable]:
+        candidates = sorted(set(Path(os.environ['INPUT_ROOT']).rglob(name))
+                            | set(Path(os.environ['INPUT_ROOT']).rglob(name + '.zip')))
+        candidates = [path for path in candidates if path.is_dir() or path.suffix == '.zip']
+        if len(candidates) > 1:
+            raise ValueError(f'Set {variable} to one result directory/ZIP: {candidates}')
+        os.environ[variable] = str(candidates[0]) if candidates else ''
+    print(variable, os.environ[variable] or '(not attached; comparison will skip it)')
 assert SESSION in (1, 2)
 variants = ('low_crop', 'retain') if SESSION == 1 else ('recall', 'retain_recall')
 os.environ['RUN_VARIANTS'] = ' '.join(variants)
@@ -255,13 +268,17 @@ Do not shorten one run only and call it a matched comparison.
 
 ## Cell 4 — Compare both runs with B5 and existing B10/crop25
 
-Attach the existing result ZIPs and set BASELINE_RESULTS_ZIP/CROP_RESULTS_ZIP
-in Cell2, or set those environment variables here before running this cell.
-They are read directly; no checkpoint loads, extra inference or extraction.
+Attach the existing results and set BASELINE_RESULTS/CROP_RESULTS in Cell2,
+or leave them empty for auto-detection by the two directory names above.
+Both extracted directories (including the vizwiz-exp layout in the screenshot)
+and ZIP files work. They are read directly; no extra inference or extraction.
+B_CKPT already uses the supplied vizwiz-size-weighted-pyramid-cp/mild_focus path;
+the natural checkpoint and original parent20 are not used by these four runs.
 Without them the table is provisional: B5 has five fewer training epochs.
 
 ```python
 import csv
+from contextlib import contextmanager
 from zipfile import ZipFile
 
 root = Path(os.environ['RUN_ROOT'])
@@ -278,20 +295,37 @@ for variant in variants:
     assert summary['objective_version'] == 'crop-support-updates-v1'
     assert summary['training_protocol']['support_recipe'] == RECIPES[variant].config
     entries.append((variant, 10, summary, diag, test))
-for variable, label, prefix, expected_version in [
-    ('BASELINE_RESULTS_ZIP', 'B10_control', 'mild_focus', 'size-weighted-updates-v1'),
-    ('CROP_RESULTS_ZIP', 'crop25_control', 'context_crop', 'context-crop-updates-v1'),
-]:
-    if not os.environ[variable]:
-        continue
-    with ZipFile(os.environ[variable]) as archive:
+@contextmanager
+def result_reader(location):
+    path = Path(location)
+    if path.is_dir():
         def read_result(suffix, required=True):
-            matches = [name for name in archive.namelist() if name.endswith(suffix)]
+            matches = [file for file in path.rglob(Path(suffix).name)
+                       if file.is_file() and file.as_posix().endswith(suffix)]
             if not matches and not required:
                 return {}
             if len(matches) != 1:
-                raise ValueError(f'Expected one {suffix}: {matches}')
-            return json.loads(archive.read(matches[0]))
+                raise ValueError(f'Expected one {suffix} under {path}: {matches}')
+            return json.loads(matches[0].read_text())
+        yield read_result
+    else:
+        with ZipFile(path) as archive:
+            def read_result(suffix, required=True):
+                matches = [name for name in archive.namelist() if name.endswith(suffix)]
+                if not matches and not required:
+                    return {}
+                if len(matches) != 1:
+                    raise ValueError(f'Expected one {suffix}: {matches}')
+                return json.loads(archive.read(matches[0]))
+            yield read_result
+
+for variable, label, prefix, expected_version in [
+    ('BASELINE_RESULTS', 'B10_control', 'mild_focus', 'size-weighted-updates-v1'),
+    ('CROP_RESULTS', 'crop25_control', 'context_crop', 'context-crop-updates-v1'),
+]:
+    if not os.environ[variable]:
+        continue
+    with result_reader(os.environ[variable]) as read_result:
         summary = read_result(f'{prefix}/eval_val_ep10/metrics.json')['summary']
         diag = read_result(f'{prefix}/diagnostic_ep10/summary.json')
         test = read_result(f'{prefix}/eval_test_ep10/metrics.json', required=False).get('summary', {})
