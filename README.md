@@ -1,20 +1,23 @@
 # GT-region answer token supervision
 
-A641,283-parameter two-layer width128 Transformer reads a16x16 ordered GT-region grid from shared192-scale features. It predicts complete UTF-8 answers, using259 byte/special symbols, without global mean pooling or answer-embedding regression. Missing/unanswerable and >64-byte answers are skipped, not silently truncated. Teacher forcing is confined to this head.
+Branch: `exp/answer-token-supervision`, based on `exp/question-guided-detail-pyramid` (`ddfdce1`). This experiment adds a training-only **641,283-parameter**, 2-layer, width-128 Transformer answer decoder that reads a 16x16 ordered grid pooled from the ground-truth region of shared 192-scale pyramid features. It predicts complete UTF-8 answers autoregressively over a 259-token byte vocabulary (256 byte values plus BOS, EOS, and PAD) without global average pooling or answer-embedding regression. Missing, unanswerable, or >64-byte answers are skipped during answer loss computation, and teacher forcing is confined strictly to this auxiliary head.
 
 ## Architecture and supervision
 
-The original I336 CLIP + I768 detail pyramid, Q conditioning and mask losses are unchanged. The head reads shared192-scale features after mask prediction. GT Answer/region never enter the grounding path. Auxiliary gradients update shared features. There is no extra VLM, image encoder, latent answer or scope selector.
+The base `I336` CLIP + `I768` detail pyramid, question conditioning, and multi-scale segmentation losses are unchanged. During training, the auxiliary answer head reads shared 192-scale decoder features after mask prediction, so ground-truth answers and regions never enter the grounding forward path while auxiliary gradients flow back into the shared visual-textual representation. Standard evaluation removes the answer head before transferring the model to the GPU, so inference uses only the image and question.
 
-New config keys: answer_weight=0.05, answer_warmup_epochs=2, answer_ramp_epochs=3. Other optimizer/freeze/config options remain available through train.py --help. fp_weight is inactive for Dice. Standard eval drops the answer head. Both new experiments require fresh training; old experiment artifacts stay unchanged.
+New `--config` JSON keys:
+- `answer_weight`: `0.05`
+- `answer_warmup_epochs`: `2`
+- `answer_ramp_epochs`: `3`
 
-## Complete Kaggle guide
+All existing optimizer, encoder-freezing, and segmentation loss flags remain available via `train.py --help` (`fp_weight` applies only when `overlap_loss="tversky"`). Runs train fresh for 20 epochs from pretrained CLIP weights.
 
-# GT-region answer token supervision
+## Kaggle workflow
 
-Branch `exp/answer-token-supervision`, based on pyramid commit `ddfdce1`. Enable Internet and2 T4 GPUs. Train20 fresh epochs from pretrained CLIP; no parent/teacher checkpoint or external VLM is required. The grounder remains the original large pyramid; only the additional head is small. T4 VRAM/runtime have not been measured. Start with an empty outputs directory.
+Enable Internet and 2 T4 GPUs, and start with an empty `outputs` directory.
 
-## 1. Setup
+### 1. Setup
 
 ```python
 !git clone --single-branch --branch exp/answer-token-supervision https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
@@ -22,9 +25,9 @@ Branch `exp/answer-token-supervision`, based on pyramid commit `ddfdce1`. Enable
 !uv sync --frozen
 ```
 
-## 2. Paths and one config
+### 2. Paths and configuration
 
-All files remain directly under outputs. JSON overrides flags, then defaults.
+All artifacts are written under `outputs/`. Configuration precedence follows **JSON config > explicit CLI flags > defaults**.
 
 ```python
 import json
@@ -42,9 +45,9 @@ config = {'overlap_loss': 'dice', 'overlap_weight': 0.5, 'fp_weight': 0.7, 'aux9
 (root / 'configs/answer.json').write_text(json.dumps(config, indent=2))
 ```
 
-## 3. Preflight
+### 3. Preflight
 
-Both ranks must pass. This checks execution/gradients, not accuracy. Preflight updates are discarded. GPU memory is reported here before full training.
+Both ranks must pass preflight, which verifies forward/backward execution, gradient flow, and peak GPU memory before launching the full run (preflight updates are discarded).
 
 ```python
 %%bash
@@ -58,9 +61,9 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
 
 ```
 
-## 4. Train20 epochs
+### 4. Train 20 epochs
 
-Global microbatch2 is1 image/GPU; accumulation2 gives effective batch4. Use batch4/accumulation1 if preflight fits. Vision fine-tunes; text stays frozen. Adam1e-5/no schedule matches the pyramid recipe. Answer loss is disabled for epochs1–2 and ramps in epochs3–5. No internal validation runs every epoch.
+A global microbatch of 2 places 1 image per GPU, and `--gradient-accumulation-steps 2` gives an effective batch size of 4 (use `--batch-size 4 --gradient-accumulation-steps 1` if memory allows). The vision encoder is fine-tuned while the text encoder stays frozen, using Adam at `1e-5` with constant learning rate. The auxiliary answer loss weight is `0.0` during epochs 1 and 2, ramps linearly over epochs 3 to 5, and stays at `0.05` from epoch 5 onward.
 
 ```python
 %%bash
@@ -80,9 +83,9 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
 
 ```
 
-## 5. Four evaluations
+### 5. Four evaluations
 
-Native mean per-image IoU is primary; global foreground IoU is separate. Masks are native size. Eval removes the auxiliary head before GPU transfer. Inputs are I+Q only. Select checkpoints on validation, never test.
+`eval.py` strips the auxiliary answer head before moving the model to the GPU, predicts native-resolution masks from image + question only, and reports both per-image `mean_iou` and dataset-wide `global_iou`. Select checkpoints using the validation split only.
 
 ```python
 %%bash
@@ -128,9 +131,9 @@ uv run --frozen eval.py \
 
 ```
 
-## 6. Diagnostics
+### 6. Diagnostics
 
-Mask analysis is CPU-only. The auxiliary diagnostic reuses one image encoding to compare GT-region, full-image and zero-visual predictions. Grounding is computed first using I+Q. Byte accuracy is teacher-forced, not free-generation VQA accuracy. Dense class accuracy includes background; inspect foreground accuracy and vocabulary coverage separately. Near-identical GT/zero-visual scores suggest the head ignores image content.
+`diagnose.py` analyzes the exported validation masks on CPU. `diagnose_answers.py` runs a single image encoding pass and compares teacher-forced byte cross-entropy and token accuracy across ground-truth region pooling, full-image pooling, and zeroed visual features to measure how strongly the answer head relies on localized visual features.
 
 ```python
 %%bash
@@ -149,9 +152,9 @@ uv run --frozen diagnose_answers.py \
 
 ```
 
-## 7. Download ZIP without checkpoints
+### 7. Download ZIP without checkpoints
 
-Includes config, run_config, history, four evaluations and diagnostics. Download .pt checkpoints separately from Kaggle Outputs; keep the selected checkpoint.
+This bundles configs, training history, evaluation metrics, exported masks, and diagnostics into a single archive while excluding `.pt` checkpoint files (download the selected `.pt` checkpoint separately from Kaggle Outputs).
 
 ```python
 import os
@@ -170,8 +173,6 @@ print(archive)
 
 ## Controls and resume
 
-For a matched no-answer control, change only answer_weight to0 and use a fresh run/session. Resume only this branch's full checkpoint with --resume-checkpoint; repeat original settings and set a larger total num-epochs. Annotation hashes, architecture and vocabulary must match. Old pyramid/latent/scope checkpoints are not valid resumes.
+To run a matched no-answer control on this branch, set `answer_weight` to `0` in a fresh output directory. Use `--resume-checkpoint` only with full checkpoints produced by this branch, keeping the original training flags, annotation hashes, architecture, and vocabulary while increasing `--num-epochs` to the target total.
 
-Loss reduction: mean valid targets within each image, then mean original images. Invalid answers contribute zero; answer_valid_fraction reports coverage. This matches DDP and partial accumulation-window sample weighting.
-
-Answer loss supervises shared representations, not the predicted mask directly. Improvements and visual dependence are hypotheses. Compare size groups and an answer_weight0 control before attributing gains to Answer. CPU synthetic tests do not establish T4 performance or accuracy.
+For loss reduction, token cross-entropy is averaged over valid answer bytes within each image and then averaged across all images in the batch (with skipped/invalid answers contributing `0.0` and `answer_valid_fraction` tracking valid sample coverage). This keeps loss scaling identical across DDP ranks and partial gradient-accumulation windows.
