@@ -1,49 +1,22 @@
 # Pyramid weight interpolation: export all models, then evaluate (no training)
 
-Branch: `exp/pyramid-weight-interpolation`. One Kaggle evaluation session.
-Use the FULL B/mild_focus epoch5 and FULL low_crop epoch10 checkpoints.
-Do NOT use original parent20, A/natural, crop25, retain or retain_recall.
+Branch: `exp/pyramid-weight-interpolation`. This workflow runs in a single Kaggle evaluation session without any training. It interpolates the trainable post-encoder weights between the full `mild_focus` epoch-5 checkpoint (`B5`) and the full `low_crop` epoch-10 checkpoint (`low_crop10`):
 
     body(alpha) = (1-alpha)*body(B5) + alpha*body(low_crop10)
 
-The default grid is0,0.1,0.25,0.5,1: FIVE independent weights-only files are saved,
-including exact endpoints. No optimizer, AMP scaler, frozen reference or epoch
-counter is stored. Every file is a complete single inference model, with the
-same number of parameters as the original pyramid. These are not full training
-resumes. Frozen encoders and ALL non-trainable buffers must match bit-for-bit;
-normalization buffers are copied, not averaged. Source hashes and provenance
-are included in every exported model and in interpolation.json.
+The default grid `alpha in {0, 0.1, 0.25, 0.5, 1}` exports five standalone weights-only `.pt` files (including both exact endpoints). Optimizer state, AMP scaler state, frozen reference bodies, and epoch counters are omitted so each file is a standard single-model inference checkpoint with the same parameter count as the base pyramid. Frozen encoders and all non-trainable buffers must match bit-for-bit between the two source checkpoints and are copied directly rather than averaged. Each exported file and `interpolation.json` record the SHA256 hashes and provenance of both source checkpoints.
 
-This is an established parameter-averaging direction, motivated by
-[Model Soups](https://proceedings.mlr.press/v162/wortsman22a.html), not a claim of
-novelty or guaranteed VizWiz improvement. The goal is to test whether part of
-low_crop's small/medium benefit can be retained nearer the stronger B5 model.
-It does not by itself solve the persistent hard localization cases.
+Background reference on weight-space averaging across fine-tuned checkpoints: [Model Soups](https://proceedings.mlr.press/v162/wortsman22a.html). Here we test whether interpolating between `B5` and `low_crop10` retains `low_crop10`'s small and medium target gains while staying closer to `B5` on large regions.
 
 ## Storage and checkpoint policy
 
-All five models are saved; the script does NOT keep only the validation winner.
-Each still includes both encoders, so weights-only is not a tiny decoder file.
-The exporter measures actual tensor storage and free disk AFTER uv sync,
-with an explicit14GiB budget cap (about15GB) even if the filesystem reports
-more space than the Kaggle working-directory quota. It uses the LOWER of
-physical free space and that cap, reserving2GiB for masks, metrics, ZIP and serialization overhead. It prints the
-estimated size/file and maximum file count under this conservative budget.
-It rejects a grid that will not fit BEFORE writing any .pt files.
+All five models in the grid are retained on disk (`alpha_0.pt`, `alpha_0p1.pt`, `alpha_0p25.pt`, `alpha_0p5.pt`, and `alpha_1.pt`). Because each weights-only checkpoint still contains both frozen CLIP encoders, `interpolate.py` checks actual tensor storage and available disk space after `uv sync` against the lower of physical free space and a `14 GiB` budget cap (~15 GB), reserving `2 GiB` for predicted masks, metrics, the results ZIP, and serialization overhead. It prints the per-file size and maximum supported file count and aborts before writing any `.pt` files if the requested grid exceeds the budget.
 
-With roughly15GB available, the default five-model grid is the starting setup;
-actual fit depends on the measured checkpoint size. To save six coefficients,
-add0.75 to ALPHAS in Cell2 (endpoints are always included). No files are deleted
-or silently dropped. Do not lower the reserve just to fill the disk completely.
-Existing output folders are never overwritten. Input full checkpoints stay in
-/kaggle/input and are not copied into outputs; the exported endpoint files are
-weights-only versions of them.
+To include `0.75` for a six-point grid if disk space permits, add `0.75` to `ALPHAS` in Cell 2 (the `0` and `1` endpoints are always included automatically). Source checkpoints stay mounted under `/kaggle/input` and are not copied into `outputs/`.
 
-## Cell 1 — Setup
+## Cell 1: Setup
 
-Attach VizWiz, full B5 and the low_crop checkpoint from session1. Result ZIPs
-contain no .pt and cannot serve as sources. Enable Internet and a GPU; evaluation
-uses one GPU and does not need torchrun. Export itself runs only on CPU.
+Attach the VizWiz dataset, the full `B5` checkpoint, and the full `low_crop/checkpoint_epoch10.pt` checkpoint from Session 1 of `exp/crop-recall-preservation`. Enable Internet and a single GPU (`interpolate.py` runs on CPU, and `eval.py` uses one GPU without `torchrun`).
 
 ```python
 !git clone --single-branch --branch exp/pyramid-weight-interpolation https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
@@ -51,13 +24,11 @@ uses one GPU and does not need torchrun. Export itself runs only on CPU.
 !uv sync --frozen
 ```
 
-Already cloned on this branch: `!git pull --ff-only`, then `!uv sync --frozen`.
+If already cloned on this branch, run `!git pull --ff-only` followed by `!uv sync --frozen`.
 
-## Cell 2 — Paths and the predeclared alpha grid
+## Cell 2: Paths and the predeclared alpha grid
 
-B5 uses your existing mount. Low_crop is auto-detected under a low_crop folder;
-paste its full path into LOW_CROP_CKPT if the upload uses another name/layout.
-Only load trusted checkpoint files.
+The script auto-detects `low_crop/checkpoint_epoch10.pt` under `/kaggle/input`; if your dataset uses a different folder name, set `LOW_CROP_CKPT` explicitly.
 
 ```python
 import json
@@ -92,14 +63,9 @@ print('Base:', os.environ['B_CKPT'])
 print('Candidate:', os.environ['LOW_CROP_CKPT'])
 ```
 
-The tool validates model config, source B5 file hash, original parent/data/group
-identity, trainable-name layout, frozen policy, tensor shapes/dtypes and exact
-frozen tensor equality. It blends only finite FP32 post-encoder parameters.
-A mismatch is rejected; there is no force flag that changes frozen encoders.
-Loading both source checkpoints briefly needs CPU RAM; only one complete frozen
-weight set plus two small trainable bodies is retained for exporting the grid.
+Before exporting, `interpolate.py` verifies that both checkpoints share the same model configuration, `B5` lineage hash, original 20-epoch parent and mask-group digests, trainable parameter layout, encoder-freezing policy, tensor shapes/dtypes, and bit-identical frozen encoder weights, then blends only the finite FP32 post-encoder parameters.
 
-## Cell 3 — Export ALL weights-only models, then full validation/diagnostics
+## Cell 3: Export all weights-only models, then full validation/diagnostics
 
 ```bash
 %%bash
@@ -125,24 +91,11 @@ for checkpoint in "$RUN_ROOT"/alpha_*.pt; do
 done
 ```
 
-Default files: alpha_0.pt, alpha_0p1.pt, alpha_0p25.pt, alpha_0p5.pt, alpha_1.pt.
-The loop discovers actual exported files, so adding0.75 needs no loop edits.
-No gradients or training epochs. FP32/native-resolution evaluation rules and
-question-only inference stay unchanged. Each evaluation is a new process and
-releases GPU allocations afterward. Set EVAL_BATCH=1 if needed.
+By default, this exports `alpha_0.pt`, `alpha_0p1.pt`, `alpha_0p25.pt`, `alpha_0p5.pt`, and `alpha_1.pt` and evaluates each checkpoint on the validation split in FP32 at native resolution. Set `EVAL_BATCH = '1'` if batch size 4 exceeds GPU memory. Because all `.pt` files are exported before the evaluation loop begins, if an evaluation command is interrupted you can run the remaining `eval.py` / `diagnose.py` commands directly without re-running `interpolate.py`.
 
-Export finishes BEFORE any evaluation. If a later evaluation fails, all exported
-models remain usable with the ordinary eval.py command; do not rerun export into
-that nonempty directory. Run only the pending evaluation/diagnostic commands,
-with a new output directory if partial predictions already exist. No automatic
-cleanup or checkpoint deletion is performed.
+## Cell 4: Compare and select using validation only
 
-## Cell 4 — Compare and select using validation only
-
-This selects highest validation mean IoU; ties favor smaller alpha (closer to
-B5). This is a numerical selection convenience, not a multi-seed conclusion.
-Inspect tiny/medium and large regressions before adopting it as the research
-candidate. The primary choice does not use test, global IoU or GT area gating.
+This script ranks the grid by validation per-image mean IoU (breaking ties in favor of smaller `alpha`, closer to `B5`) and writes `selection.json` and `interpolation_comparison.csv`. Also inspect the small, medium, and large group breakdowns before choosing a model.
 
 ```python
 import csv
@@ -193,18 +146,14 @@ print((root / 'interpolation_comparison.csv').read_text())
 print('Validation-selected model:', selection['best_checkpoint'])
 ```
 
-The endpoint scores should reproduce B5 and low_crop10 under this evaluation
-setup. Supplied seed42 validation references: B5 66.1693%, low_crop10 65.3050%.
-Small/medium/large: B5 19.5605/47.8303/79.4138%; low_crop21.3001/49.1806/77.2213%.
-Tiny GPU/batch/version rounding differences near threshold are possible; a material
-endpoint mismatch requires investigation before interpreting interior coefficients.
+Verify that the `alpha = 0` and `alpha = 1` endpoints match the standalone `B5` and `low_crop10` validation numbers:
 
-## Cell 5 — Test the two endpoints and validation-selected model
+- `B5` (`alpha = 0`): 66.1693% val mean IoU (19.5605% small, 47.8303% medium, 79.4138% large)
+- `low_crop10` (`alpha = 1`): 65.3050% val mean IoU (21.3001% small, 49.1806% medium, 77.2213% large)
 
-At most three test evaluations; if an endpoint wins, only the two endpoints run.
-This saves evaluation time and keeps test out of alpha selection. To evaluate
-ALL retained files on test instead, replace the tag source with all manifest
-checkpoint keys. Keep selection.json unchanged.
+## Cell 5: Test the two endpoints and validation-selected model
+
+To save runtime while keeping test data out of `alpha` selection, this cell evaluates at most three checkpoints on the test split: the two endpoints (`alpha_0` and `alpha_1`) and the validation-selected `best_tag` (two runs total if an endpoint wins).
 
 ```bash
 %%bash
@@ -233,11 +182,9 @@ with (root / 'interpolation_comparison.csv').open('w', newline='') as handle:
 print((root / 'interpolation_comparison.csv').read_text())
 ```
 
-Missing test entries mean not evaluated, not zero accuracy. Do not change the
-chosen alpha using these test scores. A validation improvement from several
-coefficients is exploratory and needs additional seeds before a strong claim.
+Untested interior `alpha` rows leave `test_miou_pct` empty (`None`). Keep `selection.json` fixed to the validation choice.
 
-## Cell 6 — ZIP results, keep every weights file separately
+## Cell 6: ZIP results, keep every weights file separately
 
 ```python
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -254,28 +201,8 @@ for path in sorted(root.glob('alpha_*.pt')):
     print(path, f'{path.stat().st_size / 1024**3:.2f} GiB')
 ```
 
-The ZIP includes all validation masks, diagnostics, tested masks, source
-provenance, disk plan, selection and comparison. It excludes .pt/.tmp/nested.zip.
-Every model remains in outputs for Kaggle output retention/download; the script
-never removes losing models. Do not zip the weights too and duplicate their disk
-usage. No best-model duplicate is saved: selection.json points to its alpha file.
+The ZIP archive bundles all validation masks, diagnostics, evaluated test masks, `interpolation.json`, `selection.json`, and `interpolation_comparison.csv`, while excluding `.pt`, `.tmp`, and nested `.zip` files. All `alpha_*.pt` checkpoints remain in `outputs/` for direct download.
 
-## Compatibility and limits
+## Compatibility
 
-Every alpha file works with existing eval.py and GroundingModel.from_checkpoint.
-They contain model_state_dict and architecture/provenance metadata, with NO
-optimizer_state_dict, scaler_state_dict, training_controls, support_state or
-training epoch. They cannot resume the prior Adam trajectory. A new fine-tuning
-experiment would need its own initialization/optimizer protocol.
-
-Frozen encoders/buffers are compared tensor-by-tensor before exporting; only the
-recorded compatible FP32 body parameters are interpolated. Alpha0/1 copy exact
-endpoint tensors instead of relying on floating-point arithmetic. Inputs remain
-unchanged. Artifacts are atomically written with disk-space checks, and existing
-outputs are rejected rather than overwritten. There is no multi-model inference
-ensemble: each file is used as one normal pyramid model.
-
-This branch does not change training recipes, architecture or losses. Only the
-evaluation metadata adds weight_interpolation provenance. CPU arithmetic,
-checkpoint and tiny end-to-end checks do not establish Kaggle runtime/VRAM fit
-or segmentation improvements. No actual GPU training is required by this plan.
+Every exported `alpha_*.pt` checkpoint loads directly via `eval.py` and `GroundingModel.from_checkpoint`. Because these are weights-only inference checkpoints (containing `model_state_dict` and provenance metadata without `optimizer_state_dict`, `scaler_state_dict`, `training_controls`, or `support_state`), they cannot be passed to `--resume-checkpoint` to continue a prior Adam trajectory. Endpoints (`alpha = 0` and `alpha = 1`) copy the exact source tensors without floating-point rounding.
