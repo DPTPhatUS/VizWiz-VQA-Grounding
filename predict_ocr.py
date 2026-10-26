@@ -9,8 +9,10 @@ from PIL import Image, ImageOps
 from torch.nn import functional as F
 
 from dataset import collate_samples
+from models.ocr_routing_model import EXPERIMENT as ROUTING_EXPERIMENT
 from ocr_cache import CACHE_VERSION, pixel_hash, read_json
 from ocr_data import inference_sample
+from ocr_routing_data import routing_inputs
 from training.ocr_checkpoint import load_ocr_model
 from utils import to_device
 
@@ -59,6 +61,10 @@ def main(argv=None):
         model.detail_size,
         saved["run_config"]["max_candidates"],
     )
+    if model.experiment_config["experiment"] == ROUTING_EXPERIMENT:
+        sample.update(
+            routing_inputs(image, record, saved["run_config"]["max_candidates"])
+        )
     model.to(args.device).eval()
     with torch.inference_mode():
         output = model(to_device(collate_samples([sample]), args.device))["logits"]

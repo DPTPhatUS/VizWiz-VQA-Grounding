@@ -17,9 +17,16 @@ from checkpointing import io_process_group, run_primary_io
 from dataset import make_loader
 from ocr_cache import atomic_json, file_hash
 from ocr_data import OCRGroundingDataset
+from ocr_routing_data import (
+    ROUTE_COVERAGE,
+    TARGET_VERSION,
+    TOKEN_PURITY,
+    OCRRoutingDataset,
+)
 from train import seed_everything
-from training.ocr_checkpoint import VERSION, load_ocr_model
+from training.ocr_checkpoint import checkpoint_version, load_ocr_model
 from training.ocr_objective import OCREvidenceObjective
+from training.ocr_routing_objective import RoutingObjective
 from utils import save_checkpoint, to_device
 
 
@@ -34,6 +41,13 @@ def parser():
         "--config",
         help="Flat JSON overrides CLI; architecture and training options only",
     )
+    p.add_argument(
+        "--architecture",
+        choices=("proposal", "pyramid", "residual"),
+        default="proposal",
+    )
+    p.add_argument("--route-weight", type=float, default=0.2)
+    p.add_argument("--evidence-weight", type=float, default=0.5)
     p.add_argument("--evidence-mode", choices=("full", "geometry"), default="full")
     p.add_argument("--num-epochs", type=int, default=20)
     p.add_argument(
@@ -102,6 +116,8 @@ def arguments(argv=None):
         "text_dropout",
         "selection_weight",
         "local_weight",
+        "route_weight",
+        "evidence_weight",
     ):
         value = getattr(args, key)
         if not math.isfinite(value) or value < 0 or (key == "lr" and value == 0):
@@ -143,11 +159,21 @@ def train(args, rank, world, device, group):
     model, saved, digest = load_ocr_model(
         args.parent_checkpoint,
         args.resume_checkpoint,
+        architecture=args.architecture,
         evidence_mode=args.evidence_mode,
         ocr_dropout=args.ocr_dropout,
         text_dropout=args.text_dropout,
     )
-    data = OCRGroundingDataset(
+    if saved and args.architecture != model.experiment_config.get(
+        "architecture", "residual"
+    ):
+        raise ValueError(
+            "Resume architecture differs; explicitly select the saved architecture"
+        )
+    dataset_class = (
+        OCRGroundingDataset if args.architecture == "residual" else OCRRoutingDataset
+    )
+    data = dataset_class(
         args.data_root,
         "train",
         args.cache_root,
@@ -164,11 +190,23 @@ def train(args, rank, world, device, group):
         parent_sha256=digest,
         schedule="constant",
         parent_frozen=True,
+        target_protocol={
+            "version": TARGET_VERSION,
+            "token_purity": TOKEN_PURITY,
+            "route_coverage": ROUTE_COVERAGE,
+        }
+        if args.architecture != "residual"
+        else None,
     )
     config["source_sha256"] = {
         name: file_hash(Path(__file__).parent / name)
         for name in (
             "train_ocr.py",
+            "train.py",
+            "utils.py",
+            "models/text_encoder.py",
+            "models/detail_pyramid.py",
+            "models/mask_decoder.py",
             "ocr_data.py",
             "ocr_cache.py",
             "models/ocr_evidence.py",
@@ -180,11 +218,20 @@ def train(args, rank, world, device, group):
             "models/ocr_model.py",
             "models/model.py",
             "training/ocr_objective.py",
+            "models/ocr_routing.py",
+            "models/evidence_ops.py",
+            "models/ocr_routing_model.py",
+            "ocr_routing_data.py",
+            "training/ocr_routing_objective.py",
         )
     }
     out = Path(args.output_dir)
     if saved:
         required = (
+            "architecture",
+            "route_weight",
+            "evidence_weight",
+            "target_protocol",
             "evidence_mode",
             "ocr_dropout",
             "text_dropout",
@@ -202,6 +249,21 @@ def train(args, rank, world, device, group):
             "local_weight",
             "amp",
         )
+        if (
+            args.architecture == "residual"
+            and "architecture" not in saved["run_config"]
+        ):
+            required = tuple(
+                key
+                for key in required
+                if key
+                not in {
+                    "architecture",
+                    "route_weight",
+                    "evidence_weight",
+                    "target_protocol",
+                }
+            )
         if any(saved["run_config"][key] != config[key] for key in required):
             raise ValueError(
                 "Resume protocol differs; keep training settings and cache unchanged"
@@ -256,7 +318,16 @@ def train(args, rank, world, device, group):
     loader = make_loader(
         data, args, args.batch_size // world, sampler, sampler is None, generator
     )
-    objective = OCREvidenceObjective(args.selection_weight, args.local_weight)
+    objective = (
+        OCREvidenceObjective(args.selection_weight, args.local_weight)
+        if args.architecture == "residual"
+        else RoutingObjective(
+            args.selection_weight,
+            args.local_weight,
+            args.route_weight,
+            args.evidence_weight,
+        )
+    )
     for epoch in range(start, args.num_epochs):
         seed_everything(args.seed + epoch * world + rank)
         generator.manual_seed(args.seed + epoch * world + rank)
@@ -264,7 +335,7 @@ def train(args, rank, world, device, group):
             sampler.set_epoch(epoch)
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        totals = torch.zeros(7, device=device, dtype=torch.float64)
+        totals = None
         skipped = 0
         local_batch = args.batch_size // world
         local_samples = len(sampler) if sampler else len(data)
@@ -303,6 +374,8 @@ def train(args, rank, world, device, group):
                 skipped += int(scaler.get_scale() < scale)
                 optimizer.zero_grad(set_to_none=True)
             values = [loss.detach(), *parts.values()]
+            if totals is None:
+                totals = torch.zeros(2 + len(parts), device=device, dtype=torch.float64)
             totals[0] += n
             totals[1:] += torch.stack(values).to(torch.float64) * n
         if world > 1:
@@ -323,7 +396,7 @@ def train(args, rank, world, device, group):
                 # Complete adapter resume state, excluding the fixed 1.73GB parent.
                 save_checkpoint(
                     {
-                        "version": VERSION,
+                        "version": checkpoint_version(raw_model),
                         "epoch": epoch + 1,
                         "parent_sha256": digest,
                         "adapter_state_dict": raw_model.adapter.state_dict(),

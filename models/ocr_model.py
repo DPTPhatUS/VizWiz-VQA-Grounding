@@ -23,8 +23,8 @@ class OCRGroundingModel(nn.Module):
             raise ValueError("Dropout probabilities must be in [0,1)")
         self.parent = parent.requires_grad_(False).eval()
         tiny = parent.experiment_config["tiny"]
-        self.adapter = OCREvidenceAdapter(
-            parent.text_encoder.output_dim, 8 if tiny else 16, width=32 if tiny else 128
+        self.adapter = self._make_adapter(
+            parent.text_encoder.output_dim, 8 if tiny else 16, 32 if tiny else 128
         )
         self.evidence_mode, self.ocr_dropout, self.text_dropout = (
             evidence_mode,
@@ -45,6 +45,17 @@ class OCRGroundingModel(nn.Module):
         }
         self.inference_view = "full"
 
+    def _make_adapter(self, text_dim, detail_dim, width):
+        return OCREvidenceAdapter(text_dim, detail_dim, width)
+
+    def _decode_parent(self, batch, features, question):
+        return self.parent.decode_features(
+            batch, features, question, return_detail=True
+        )
+
+    def _adapter_features(self, base, batch):
+        return {"detail": base["detail_features"]}
+
     def train(self, mode=True):
         super().train(mode)
         self.parent.eval()
@@ -53,9 +64,7 @@ class OCRGroundingModel(nn.Module):
     def forward(self, batch):
         with torch.no_grad(), torch.autocast(batch["image"].device.type, enabled=False):
             features, question = self.parent.encode_inputs(batch)
-            base = self.parent.decode_features(
-                batch, features, question, return_detail=True
-            )
+            base = self._decode_parent(batch, features, question)
         if not self.training and self.inference_view == "base":
             return {"logits": base["logits"]}
         valid = batch["ocr_valid"].clone()
@@ -84,7 +93,7 @@ class OCRGroundingModel(nn.Module):
             recognized[ids] = pooled.to(recognized.dtype)
         # Adapter parameters remain in the graph even when a rank has no OCR.
         return self.adapter(
-            detail=base["detail_features"],
+            **self._adapter_features(base, batch),
             base_logits=base["logits"],
             question_tokens=question.tokens,
             question_mask=question.attention_mask,

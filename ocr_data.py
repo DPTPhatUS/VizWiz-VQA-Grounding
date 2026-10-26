@@ -121,6 +121,12 @@ class OCRGroundingDataset(VizWizGroundingDataset):
         self.text_override = dict(zip(locations, shuffled))
         return sum(a != b for a, b in zip(texts, shuffled))
 
+    def _native_inputs(self, image, record):
+        return native_candidates(image, record, self.max_candidates)
+
+    def _training_targets(self, mask, inputs):
+        return evidence_targets(mask, inputs["ocr_boxes"], inputs["ocr_valid"])
+
     def __getitem__(self, index):
         result = super().__getitem__(index)
         name = self.names[index]
@@ -131,7 +137,7 @@ class OCRGroundingDataset(VizWizGroundingDataset):
             raise ValueError(f"OCR filename mismatch: {name}")
         with Image.open(self.root / self.split / name) as source:
             image = ImageOps.exif_transpose(source).convert("RGB")
-        inputs = native_candidates(image, record, self.max_candidates)
+        inputs = self._native_inputs(image, record)
         for i, text in enumerate(inputs["ocr_texts"]):
             inputs["ocr_texts"][i] = getattr(self, "text_override", {}).get(
                 (name, i), text
@@ -145,7 +151,5 @@ class OCRGroundingDataset(VizWizGroundingDataset):
                 / Path(name).with_suffix(".png")
             ) as source:
                 mask = source.convert("L")
-            result.update(
-                evidence_targets(mask, inputs["ocr_boxes"], inputs["ocr_valid"])
-            )
+            result.update(self._training_targets(mask, inputs))
         return result

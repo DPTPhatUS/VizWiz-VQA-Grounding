@@ -10,8 +10,10 @@ from PIL import Image
 
 from dataset import make_loader
 from metrics import global_iou_summary, metric_samples
+from models.ocr_routing_model import EXPERIMENT as ROUTING_EXPERIMENT
 from ocr_cache import atomic_json
 from ocr_data import OCRGroundingDataset
+from ocr_routing_data import OCRRoutingDataset
 from training.ocr_checkpoint import load_ocr_model
 from utils import to_device
 
@@ -25,7 +27,7 @@ def main(argv=None):
     p.add_argument("--dataset", choices=("val", "test"), default="val")
     p.add_argument(
         "--view",
-        choices=("full", "base", "missing", "geometry", "shuffled_text"),
+        choices=("full", "base", "missing", "geometry", "shuffled_text", "evidence"),
         default="full",
     )
     p.add_argument("--output-dir", required=True)
@@ -39,7 +41,11 @@ def main(argv=None):
     config = saved["run_config"]
     model.inference_view = args.view
     model.to(args.device).eval()
-    data = OCRGroundingDataset(
+    routing = model.experiment_config["experiment"] == ROUTING_EXPERIMENT
+    if args.view == "evidence" and not routing:
+        raise ValueError("Independent evidence view requires a routing checkpoint")
+    dataset_class = OCRRoutingDataset if routing else OCRGroundingDataset
+    data = dataset_class(
         args.data_root,
         args.dataset,
         args.cache_root,
@@ -63,6 +69,7 @@ def main(argv=None):
     out.mkdir(parents=True, exist_ok=True)
     scores, totals, base_scores, base_totals, groups, evidence = {}, {}, {}, {}, {}, {}
     elapsed, measured_images = 0.0, 0
+    evidence_scores = {}
     with torch.inference_mode():
         for step, batch in enumerate(loader):
             batch = to_device(batch, args.device)
@@ -84,6 +91,9 @@ def main(argv=None):
                 Image.fromarray(prediction.cpu().numpy().astype("uint8") * 255).save(
                     out / Path(name).with_suffix(".png")
                 )
+            if "evidence_logits" in output:
+                for name, score, _ in metric_samples(output["evidence_logits"], batch):
+                    evidence_scores[name] = score
             baseline = output.get("base_logits", output["logits"])
             for i, (name, score, _) in enumerate(
                 metric_samples(baseline, batch, pixel_totals=base_totals)
@@ -106,6 +116,15 @@ def main(argv=None):
                     if "null_probability" in output
                     else None,
                 }
+                if "route_probability" in output:
+                    evidence[name].update(
+                        route_probability=output["route_probability"][i].item(),
+                        inclusion_probabilities=output["inclusion_probability"][i]
+                        .cpu()
+                        .tolist(),
+                        boxes=batch["ocr_boxes"][i].cpu().tolist(),
+                        candidate_valid=output["candidate_valid"][i].cpu().tolist(),
+                    )
     summary = dict(
         num_samples=len(scores),
         mean_iou=sum(scores.values()) / len(scores),
@@ -140,12 +159,27 @@ def main(argv=None):
         }
         for group, names in groups.items()
     }
+    if evidence_scores:
+        summary["evidence_mean_iou"] = sum(evidence_scores.values()) / len(
+            evidence_scores
+        )
+        summary["route_oracle_mean_iou"] = sum(
+            max(base_scores[k], evidence_scores[k]) for k in scores
+        ) / len(scores)
+        summary["route_oracle_warning"] = (
+            "GT chooses between evidence/base: diagnostic only"
+        )
+        for group, names in groups.items():
+            summary["groups"][group]["evidence_mean_iou"] = sum(
+                evidence_scores[k] for k in names
+            ) / len(names)
     atomic_json(
         {
             "summary": summary,
             "per_sample": scores,
             "base_per_sample": base_scores,
             "evidence": evidence,
+            "evidence_per_sample": evidence_scores,
         },
         out / "metrics.json",
     )
