@@ -1,12 +1,6 @@
 # Question-guided high-resolution detail pyramid
 
-Branch: `exp/question-guided-detail-pyramid`, created from
-`exp/spatial-detail-decoder` at `63977d2`. This is a new experiment requiring
-fresh training from pretrained CLIP, not a checkpoint-compatible refactor.
-
-The hypothesis is that high-resolution local features, question-conditioned
-fusion, and signed mask refinement can improve small-region precision. The
-implementation and synthetic checks do not establish an accuracy improvement.
+Branch: `exp/question-guided-detail-pyramid`, created from `exp/spatial-detail-decoder` at `63977d2`. This experiment introduces a 768-pixel convolutional detail pyramid, question-conditioned multi-scale fusion, and a signed residual mask refiner, trained fresh from pretrained CLIP weights.
 
 ## Architecture
 
@@ -31,50 +25,27 @@ Original upright RGB image
                         logits768 = resize(logits384) + signed correction
 ```
 
-* Both RGB views come directly from the same original image, in `[0,1]`. The
-  model applies CLIP mean/std to both. No crop/flip/color augmentation is added.
-  Aspect ratios are warped to squares, as in the parent CLIP experiments.
-* CLIP is `openai/clip-vit-large-patch14-336`. Text is frozen and kept in eval
-  mode. Vision is trainable except pooled-CLS `post_layernorm`, which patch
-  grounding does not use. Its checkpoint keys are retained.
-* Vision skips are hidden states 4/7/9. They and the final bottleneck have shape
-  `(B,1024,24,24)`. Each skip has its own nonlinear compression and FiLM head;
-  Q reduction is shared. FiLM heads start at zero (identity modulation).
-* Decoder channels are `128 -> 64 -> 32 -> 16 -> 16`. Every upsampling block is
-  bilinear resize followed by **one standard 3x3 convolution**, GroupNorm and
-  GELU. CLIP skip-fusion and detail-fusion blocks remain depthwise separable.
-* CNN encoder channels at `768/384/192/96/48` are `8/16/32/64/128`. Each level
-  has two standard 3x3/GN/GELU blocks. Max pooling downsamples. Top-down pyramid
-  levels use 1x1 lateral projection, addition and 3x3/GN/GELU smoothing.
-* Each spatial guide is a nonlinear function of semantic features, 16-channel
-  detail features and 16-channel projected Q. Fusion adds a residual whose
-  scalar starts at zero. The refiner reads 41 concatenated channels, reduces
-  to 16 with a standard 3x3 block, then predicts a one-channel correction.
-  The final correction head starts at zero, so initial logits768 exactly match
-  bilinear-resized logits384. Refinement is not restricted to a thresholded mask.
-* Mask heads at 96/192 are training-only; the 384 mask feeds the refiner. Only
-  final 768 logits are exported for evaluation. There is no latent answer,
-  teacher, oracle view, answer reader, or GT answer input on this branch.
+* Both RGB views are generated directly from the original `[0, 1]` image and normalized with CLIP mean and std. Aspect ratios are resized to squares without crop, flip, or color augmentation, matching the parent CLIP setup.
+* CLIP is `openai/clip-vit-large-patch14-336`. The text encoder is frozen and kept in `eval` mode. The vision encoder is trainable except for the unused pooled-CLS `post_layernorm` (whose state-dict keys are retained for checkpoint compatibility).
+* Vision skip connections tap hidden states 4, 7, and 9, which share shape `(B, 1024, 24, 24)` with the final bottleneck. Each skip has its own nonlinear channel compression and zero-initialized FiLM head (identity modulation at step 0), sharing a common question projection.
+* Decoder channels progress through `128 -> 64 -> 32 -> 16 -> 16`. Each upsampling block uses bilinear resize followed by **one standard 3x3 convolution**, GroupNorm, and GELU. CLIP skip-fusion and detail-fusion blocks use depthwise-separable convolutions.
+* The high-resolution CNN encoder runs at `768 / 384 / 192 / 96 / 48` with channel widths `8 / 16 / 32 / 64 / 128`. Each stage consists of two standard 3x3 Conv/GN/GELU blocks followed by max-pooling downsampling. Top-down pyramid levels combine a 1x1 lateral projection with bilinear upsampling and a 3x3 Conv/GN/GELU smoothing block into 16 channels.
+* At each fusion stage, a nonlinear spatial guide combines decoder semantic features, 16-channel detail features, and 16-channel projected question features. Fusion adds a gated residual with a zero-initialized scalar weight. At 768 resolution, the residual refiner concatenates 41 channels (decoder features, upsampled 384-scale logits, 768-scale detail features, and projected question features), reduces them to 16 channels through a 3x3 block, and predicts a 1-channel signed logit correction over the full grid. Because the final correction head is zero-initialized, initial `logits768` match bilinearly upsampled `logits384`.
+* Auxiliary mask heads at 96 and 192 are used only during training, while the 384 head feeds the 768 refiner. Evaluation exports only the final 768 logits. Both training and inference use only the image and question.
 
-The implemented non-backbone parameter count is **6,649,101**, including text
-projection and cross-attention. This differs from the earlier 6.09M sketch
-because skip conditioning, Q-guided detail fusion and auxiliary heads changed.
+The non-backbone parameter count is **6,649,101**, including text projection and cross-attention.
 
 ## Objective
 
-The default is `BCE + 0.5 * soft Dice` for each head:
+Each mask head is supervised with `BCE + 0.5 * soft Dice`:
 
 ```text
 L = L768 + 0.3 * L384 + 0.2 * L192 + 0.1 * L96
 ```
 
-Main targets are nearest-neighbor binary masks at 768. Auxiliary targets use
-area interpolation from this target to preserve fractional coverage of tiny
-regions. This cannot recover an object already lost during the native-to-768
-mask conversion. Loss calculations accumulate in float32 under CUDA FP16 AMP.
-Weights above are initial experimental settings, not tuned coefficients.
+The main 768 target uses nearest-neighbor resized binary masks. Auxiliary targets at 96, 192, and 384 use area interpolation from the 768 target to preserve fractional coverage on small regions. Loss computations accumulate in float32 under CUDA FP16 AMP.
 
-Optional `--config` JSON (all defaults shown):
+Optional `--config` JSON (showing default values):
 
 ```json
 {
@@ -87,15 +58,11 @@ Optional `--config` JSON (all defaults shown):
 }
 ```
 
-`fp_weight` is used only by `overlap_loss="tversky"`: its denominator is
-`TP + fp_weight*FP + (1-fp_weight)*FN + 1`, with numerator `TP + 1`.
-This is an optional separate ablation, not enabled in the default Dice run.
-Zero auxiliary weights retain zero-valued graph dependencies for DDP.
+`fp_weight` applies only when `overlap_loss="tversky"`, which uses numerator `TP + 1` and denominator `TP + fp_weight * FP + (1 - fp_weight) * FN + 1`. Setting an auxiliary weight to `0` keeps a zero-multiplied term in the computation graph for DDP reducer consistency.
 
 ## Kaggle setup and 20-epoch run
 
-Enable Internet and two T4 GPUs. Clone the branch, change into the repository,
-and install the locked environment before launching multiple processes:
+Enable Internet and two T4 GPUs. Clone the branch and sync the locked dependencies before launching `torchrun`:
 
 ```bash
 git clone --single-branch --branch exp/question-guided-detail-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
@@ -103,7 +70,7 @@ cd VizWiz-VQA-Grounding
 uv sync --frozen
 ```
 
-With `DATA_ROOT` pointing at the VizWiz folder, run the short real-backbone check:
+With `DATA_ROOT` pointing to the VizWiz dataset directory, run the multi-GPU preflight check:
 
 ```bash
 uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
@@ -111,13 +78,9 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
   --gradient-checkpointing
 ```
 
-This checks real input shapes, several backward iterations, frozen/trainable
-gradients, AMP and DDP; it writes no checkpoints or training history. CPU checks
-cannot replace this GPU check. It does not establish accuracy or full-session runtime.
-Initial FP16 gradient overflow is handled by GradScaler backoff and a retry of
-the same batch (at most eight scale reductions per batch). Backoff events are
-printed and do not count as successful updates. Missing gradients, nonfinite
-forward loss, FP32 nonfinite gradients or persistent overflow still fail.
+Preflight verifies input shapes, forward/backward passes, frozen and trainable parameter gradients, AMP, and DDP synchronization without writing checkpoints or history files. If an initial FP16 step overflows, `GradScaler` backs off and retries the same batch (up to 8 scale reductions per batch); backoff events are logged and excluded from completed step counts, while missing gradients, nonfinite forward losses, or persistent overflow raise an error.
+
+Run the 20-epoch training job:
 
 ```bash
 uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
@@ -133,28 +96,15 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
   --save-every 10
 ```
 
-Batch size is **global microbatch**: one image/GPU here. Accumulation gives
-effective global batch 4, including correct sample weighting in the final
-partial window. If memory permits, `--batch-size 4` with accumulation 1 also
-gives effective batch 4. Memory/runtime have not been measured on Kaggle T4.
+`--batch-size 2` is the **global microbatch** (1 image per GPU across 2 GPUs), and `--gradient-accumulation-steps 2` yields an effective global batch size of 4 with exact sample weighting on the final partial accumulation window. If GPU memory allows, `--batch-size 4 --gradient-accumulation-steps 1` produces the same effective batch size of 4.
 
-Adam, no weight decay or LR scheduler, clipping at global norm 1, CUDA FP16
-GradScaler, deterministic epoch-keyed seeding and sampler shuffling follow the
-simple existing trainer. Activation checkpointing uses nonreentrant recomputation;
-it changes memory/time, not the intended forward computation. Validation is
-disabled by default; enable it independently with --validate-every. Output collisions fail rather than overwrite another run.
+Default training uses Adam (`lr=1e-5`, zero weight decay, no LR scheduler), gradient clipping at global norm 1.0, CUDA FP16 `GradScaler`, deterministic epoch-keyed seeding, and nonreentrant activation checkpointing. Periodic validation is disabled by default and can be enabled with `--validate-every`. Existing output files in `--output-dir` cause an immediate error to prevent accidental overwrites.
 
-Full checkpoints are `outputs/checkpoint_epoch10.pt` and `checkpoint_epoch20.pt`.
-Raw final weights are also saved. Full checkpoints include optimizer/scaler,
-resolved config, architecture, source hashes and environment version. Resume
-with `--resume-checkpoint` from this experiment only; `--num-epochs` is the
-total target epoch. Batch/accumulation/LR/seed/world size must match.
+Full resumable checkpoints are written to `outputs/checkpoint_epoch10.pt` and `outputs/checkpoint_epoch20.pt` alongside final raw model weights. Full checkpoints store the model, optimizer, AMP scaler, resolved configuration, architecture metadata, source file hashes, and environment details. Use `--resume-checkpoint` to resume a run from this branch with matching batch size, accumulation steps, learning rate, seed, and GPU count, where `--num-epochs` sets the total target epoch count.
 
 ## Evaluate and diagnose
 
-Run each evaluation with one process. Both views are reconstructed from the
-original image, and logits are resized to native GT size **before** thresholding.
-The metric is mean per-image foreground IoU, not foreground/background class mIoU.
+Run evaluation in a single process. Both image views are constructed from the original image, and predicted 768-scale logits are bilinearly resized to native ground-truth resolution **before** thresholding at zero.
 
 ```bash
 uv run --frozen python eval.py \
@@ -167,21 +117,11 @@ uv run --frozen python diagnose.py \
   --output-dir outputs/diagnostic_ep20
 ```
 
-Repeat evaluation for epoch10 and for test if native test GT masks are available.
-Select checkpoints/hyperparameters by validation, never by the test results.
-Diagnostic reads exported masks on CPU, verifies each mask against stored IoU,
-and reports native precision/recall, predicted/GT area ratio and size groups.
-Evaluation/diagnostic output directories must be new or empty.
-
-Personal notebook instructions and local tests remain under ignored `personal/`.
-Older answer-latent probes/checkpoints belong to their original branches.
+Run the same commands for `checkpoint_epoch10.pt` and for the `test` split when test ground-truth masks are available. Select checkpoints and hyperparameters using validation metrics only. `diagnose.py` reads the exported PNG masks on CPU, cross-checks per-image IoU against `metrics.json`, and breaks down native-resolution precision, recall, predicted-to-GT area ratios, and GT size buckets. Output directories for `eval.py` and `diagnose.py` must be new or empty.
 
 ## Encoder freezing and optimization
 
-Omitting the options below preserves this branch's existing training behavior:
-Adam, LR `1e-5`, zero weight decay, no LR schedule, and the branch's original
-encoder freezing policy. Freezing is opt-in; the detail CNN and decoder remain
-trainable. No model/state-dict keys or evaluation preprocessing change.
+Omitting the options below keeps the branch's default training configuration: Adam with LR `1e-5`, zero weight decay, constant LR, and the default encoder freezing policy. Encoder freezing is opt-in, while the detail CNN and decoder always remain trainable. Model state-dict keys and evaluation preprocessing are unchanged.
 
 | Option | Values / default |
 | --- | --- |
@@ -198,15 +138,9 @@ trainable. No model/state-dict keys or evaluation preprocessing change.
 | `--poly-power` | Positive exponent for `poly`; default `0.9` |
 | `--config` | Flat JSON with training options; optional |
 
-`BOOL` accepts `True` or `False`; a freeze flag without a value means `True`.
-The aliases `--no-freeze-backbone`, `--no-freeze-vision-encoder`, and
-`--no-freeze-text-encoder` mean `False`. An explicit component setting overrides
-`freeze_backbone` within the same source. **JSON config > explicit CLI > branch
-defaults**: a config shorthand also overrides component flags on the CLI.
-Existing recipe/loss settings can share the same JSON; unsupported keys fail
-early. Existing branch-specific flags remain available through `train.py --help`.
+`BOOL` accepts `True` or `False`; passing a freeze flag without a value sets it to `True`. The negative aliases `--no-freeze-backbone`, `--no-freeze-vision-encoder`, and `--no-freeze-text-encoder` set the corresponding flag to `False`. Within the same configuration source, a specific encoder flag overrides `freeze_backbone`. Precedence follows **JSON config > explicit CLI > branch defaults**, so a JSON shorthand also overrides component flags passed on the CLI. Recipe and loss settings can share the same JSON file, and unrecognized keys raise an error immediately. Run `train.py --help` to see all branch-specific flags.
 
-Append, for example, to this branch's existing training command:
+Example CLI flags to freeze the backbone and use AdamW with a cosine schedule:
 
 ```bash
 --freeze-backbone True \
@@ -218,14 +152,9 @@ Append, for example, to this branch's existing training command:
 --min-lr-ratio 0.1
 ```
 
-This is a configurable experiment example, not a validated best hyperparameter
-setting. To freeze only vision while retaining the text policy, append
-`--freeze-vision-encoder True`. To explicitly train both encoders, use
-`--freeze-backbone False`. Models with a deliberately fixed reference stage
-(gain-guided refinement) reject encoder unfreezing to preserve that algorithm.
-Unused CLIP/SigLIP pooled-output parameters stay frozen when unfreezing token encoders.
+To freeze only the vision encoder while keeping the default text policy, pass `--freeze-vision-encoder True`. To train both encoders explicitly, pass `--freeze-backbone False`. Branches that rely on a fixed reference stage (such as gain-guided refinement) reject encoder unfreezing. Unused CLIP/SigLIP pooled-output parameters remain frozen when token encoders are unfrozen.
 
-Equivalent JSON (`--config path/to/train.json`):
+Equivalent JSON configuration (`--config path/to/train.json`):
 
 ```json
 {
@@ -239,40 +168,21 @@ Equivalent JSON (`--config path/to/train.json`):
 }
 ```
 
-Frozen encoders stay in eval mode during training and are excluded from the
-optimizer when a freezing option is set. LR schedules advance after successful
-optimizer updates, including gradient accumulation; AMP overflow skips do not
-advance them. Checkpoints save the resolved optimization settings, trainable
-parameter layout and schedule progress. Resume restores these settings and
-rejects conflicting options. For scheduled runs, keep the original total
-`--num-epochs`, loader length and accumulation so the LR trajectory is unchanged.
+Frozen encoders stay in `eval` mode during training and are excluded from the optimizer. Learning-rate schedules step once per completed optimizer update (accounting for gradient accumulation) and do not advance when AMP skips an update due to gradient overflow. Checkpoints record the resolved optimization config, trainable parameter layout, and scheduler state; resuming restores those settings and rejects conflicting overrides. When resuming a scheduled run, keep `--num-epochs`, dataloader length, and gradient accumulation unchanged so the LR schedule trajectory stays consistent.
 
-Old checkpoints still load for evaluation with the same architecture and
-weights. Full legacy resume keeps its original optimizer layout and constant
-LR behavior; changing freezing, optimizer, decay or enabling a new LR schedule
-requires a new run (or an explicit weights-only initialization where supported).
-Resume retains each branch's existing RNG/data-order policy; legacy branches
-that do not save or reconstruct RNG state do not guarantee bitwise replay.
-No freezing/optimization change retroactively changes a previously trained
-checkpoint or its reported results.
+Existing checkpoints remain compatible with evaluation and legacy constant-LR resume. Changing encoder freezing, optimizer type, weight decay, or LR scheduling requires starting a new run (or using weights-only initialization where supported).
 
 ## Foreground global IoU
 
-The existing evaluation command now writes both metrics to `metrics.json`
-under `summary`, using the final native-resolution binary predictions:
+`eval.py` writes both dataset-level IoU metrics to `metrics.json` under `summary`, computed from the final native-resolution binary masks:
 
-- `mean_iou`: arithmetic mean of per-image foreground IoUs; each image has equal weight.
-- `global_iou`: sum of all foreground intersections divided by sum of all foreground unions across the evaluated split. This is not foreground/background class-averaged IoU.
-- `total_intersection` and `total_union`: exact integer pixel counts for auditing.
+- `mean_iou`: arithmetic mean of per-image foreground IoUs (weighting each image equally).
+- `global_iou`: total foreground intersection pixels divided by total foreground union pixels across the evaluated split.
+- `total_intersection` and `total_union`: exact integer pixel counts across the split.
 
-Values are fractions in `[0, 1]`; multiply by 100 for percentages. Logits are
-restored to each original image size before thresholding at zero. Empty-union
-IoU is one. No training, checkpoint, inference or threshold change is required.
+Values are reported as fractions in `[0, 1]` (multiply by 100 for percentages). Logits are resized to each image's original resolution before thresholding at zero, and an empty union evaluates to an IoU of 1.0.
 
-`diagnose.py` also reports global IoU in `overall` and `by_gt_area` in its
-`summary.json`. It computes counts from exported PNG masks and original GT,
-so existing validation predictions can be analyzed on CPU without rerunning
-the model (use a new diagnostic output directory):
+`diagnose.py` also records `global_iou` under `overall` and `by_gt_area` in `summary.json` directly from the exported PNG masks and native ground truth on CPU:
 
 ```bash
 uv run diagnose.py --predictions outputs/eval_val_ep20 \
@@ -281,16 +191,11 @@ uv run diagnose.py --predictions outputs/eval_val_ep20 \
 
 ## Continue the original pyramid: epoch 20 to 40
 
-This is the next baseline run. Use `exp/question-guided-detail-pyramid`, not the
-Lovasz or scale-constrained branches. Continue the ORIGINAL vision-trainable,
-text-frozen pyramid with its natural sampling and BCE+Dice objective. Do not
-freeze vision or introduce a new optimizer/loss during this continuation.
+The workflow below extends the vision-trainable, text-frozen pyramid run on `exp/question-guided-detail-pyramid` from epoch 20 to epoch 40 using the original natural sampling and BCE + Dice objective.
 
-### Cell R1 — Fresh Kaggle session
+### Cell R1: Fresh Kaggle session
 
-Enable Internet and two GPUs. Attach the dataset containing the original full
-`checkpoint_epoch20.pt`. The weights-only `model_final_epoch20.pt` cannot resume
-optimizer/AMP state. Start with a fresh `outputs` directory in this session.
+Enable Internet and two GPUs, and attach the dataset containing the full `checkpoint_epoch20.pt` (the weights-only `model_final_epoch20.pt` does not contain optimizer or GradScaler state). Start with a clean `outputs` directory.
 
 ```python
 !git clone --single-branch --branch exp/question-guided-detail-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
@@ -298,14 +203,11 @@ optimizer/AMP state. Start with a fresh `outputs` directory in this session.
 !uv sync --frozen
 ```
 
-If already cloned on this branch, use `!git pull --ff-only` and `!uv sync --frozen`
-instead of cloning again.
+If the repository is already cloned on this branch, run `!git pull --ff-only` and `!uv sync --frozen`.
 
-### Cell R2 — Read the saved training settings
+### Cell R2: Read the saved training settings
 
-The checkpoint path below is the original pyramid dataset used in the previous
-session. Edit it if your Kaggle mount differs. This cell reads metadata on CPU;
-it does not initialize CLIP or change the checkpoint.
+Update `RESUME_CKPT` if your Kaggle input mount path differs. This cell inspects the checkpoint metadata on CPU and writes `continuation.json`.
 
 ```python
 import gc
@@ -369,14 +271,9 @@ del saved, run, controls, optimization
 gc.collect()
 ```
 
-No new loss JSON is needed: resume restores the saved objective. Encoder policy,
-optimizer controls and gradient-checkpointing settings are restored from the
-checkpoint where present; legacy full checkpoints retain the historical recipe.
-Do not append freeze flags or reuse a scale/Lovasz config. If this is a different
-scheduled run, the trainer rejects extending its fixed update budget; this guide
-does not reset or silently stretch that schedule.
+Resuming restores the saved loss configuration, encoder freezing policy, optimizer state, and gradient-checkpointing setting directly from `checkpoint_epoch20.pt`.
 
-### Cell R3 — Train epochs 21–40
+### Cell R3: Train epochs 21 to 40
 
 ```bash
 %%bash
@@ -397,21 +294,9 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
     --no-save-final-weights
 ```
 
-`40` is the TOTAL target, so this runs 20 additional epochs. It restores model,
-optimizer and AMP scaler, plus training-control progress when available. The
-original run has constant LR, so no LR schedule is restarted. Epoch-keyed RNG and
-sampler ordering continue from the saved epoch. Validation runs every 5 epochs
-inside train, in FP32, and exports masks/metrics at 25/30/35/40. Each GPU uses
-validation batch 1 while the optimizer remains resident. No padded/repeated
-validation samples are counted. Full checkpoints are saved ONLY at epochs 30/40
-directly under `outputs`; no duplicate final weights file is written.
-Epochs 25/35 have predictions/metrics but no weights to resume or deploy. Choose
-a deployable checkpoint from the saved epochs, or rerun to recover another epoch.
-The new history contains epochs 21–40; keep the original 1–20 history separately.
-A 40-epoch target fits the same count of training epochs as the original session,
-but training plus evaluation runtime still depends on the Kaggle hardware.
+Setting `--num-epochs 40` runs 20 additional epochs (epochs 21 through 40), restoring the model, optimizer, AMP scaler, and epoch-keyed RNG/sampler ordering from epoch 20. Validation runs every 5 epochs in FP32 with batch size 1 per GPU and exports masks and metrics at epochs 25, 30, 35, and 40 without padding or duplicating samples across ranks. Full checkpoints are saved at epochs 30 and 40 under `outputs/`, while `--no-save-final-weights` skips writing a duplicate raw-weights file at the end. Keep the new `history.jsonl` (epochs 21 to 40) alongside the original epochs 1 to 20 history.
 
-### Cell R4 — Validation and size-group diagnostics
+### Cell R4: Validation and size-group diagnostics
 
 ```bash
 %%bash
@@ -424,12 +309,9 @@ for epoch in 25 30 35 40; do
 done
 ```
 
-Validation masks already exist after Cell R3, including epochs without a saved
-checkpoint. Cell R4 runs CPU diagnostics only; do not rerun eval.py into these
-nonempty folders. Compare mean IoU, global IoU and the three GT-size groups
-against the original epoch-20 results. Select checkpoints using validation.
+Because Cell R3 already exported validation predictions for epochs 25, 30, 35, and 40, Cell R4 runs CPU diagnostics directly on those folders. Compare `mean_iou`, `global_iou`, and the three GT-size buckets against epoch 20 to select a checkpoint on validation.
 
-### Cell R5 — Test exports at epochs 30 and 40
+### Cell R5: Test exports at epochs 30 and 40
 
 ```bash
 %%bash
@@ -443,12 +325,9 @@ for epoch in 30 40; do
 done
 ```
 
-Standalone test evaluation uses batch 4; reduce it to 1 if needed.
-Local test scoring requires annotations and GT masks. Skip this cell if they are
-unavailable; do not use test scores to select a checkpoint. If the session ends
-after training, keep the full checkpoints and evaluate in a separate session.
+Standalone test evaluation uses batch size 4 (or 1 if memory is constrained). Local test scoring requires test annotations and ground-truth masks; skip this step if test masks are unavailable.
 
-### Cell R6 — Download results without checkpoint files
+### Cell R6: Download results without checkpoint files
 
 ```python
 from zipfile import ZipFile, ZIP_DEFLATED
@@ -463,18 +342,11 @@ print('Download results:', archive)
 print('Keep full .pt checkpoints separately for later resume.')
 ```
 
-If interrupted before epoch 40, resume the latest full checkpoint on this branch
-with the SAME total target `--num-epochs 40`, batch, accumulation, LR, seed and GPU
-count. Read that checkpoint's settings as above, adjusting the expected start
-epoch in Cell R2. Use fresh outputs or a history ending at exactly that epoch.
+If the session stops before epoch 40, resume from the latest saved full checkpoint (`checkpoint_epoch30.pt`) with `--num-epochs 40` and the same batch size, accumulation steps, learning rate, seed, and GPU count.
 
 ### Optional validation and storage controls
 
-`--validate-every N` exports native-resolution validation masks and metrics every
-N completed epochs (`0`, the default, disables it). `--val-batch-size` is per GPU
-and defaults to 1 because training optimizer state remains in VRAM.
-`--save-every` independently controls full resumable checkpoints.
-`--no-save-final-weights` suppresses the extra final raw-weights file; it does not
-suppress scheduled full checkpoints. Defaults preserve the prior training path.
-Validation uses unpadded rank shards, restores module modes/RNG, and does not
-perform optimizer updates or best-checkpoint selection.
+- `--validate-every N`: Exports native-resolution validation masks and metrics every `N` completed epochs (`0` disables in-training validation, the default).
+- `--val-batch-size`: Per-GPU validation batch size during training (defaults to `1` since optimizer state stays in VRAM).
+- `--save-every`: Interval for saving full resumable checkpoints.
+- `--no-save-final-weights`: Skips writing the extra raw-weights file `model_final_epoch<N>.pt` while keeping scheduled full checkpoints.
