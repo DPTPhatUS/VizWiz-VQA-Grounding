@@ -57,6 +57,7 @@ def eval_main(argv=None):
         "grounding_mode": "question",
         "training_config": config.get("training_config"),
         "objective_version": config.get("objective_version"),
+        "weight_interpolation": config.get("weight_interpolation"),
         "optimization_config": config.get("optimization_config"),
         "effective_batch_size": config.get("effective_batch_size"),
         "seed": config.get("seed"),
