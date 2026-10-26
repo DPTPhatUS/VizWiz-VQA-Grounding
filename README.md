@@ -1,13 +1,8 @@
 # YOLO detector preprocessing experiment (`exp/yolo-detector`)
 
-This branch trains a single-class YOLO detector, draws its predicted boxes onto
-the dataset images, then trains the original grounding baseline on those images.
-The grounding model architecture and checkpoint keys are unchanged. YOLO runs
-offline; it is not part of the grounding model's forward pass.
+This branch trains a single-class YOLO detector, draws its predicted boxes onto the dataset images, and then trains the original grounding baseline on those boxed images. The grounding model architecture and checkpoint keys are unchanged. YOLO runs offline as a preprocessing step before grounding training and evaluation.
 
-Install the dependencies in `pyproject.toml` with `uv sync`. This branch includes
-Ultralytics. Run the following commands from the repository root, with the source
-dataset at `data/vizwiz` (images, grounding JSON files, and binary masks):
+Install the dependencies in `pyproject.toml` with `uv sync` (which includes Ultralytics). Run the following commands from the repository root, with the source dataset at `data/vizwiz` (images, grounding JSON files, and binary masks):
 
 ```bash
 # 1. Train detector on train annotations, using val annotations for validation.
@@ -30,18 +25,9 @@ uv run eval.py --data-root data/vizwiz_yolo_box --dataset val \
   --output-dir results/grounding_yolo_val
 ```
 
-Use `--splits train,val` if test images/JSON are unavailable. Evaluating with
-`--dataset test` also requires test masks. The generated dataset symlinks the
-original annotations and masks, which remain supervision/evaluation targets.
-The default rendering uses the highest-confidence detection; an image with no
-detections receives a full-image box. EXIF orientation is applied before prediction
-and rendering. Keep the detector checkpoint and rendering settings the same across
-splits, and use a fresh output directory when changing settings.
+Use `--splits train,val` if test images or JSON annotations are unavailable. Evaluating with `--dataset test` also requires test masks. The generated dataset symlinks the original annotations and masks, which remain the supervision and evaluation targets. Default rendering draws the highest-confidence detection, falling back to a full-image box when no detection is found. EXIF orientation is applied before prediction and rendering. Keep the detector checkpoint and rendering settings consistent across splits, and write to a fresh output directory when changing settings.
 
-Grounding train/eval always use the baseline encoder's 336×336 input. Detector
-scripts retain `--image-size` because their inference/training resolution is
-configurable. `eval.py` requires a grounding checkpoint. Run any script with
-`--help` for its remaining data, training, and output controls.
+Grounding training and evaluation always use the baseline encoder's 336 × 336 input resolution. Detector scripts expose `--image-size` because detector training and inference resolution is configurable. `eval.py` requires a grounding checkpoint. Run any script with `--help` for additional data, training, and output flags.
 
 Optional detector-only evaluation:
 
@@ -50,26 +36,16 @@ uv run eval_detector.py --data-root data/vizwiz \
   --checkpoint outputs/yolo/detector/weights/best.pt
 ```
 
-`generate_random_box.py` retains the random-box control experiment.
-`generate_box.py` draws boxes derived from ground-truth masks: it is an oracle
-diagnostic and must not be used for normal validation/test performance claims.
-Train a separate grounding checkpoint for each image preprocessing condition.
-`models/box_renderer.py` is a historical tensor-rendering utility; the pipeline
-above uses the offline PIL renderer in `generate_yolo_box.py`.
+`generate_random_box.py` implements the random-box control experiment, and `generate_box.py` draws boxes from ground-truth masks as an oracle diagnostic. Train a separate grounding checkpoint for each image preprocessing condition. `models/box_renderer.py` is an older tensor-rendering utility; the pipeline above uses the offline PIL renderer in `generate_yolo_box.py`.
 
-# 🏆Workshop Spotlight at CVPR 2025
-Our work has been selected as a spotlight paper at a workshop in CVPR 2025! ( https://cvpr.thecvf.com/ )
-We are honored that our research was recognized and featured among the notable contributions. 
+## Project and Task
 
-# Tasks: VizWiz-VQA-Grounding
- This project was developed for the [VizWiz-VQA-Grounding Challenge](https://vizwiz.org/tasks-and-datasets/visual-qa/) 2025. The goal is to return grounded visual evidence for answers to visual questions posed by people with visual impairments. 
+Developed for the [VizWiz-VQA-Grounding Challenge](https://vizwiz.org/tasks-and-datasets/visual-qa/) 2025 and selected as a workshop spotlight at [CVPR 2025](https://cvpr.thecvf.com/).
 
+Given an image-question pair, the task is to predict the region in the image that supports the most common answer (answer grounding). Predictions are evaluated by mean Intersection over Union (IoU) against human-annotated binary masks.
 
-## 🎶Task Objective
-Given an image-question pair, the task is to predict the region in the image that supports the most common answer. This is known as **answer grounding**, and predictions are evaluated based on **mean Intersection over Union (IoU)** with human-annotated binary masks.
+## Project Structure
 
-
-## 📂Project Structure
 ```project/
 ├── README.md
 ├── models/
@@ -97,7 +73,9 @@ Given an image-question pair, the task is to predict the region in the image tha
 ├── metrics.py
 └── config.yml
 ```
-## ⚙️ Installation
+
+## Legacy Environment Setup
+
     apt update
     apt install -y git
     git
@@ -108,28 +86,17 @@ Given an image-question pair, the task is to predict the region in the image tha
     pip install tqdm
     pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-## 🚀 Running the Code
-Use the four-stage experiment commands above. Pointing `train.py` at the original
-`data/vizwiz` instead trains the baseline on unboxed images.
+## Running and Evaluation
 
-## 🧠 Model Design
+Use the four-stage workflow at the top of this file. Pointing `train.py` at the original `data/vizwiz` directory trains the baseline on unboxed images. Run `eval.py` with the grounding checkpoint and the matching image preprocessing condition.
 
-## 📊 Evaluation
-Use `eval.py` with the grounding checkpoint and the same image preprocessing
-condition used for training, as shown above.
+## License
 
-## 🔗 References
-
-## 📝 License
-<a href="http://creativecommons.org/licenses/by/4.0/" rel="license"><img src="https://i.creativecommons.org/l/by/4.0/88x31.png" alt="Creative Commons License"></a>  
-This work is licensed under a Creative Commons Attribution 4.0 International License.
+Licensed under [Creative Commons Attribution 4.0 International](http://creativecommons.org/licenses/by/4.0/).
 
 ## Encoder freezing and optimization
 
-Omitting the options below preserves this branch's existing training behavior:
-Adam, LR `1e-5`, zero weight decay, no LR schedule, and the branch's original
-encoder freezing policy. Freezing is opt-in; the detail CNN and decoder remain
-trainable. No model/state-dict keys or evaluation preprocessing change.
+Omitting the options below keeps this branch's default training setup: Adam, learning rate `1e-5`, zero weight decay, constant learning rate, and the default encoder freezing policy. Freezing is opt-in, and the detail CNN and decoder always remain trainable. Model state-dict keys and evaluation preprocessing are unchanged.
 
 | Option | Values / default |
 | --- | --- |
@@ -146,15 +113,9 @@ trainable. No model/state-dict keys or evaluation preprocessing change.
 | `--poly-power` | Positive exponent for `poly`; default `0.9` |
 | `--config` | Flat JSON with training options; optional |
 
-`BOOL` accepts `True` or `False`; a freeze flag without a value means `True`.
-The aliases `--no-freeze-backbone`, `--no-freeze-vision-encoder`, and
-`--no-freeze-text-encoder` mean `False`. An explicit component setting overrides
-`freeze_backbone` within the same source. **JSON config > explicit CLI > branch
-defaults**: a config shorthand also overrides component flags on the CLI.
-Existing recipe/loss settings can share the same JSON; unsupported keys fail
-early. Existing branch-specific flags remain available through `train.py --help`.
+`BOOL` accepts `True` or `False`; passing a freeze flag without a value sets it to `True`. The negative flags `--no-freeze-backbone`, `--no-freeze-vision-encoder`, and `--no-freeze-text-encoder` set the corresponding option to `False`. Within the same source, a specific encoder flag overrides `freeze_backbone`. Precedence follows JSON config, then explicit CLI flags, then branch defaults, so a JSON config value also overrides CLI flags. Existing recipe and loss settings can share the same JSON file, and unrecognized keys raise an error immediately. See `train.py --help` for branch-specific flags.
 
-Append, for example, to this branch's existing training command:
+For example, append these flags to the training command:
 
 ```bash
 --freeze-backbone True \
@@ -166,12 +127,7 @@ Append, for example, to this branch's existing training command:
 --min-lr-ratio 0.1
 ```
 
-This is a configurable experiment example, not a validated best hyperparameter
-setting. To freeze only vision while retaining the text policy, append
-`--freeze-vision-encoder True`. To explicitly train both encoders, use
-`--freeze-backbone False`. Models with a deliberately fixed reference stage
-(gain-guided refinement) reject encoder unfreezing to preserve that algorithm.
-Unused CLIP/SigLIP pooled-output parameters stay frozen when unfreezing token encoders.
+To freeze only the vision encoder while keeping the default text policy, pass `--freeze-vision-encoder True`. To train both encoders, pass `--freeze-backbone False`. Gain-guided refinement models keep their reference stage fixed and reject encoder unfreezing. Unused CLIP and SigLIP pooled-output parameters stay frozen when token encoders are unfrozen.
 
 Equivalent JSON (`--config path/to/train.json`):
 
@@ -187,19 +143,6 @@ Equivalent JSON (`--config path/to/train.json`):
 }
 ```
 
-Frozen encoders stay in eval mode during training and are excluded from the
-optimizer when a freezing option is set. LR schedules advance after successful
-optimizer updates, including gradient accumulation; AMP overflow skips do not
-advance them. Checkpoints save the resolved optimization settings, trainable
-parameter layout and schedule progress. Resume restores these settings and
-rejects conflicting options. For scheduled runs, keep the original total
-`--num-epochs`, loader length and accumulation so the LR trajectory is unchanged.
+Frozen encoders stay in `eval` mode during training and are excluded from the optimizer. Learning rate schedules step after each completed optimizer update (accounting for gradient accumulation) and do not advance when AMP skips an overflowing step. Checkpoints store the resolved optimization config, trainable parameter layout, and scheduler state; resuming restores these settings and rejects conflicting flags. When resuming a scheduled run, keep `--num-epochs`, dataset length, and gradient accumulation unchanged to preserve the learning rate schedule.
 
-Old checkpoints still load for evaluation with the same architecture and
-weights. Full legacy resume keeps its original optimizer layout and constant
-LR behavior; changing freezing, optimizer, decay or enabling a new LR schedule
-requires a new run (or an explicit weights-only initialization where supported).
-Resume retains each branch's existing RNG/data-order policy; legacy branches
-that do not save or reconstruct RNG state do not guarantee bitwise replay.
-No freezing/optimization change retroactively changes a previously trained
-checkpoint or its reported results.
+Existing checkpoints remain compatible with evaluation. Resuming a legacy checkpoint keeps its original optimizer layout and constant learning rate; changing encoder freezing, optimizer type, weight decay, or learning rate schedule requires starting a new run (or initializing from weights only where supported). Resuming follows each branch's RNG and data-order handling.
