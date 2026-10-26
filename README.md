@@ -86,32 +86,47 @@ targets are dataset-side training fields and are never model inputs.
 This gate threshold is a training relevance definition, not a tuned inference
 threshold. Empty-GT images use NULL.
 
-## Recommended schedule: CPU preparation, then one GPU session
+## Kaggle notebook: setup, cache, train and evaluate
 
-OCR preprocessing may take substantial time on native images. Cache it once in a
-CPU session and attach the resulting dataset in the GPU session. The exact same
-cache is used by both runs. Train time on 2xT4 has not been measured; if two runs do
-not fit one GPU session, split them without changing their configs. Do not reduce
-one run's epochs and call the pair matched.
+Default: use ONE notebook/session with Internet and 2xT4. Attach only:
+1. The existing VizWiz dataset.
+2. The existing B+5 checkpoint dataset containing
+   `mild_focus/checkpoint_epoch5.pt`.
 
-### Session 1: cache and coverage (CPU, no PyTorch setup needed)
+You do NOT need to upload a new OCR dataset, new annotations, or OCR model
+weights. The OCR models download automatically; cache JSON files are generated
+locally in `outputs/ocr_cache` and reused by both runs.
 
-Enable Internet. Attach the VizWiz dataset.
+OCR preprocessing runs on CPU in the cells below. Keeping it in the GPU session
+is simpler but uses session time while GPUs are idle. If you prefer a separate
+CPU session, the optional handoff instructions appear below. Two 20-epoch runs
+plus preprocessing have not been timed on Kaggle; do not assume they will fit
+the session limit. A prepared cache can avoid repeating preprocessing.
+
+### Cell 1 — Setup
 
 ```python
 !pip install -q uv
 !git clone --single-branch --branch exp/ocr-evidence-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
-%cd VizWiz-VQA-Grounding
+%cd /kaggle/working/VizWiz-VQA-Grounding
+!uv sync --frozen
 
 import os
 os.environ["DATA_ROOT"] = "/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz"
 os.environ["RUN_ROOT"] = "outputs"
 os.environ["OCR_CACHE"] = "outputs/ocr_cache"
-os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["PARENT_CKPT"] = "/kaggle/input/datasets/khoahoang0512/vizwiz-size-weighted-pyramid-cp/mild_focus/checkpoint_epoch5.pt"
+os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MPLBACKEND"] = "Agg"
 ```
 
-Keep Paddle out of the PyTorch environment. These tested backend versions use
+### Cell 2 — Install OCR and inspect validation coverage
+
+Training/evaluation still use `uv run`, as in the previous branches. OCR uses a
+separate environment at `/tmp/ocr-env` to avoid mixing Paddle and PyTorch
+dependencies. This is local setup only; do not upload that environment.
+
+These tested backend versions use
 mobile detection/recognition, disable document dewarping/orientation modules and
 retain all recognition confidences. Max side=1600 caps detection compute; the
 backend returns coordinates in the original upright image.
@@ -137,7 +152,10 @@ If proposals miss the target regions, improve the detector/input policy before
 spending GPU time on the adapter. This is a human research decision; no automatic
 validation-tuned training gate is installed.
 
-When coverage warrants training:
+### Cell 3 — Cache the remaining images
+
+When coverage warrants training, generate train/test cache files in the SAME
+local `outputs/ocr_cache` directory:
 
 ```bash
 %%bash
@@ -145,46 +163,19 @@ set -euo pipefail
 /tmp/ocr-env/bin/python cache_ocr.py \
     --data-root "$DATA_ROOT" --cache-root "$OCR_CACHE" \
     --splits train test --device cpu --max-side 1600
-python - <<'PY'
-import os
-from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZipFile
-root = Path(os.environ["RUN_ROOT"])
-with ZipFile(root / "ocr_cache_and_coverage.zip", "w", ZIP_DEFLATED) as archive:
-    for folder in ("ocr_cache", "ocr_coverage"):
-        for path in sorted((root / folder).rglob("*")):
-            if path.is_file() and path.suffix not in {".pt", ".tmp", ".zip"}:
-                archive.write(path, path.relative_to(root))
-PY
 ```
 
-Download the ZIP and upload its extracted contents as a Kaggle dataset. Caching is
-resumable: existing image records are verified and skipped. Missing files stop
-training instead of silently masquerading as images with no text. Recognition
-failures are retained as low-confidence candidates. OCR is run only on RGB;
+Continue directly to Cell 4. No upload, download, new Kaggle dataset or path
+change is needed between these cells. Missing cache files stop training rather
+than silently masquerading as images with no text. OCR is run only on RGB;
 question/answer/GT are never passed to the backend.
 
-### Session 2: setup, train both adapters, evaluate
+### Cell 4 — Train both adapters
 
-Enable Internet and 2xT4. Attach VizWiz, the exact B+5 checkpoint, and the OCR cache.
-
-```python
-!pip install -q uv
-!git clone --single-branch --branch exp/ocr-evidence-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
-%cd VizWiz-VQA-Grounding
-!uv sync
-
-import os
-os.environ["DATA_ROOT"] = "/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz"
-os.environ["PARENT_CKPT"] = "/kaggle/input/datasets/khoahoang0512/vizwiz-size-weighted-pyramid-cp/mild_focus/checkpoint_epoch5.pt"
-os.environ["OCR_CACHE"] = "/kaggle/input/datasets/YOUR_USERNAME/YOUR_OCR_DATASET/ocr_cache"
-os.environ["RUN_ROOT"] = "outputs"
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MPLBACKEND"] = "Agg"
-```
-
-Edit only OCR_CACHE to match the dataset sidebar. Do not use original parent20,
-natural/A, crop checkpoints, or interpolation endpoints as the parent.
+Use the same notebook and environment variables from Cell 1. Keep
+`OCR_CACHE=outputs/ocr_cache`; do not clone again or point it at a new dataset.
+Both runs start independently from B+5. Do not use original parent20, natural/A,
+crop checkpoints or interpolation endpoints as the parent.
 
 ```bash
 %%bash
@@ -207,6 +198,8 @@ optimizer, scaler and provenance; no duplicate parent. They should be a few MB
 each, not GB. Keep the original B+5 separately: both artifacts are required for
 loading. SHA256 mismatch is an error. Rank-zero disk errors are propagated through
 a CPU group rather than leaving other ranks waiting in NCCL.
+
+### Cell 5 — Evaluate and diagnose
 
 Evaluate validation at epochs10 and20, with native masks, mean/global IoU, size
 groups and the unchanged parent's paired score. These are NOT test-selected runs.
@@ -277,7 +270,7 @@ uv run audit_ocr.py --data-root "$DATA_ROOT" --cache-root "$OCR_CACHE" \
 Change ep20 to the selected epoch if necessary. Candidate-set and perfect local
 correction oracles use GT and are diagnostic upper bounds, never model scores.
 
-### Export the session
+### Cell 6 — ZIP results for download
 
 The result ZIP contains metrics, masks, diagnostics and configs; checkpoints stay
 outside it for separate Kaggle download. All adapter checkpoints are retained.
@@ -293,6 +286,38 @@ with ZipFile(archive_path, "w", ZIP_DEFLATED) as archive:
             archive.write(path, path.relative_to(root))
 print(archive_path)
 ```
+
+### Optional: prepare OCR in a separate CPU session
+
+This is optional, to avoid spending GPU-session time on OCR. Generate the same
+cache using Cells 1-3 (the OCR cells themselves do not need a GPU), then save it:
+
+```python
+from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
+
+root = Path(os.environ["RUN_ROOT"])
+with ZipFile(root / "ocr_cache_and_coverage.zip", "w", ZIP_DEFLATED) as archive:
+    for folder in ("ocr_cache", "ocr_coverage"):
+        for path in sorted((root / folder).rglob("*")):
+            if path.is_file() and path.suffix not in {".pt", ".tmp", ".zip"}:
+                archive.write(path, path.relative_to(root))
+```
+
+Only in this separate-session workflow, download this ZIP and upload its extracted
+`ocr_cache/` directory as a Kaggle dataset. It contains OCR polygons, recognized
+strings, confidence and provenance JSONs; it does not need images, GT masks,
+checkpoints, environments or OCR model weights.
+
+In the new GPU notebook, run Cell 1 and then replace just this variable:
+
+```python
+os.environ["OCR_CACHE"] = "/kaggle/input/datasets/YOUR_USERNAME/YOUR_OCR_DATASET/ocr_cache"
+```
+
+Use the actual path from the Kaggle sidebar. Attach this OCR cache dataset in
+addition to VizWiz and B+5, skip Cells 2-3, then run Cells 4-6. Caching is resumable
+within a session: existing image records are verified and skipped.
 
 ### Resume and arbitrary-image inference
 
