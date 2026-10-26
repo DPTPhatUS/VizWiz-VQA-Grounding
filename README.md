@@ -1,12 +1,25 @@
 # Gain-guided refinement
 
-This branch trains a compact grounding model with a high-resolution crop refiner and an expected-IoU-gain router. Inputs and evaluation use only the question. The coarse model stays frozen; the refiner is also frozen while training the router.
+This experiment adds a learned refinement stage that selects local image crops and predicts mask corrections based on expected IoU gain.
 
-The compact model explicitly freezes its CLIP text encoder, matching grounding-controls. During gain-guided training the entire coarse model is already frozen, so this does not change refiner/router optimization. To use a coarse model trained with text frozen from the beginning, initialize from a grounding-controls run trained with that setting.
+The model uses a coarse-to-fine structure:
+1. A frozen coarse model produces initial 336x336 mask logits.
+2. An evidence router scores potential crop locations.
+3. A local refiner predicts signed corrections on selected high-resolution crops.
 
-The coarse decoder now receives cross-attention output directly, matching grounding-controls with residual fusion removed. Initialize from a controls checkpoint trained with that architecture. Older coarse or gain-guided checkpoints containing `residual_scale` are incompatible with this version. The crop refiner still predicts additive mask corrections; that is separate from the removed encoder fusion.
+Inputs are image + question; ground-truth answers are not used at inference time.
 
-Install the project dependencies, or keep your notebook's Torch/Torchvision installation and install `transformers tqdm pillow numpy`. Run from this branch with a VizWiz root containing `<split>_grounding.json`, `<split>/` images, and `binary_masks_png/<split>/` masks.
+## Kaggle
+
+Clone branch `exp/gain-guided-refinement` and enable a GPU with internet access (for downloading pretrained CLIP weights). Install the required dependencies:
+
+```bash
+pip install transformers tqdm pillow
+```
+
+The dataset root (`--data-root`) must contain `train_grounding.json`, `val_grounding.json`, `test_grounding.json`, image directories `train/`, `val/`, `test/`, and ground-truth masks under `binary_masks_png/<split>/`.
+
+Run in a `%%bash` cell, replacing the dataset path:
 
 ```bash
 python train.py --data-root /path/to/vizwiz --stage refiner --init-checkpoint /path/to/compact-controls/checkpoint_epoch100.pt --output-dir outputs-refiner --num-epochs 30 --batch-size 1
@@ -14,27 +27,28 @@ python train.py --data-root /path/to/vizwiz --stage router --init-checkpoint out
 python eval.py --data-root /path/to/vizwiz --checkpoint outputs-router/checkpoint_epoch30.pt --dataset test --output-dir results-router --budget 2
 ```
 
-The refiner starts from a question-only compact controls checkpoint. The router starts from the refiner stage. Either stage can also initialize from its own saved weights. Images use a 336-pixel coarse input and a 672-pixel detail canvas; crops use 336 pixels. Refiner evaluation uses fixed coverage, and router evaluation selects positive predicted gains. `--budget` chooses up to 1, 2, or 4 crops. Separate evaluation and exported masks use original image dimensions.
+The refiner initializes from a question-only compact controls checkpoint. The router initializes from the trained refiner stage. Either stage can also initialize from its own saved weights. Images use a 336-pixel coarse input and a 672-pixel detail canvas; crops use 336 pixels. Refiner evaluation uses fixed coverage, and router evaluation selects positive predicted gains. `--budget` chooses up to 1, 2, or 4 crops. Separate evaluation and exported masks use original image dimensions.
+
+## Single-image prediction
 
 ```bash
 python predict_save.py --checkpoint outputs-router/checkpoint_epoch30.pt --image example.jpg --question "Where is the label?" --output mask.png
 python visualize_predictions.py --checkpoint outputs-router/checkpoint_epoch30.pt --image example.jpg --question "Where is the label?" --output overlay.png
 ```
 
-Use `train.py --help` and `eval.py --help` for operational options. Real-data accuracy and GPU throughput require training; tiny models are used only by local offline tests.
+Pass `--help` to `train.py` or `eval.py` for CLI options.
 
 ## Training output and separate evaluation
 
-Training reads only the training split: no validation dataset is loaded and no validation runs, including after the final epoch. This applies to both the refiner and router stages.
+`train.py` loads only the training split and does not run validation during or after training. This applies to both the refiner and router stages.
 
-Training saves only periodic resumable checkpoints: `checkpoint_epoch10.pt`, `checkpoint_epoch20.pt`, etc. `--save-every` defaults to **10**. Each checkpoint contains model weights, optimizer/scaler state, completed epoch, and embedded run configuration, and uses legacy PyTorch serialization. There is no additional final raw-model export or automatic final checkpoint. If training ends between checkpoint intervals, the latest saved model is from the preceding interval; use `--save-every 1` to save every completed epoch. `--save-every 0` disables all model saving.
+Training saves periodic resumable checkpoints (`checkpoint_epoch10.pt`, `checkpoint_epoch20.pt`, etc.). `--save-every` defaults to **10**. Each checkpoint contains model weights, optimizer/scaler state, completed epoch, and embedded run configuration, serialized via standard PyTorch format. If training ends between intervals, the latest saved model is from the preceding interval; use `--save-every 1` to save every completed epoch, or `--save-every 0` to disable model saving.
 
-Existing raw weights remain loadable using this branch's default model settings. Resumable checkpoints retain their own `run_config` and `experiment_config`; no standalone configuration file is written or read. `history.jsonl` contains training losses only. Run `eval.py` separately with `--dataset val` or `--dataset test`; the commands above use the periodic checkpoint saved at their epoch count.
+Existing raw weights remain loadable using this branch's default model settings. Resumable checkpoints retain their own `run_config` and `experiment_config`. `history.jsonl` contains training losses only. Run `eval.py` separately with `--dataset val` or `--dataset test`.
 
-To resume a periodic checkpoint, use `--resume-checkpoint /path/to/checkpoint_epoch10.pt` with its existing output directory or a fresh one; optimizer/scaler state and completed epoch are restored, and `--num-epochs` is the final total epoch count. To start a new run from checkpoint weights, use `--init-checkpoint /path/to/checkpoint_epoch<N>.pt`; this starts a fresh optimizer and epoch counter. Repeat the original batch size, seed, learning rate, and experiment-specific training arguments when continuing a run. Older supported full checkpoints remain loadable.
+To resume a periodic checkpoint, pass `--resume-checkpoint /path/to/checkpoint_epoch10.pt` with its existing output directory or a fresh one. Optimizer and scaler states and completed epoch are restored, and `--num-epochs` specifies the final total epoch count. To start a new run from checkpoint weights, pass `--init-checkpoint /path/to/checkpoint_epoch<N>.pt` to initialize a fresh optimizer and epoch counter. Repeat the original batch size, seed, learning rate, and experiment-specific arguments when continuing a run. Older supported full checkpoints remain loadable.
 
-Existing output directories are accepted for all training modes. Matching model filenames are overwritten; other model files remain. History is appended to `history.jsonl`, creating it if absent. To continue in a fresh Kaggle notebook, only the resumable checkpoint is needed to restore training state; no previous history or separate configuration file is required. The training dataset must still be available. Repeat the saved `--stage` when resuming; the full checkpoint already contains the frozen coarse and refiner weights, so the original initialization file is unnecessary.
-
+Existing output directories are accepted for all training modes. Matching model filenames are overwritten; other model files remain. History is appended to `history.jsonl`, creating it if absent. To continue in a fresh Kaggle notebook, only the resumable checkpoint is needed to restore training state. The training dataset must still be available. Repeat the saved `--stage` when resuming; the full checkpoint already contains the frozen coarse and refiner weights, so the original initialization file is unnecessary.
 
 ## Code layout
 
@@ -43,10 +57,10 @@ Existing output directories are accepted for all training modes. Matching model 
 - `models/mask_decoder.py`: the decoder used by this experiment.
 - `train.py`: construct the model and dataset, run training, save periodic resumable checkpoints.
 - `eval.py`: construct the model, load weights, evaluate and export masks.
-- `utils.py`: batch transfer and a few plain weight-loading helpers.
+- `utils.py`: batch transfer and weight-loading helpers.
 
 The separate backbone, experiment, and checkpoint modules and model factory are removed. Training uses no validation and saves only resumable checkpoints every 10 epochs by default.
 
-For existing standalone refiner weights, use `--stage refiner` with `eval.py`, `predict_save.py`, or `visualize_predictions.py`. Router inference is the default when no saved stage is available.
+For existing standalone refiner weights, pass `--stage refiner` with `eval.py`, `predict_save.py`, or `visualize_predictions.py`. Router inference is the default when no saved stage is specified.
 
-Training shows a batch progress bar for each epoch (rank 0 under `torchrun`), and evaluation shows a batch progress bar. Install `tqdm` alongside Transformers and Pillow in the Kaggle notebook.
+Training displays a batch progress bar for each epoch (on rank 0 under `torchrun`), and evaluation displays a progress bar.
