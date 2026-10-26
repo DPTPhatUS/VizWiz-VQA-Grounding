@@ -1,73 +1,44 @@
 # Parent-preserving pyramid: C and D in one Kaggle session
 
-Branch: `exp/parent-preserving-pyramid`, from size-weighted-pyramid at3cbe644.
-Run C then D sequentially in one session. Use train_group.py/preflight_group.py,
-not train.py. Both use run B's mild-focus objective (focus_alpha0.25), the SAME
-original pyramid epoch20, frozen vision/text, BCE+Dice, Adam and no projection.
-They do NOT initialize from B's trained result or from one another.
+Branch: `exp/parent-preserving-pyramid`, branched from `exp/size-weighted-pyramid` at `3cbe644`. This workflow runs experiments C (`foreground`) and D (`parameters`) sequentially in a single Kaggle session using `train_group.py` and `preflight_group.py`. Both runs use run B's mild-focus weighting (`focus_alpha = 0.25`), initialize from the same 20-epoch parent pyramid checkpoint, keep the vision and text encoders frozen, and train with BCE + Dice and Adam without gradient projection. Each run initializes independently from the 20-epoch parent rather than from run B or from one another.
 
 ## Two different preservation hypotheses
 
 | Run folder | Mode | Strength | Additional training-only state |
 |---|---|---:|---|
-| foreground (C) | foreground | 1.0 | Frozen copy of the post-encoder body |
-| parameters (D) | parameters | 0.01 | Initial values of trainable parameters |
+| `foreground` (C) | `foreground` | 1.0 | Frozen copy of the post-encoder body |
+| `parameters` (D) | `parameters` | 0.01 | Initial values of trainable parameters |
 
-Both inherit weights w=(1-alpha)*p+alpha*(0.5,0.5,0), alpha0.25. Frequencies p
-come from TRAIN masks only. For249/1676/4569 images, weights are approximately
-15.38%/31.86%/52.77%. Balanced sampling and data order remain the same as B.
+Both runs use group weights `w = (1 - alpha) * p + alpha * (0.5, 0.5, 0)` with `alpha = 0.25`, where `p` is the training split frequency across `<1%`, `1-10%`, and `>=10%` ground-truth foreground masks (249 / 1,676 / 4,569 images, giving weights of approximately 15.38% / 31.86% / 52.77%). Balanced group sampling and data ordering match run B.
 
 ### C: retain correct parent foreground on large-GT images
 
-For each training image with >=10% foreground on the resized training mask,
-K contains GT-foreground pixels where parent logit>0. Student probabilities p
-are penalized only if they fall BELOW parent probabilities t:
+For each training image with `>=10%` foreground on the resized training mask, let `K` be the set of ground-truth foreground pixels where the frozen parent's logit is positive (`> 0`). Student probabilities `p` are penalized only when they drop below the parent's probabilities `t`:
 
     keep(image) = mean over K of relu(t-p)^2
     L_C = w_small*L_small + w_medium*L_medium
           + w_large*(L_large + 1.0*keep)
 
-Empty K gives zero. Normalize per image before averaging images. Teacher false
-positives, missed foreground and smaller-GT images are not protected. Increasing
-student confidence above parent is allowed. GT segmentation supervision stays
-active at all final/auxiliary heads. This is not a guarantee of preserving recall:
-it constrains probabilities at selected pixels, not the entire predicted shape.
+If `K` is empty, `keep(image)` is zero. The penalty is averaged over `K` per image before averaging across images in the batch. Teacher false positives, teacher false negatives, and images in the smaller ground-truth size groups are not penalized, and the student is free to increase confidence above the parent. Standard ground-truth segmentation supervision remains active at all final and auxiliary heads.
 
-CLIP vision/text execute ONCE per image. Their frozen outputs are shared with a
-frozen parent copy of CNN/fusion/decoder/refiner, built only from post-encoder
-modules (about6.65M parameters for the full pyramid). CNN branches are separate;
-student CNN features cannot stand in for the original parent's CNN. The parent
-has no gradient and is never included in model/DDP/optimizer state keys.
+During training in mode C, the frozen CLIP vision and text encoders run once per image. Their outputs are shared with a frozen copy of the parent's post-encoder modules (CNN pyramid, fusion, decoder, and refiner, totaling about 6.65M parameters). Because the student's CNN pyramid updates during training, the frozen parent retains its own separate CNN pyramid branch. The frozen parent copy requires no gradients and is excluded from the student's `model_state_dict`, DDP wrapper, and optimizer state.
 
 ### D: L2-SP anchor around the parent
 
-For trainable student parameters only, store their initial parent values theta0:
+Mode D stores the initial parent values `theta0` for all trainable student parameters and adds a quadratic anchor penalty around `theta0`:
 
     anchor = 0.5 * sum over trainable parameters of (theta-theta0)^2
     L_D = L_B + 0.01*anchor
 
-This is a SUM, not parameter-mean MSE. The exact extra gradient0.01*(theta-theta0)
-is added ONCE per optimizer update, before gradient clipping/Adam and with correct
-AMP unscaling. It is not ordinary weight decay toward zero, and it is not
-multiplied by the number of groups, accumulation steps or GPUs. No parent forward
-or second model is constructed for D.
+This term sums squared parameter differences across trainable tensors (rather than taking a per-parameter mean). Its exact gradient `0.01 * (theta - theta0)` is added once per optimizer step prior to gradient clipping and the Adam update, with proper AMP unscaling, independent of the number of size groups, accumulation steps, or GPUs. Mode D does not construct a second model copy or run a parent forward pass.
 
-The two strengths are predeclared starting values, not tuned optima. C and D have
-different units; their coefficients are not directly comparable. Anchor magnitude
-may need reevaluation if the trainable parameter scale/count changes. The ideas
-are motivated by [Learning without Forgetting](https://arxiv.org/abs/1606.09282)
-and [L2-SP](https://proceedings.mlr.press/v80/li18a.html); the selective foreground
-variant is a task-specific hypothesis, not a demonstrated result from those papers.
+Note that C and D operate in different units (probability-space MSE vs. parameter-space L2 sum), so their strength coefficients (`1.0` and `0.01`) have different scales. Background references: [Learning without Forgetting](https://arxiv.org/abs/1606.09282) and [L2-SP](https://proceedings.mlr.press/v80/li18a.html).
 
-Inference is still ONE original student pyramid, with unchanged state-dict keys,
-architecture, normalization and no answer input. Both training-only references
-are discarded by normal evaluation/inference.
+At inference time, both C and D export a single standard student pyramid with unchanged state-dict keys, architecture, and preprocessing. All training-only reference states are ignored during evaluation.
 
-## Cell 1 — Fresh session and environment
+## Cell 1: Fresh session and environment
 
-Enable Internet and two GPUs (for example T4 x2). Attach both VizWiz and the
-original pyramid checkpoint dataset. Keep that checkpoint under /kaggle/input;
-do not copy it into outputs. No notebook file is generated by this guide.
+Enable Internet and two GPUs (such as 2x T4). Attach both the VizWiz dataset and the original 20-epoch pyramid checkpoint dataset under `/kaggle/input`.
 
 ```python
 !git clone --single-branch --branch exp/parent-preserving-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
@@ -75,10 +46,9 @@ do not copy it into outputs. No notebook file is generated by this guide.
 !uv sync --frozen
 ```
 
-If already cloned on this branch, use `!git pull --ff-only` then
-`!uv sync --frozen` instead. Complete dependency setup before torchrun.
+If the repository is already cloned on this branch, run `!git pull --ff-only` followed by `!uv sync --frozen`.
 
-## Cell 2 — Paths and C/D configs
+## Cell 2: Paths and C/D configs
 
 ```python
 import json
@@ -122,17 +92,11 @@ for run, strength in (('foreground', 1.0), ('parameters', 0.01)):
     print(path, config)
 ```
 
-Config > explicit CLI flags > defaults. Keep focus_alpha=0.25 for both runs. Change only the preservation mode/strength
-between these C/D configs. Use the original question-guided-detail-pyramid epoch20, NOT a scale or
-Lovasz continuation checkpoint. Each run initializes model weights from this
-same parent and starts its own fresh optimizer, AMP scaler and epoch counter.
+Precedence is JSON config > explicit CLI flags > defaults. Both configs keep `focus_alpha = 0.25` and differ only in `preservation_mode` and `preservation_strength`. Ensure `PYRAMID_CKPT` points to the original 20-epoch `question-guided-detail-pyramid` checkpoint; each run initializes its student weights from this parent with a fresh optimizer, AMP scaler, and epoch counter.
 
-## Cell 3 — C then D: preflight, train, evaluate and diagnostic
+## Cell 3: C then D: preflight, train, evaluate and diagnostic
 
-This single cell runs both experiments SEQUENTIALLY. Each command is a fresh
-process, releasing its GPU allocations on exit. D never initializes from C.
-Two GPUs train one student; evaluation then uses one GPU. Batch6 is global over
-three groups and two ranks, one image/group/GPU before accumulation.
+This cell runs `foreground` (C) followed by `parameters` (D) in separate subprocesses, releasing GPU memory between commands. Training uses two GPUs with a global batch size of 6 (1 image per size group per GPU), and evaluation runs on a single GPU.
 
 ```bash
 %%bash
@@ -181,31 +145,16 @@ for run in foreground parameters; do
 done
 ```
 
-Preflight must pass on both ranks. Its updates are discarded; training starts
-again from the same parent. CUDA training uses AMP; evaluation uses FP32 and the
-original native-resolution threshold/IoU rules. If eval batch4 exceeds memory,
-set EVAL_BATCH=1. Test metrics need local GT; do not select a run using test.
-No validation is performed inside training; the script evaluates at the end.
-C uses the shared training-autocast encoder features for its reference forward;
-the probability penalty is computed in FP32. This is not a cached FP32 parent
-evaluation mask, so near-threshold selections can differ slightly from eval.py.
+Preflight must pass on both ranks; its updates are discarded before `train_group.py` re-initializes from `PYRAMID_CKPT`. Training runs under AMP while evaluation runs in FP32 at native resolution (set `EVAL_BATCH = '1'` if batch size 4 exceeds VRAM). In mode C, the reference branch reuses the training-autocast encoder features and computes the probability penalty in FP32.
 
-Each run has five ADDITIONAL epochs after parent20 (25 total training epochs).
-Expected checkpoints are ONLY:
+Each run trains for 5 continuation epochs after the 20-epoch parent (25 total training epochs) and writes a single checkpoint:
 
-- outputs/foreground/checkpoint_epoch5.pt
-- outputs/parameters/checkpoint_epoch5.pt
+- `outputs/foreground/checkpoint_epoch5.pt`
+- `outputs/parameters/checkpoint_epoch5.pt`
 
-There is no duplicate model_final file. Old A/B, scale and per-image branches are not changed.
-The full checkpoints also store the original training-only parent references;
-they add only post-encoder reference tensors, not a second backbone. The disk-space estimator and coordinated CPU-group disk-error handling
-are retained. Both frozen backbones are still stored in each full checkpoint,
-so enough disk is still required; no checkpoints are deleted automatically.
-A single session is the intended workflow, but real Kaggle runtime/VRAM fit has
-not been measured here. Two five-epoch group runs plus evaluation are not a
-promise to finish within every accelerator/session limit.
+Each full checkpoint also stores `preservation_state` (the post-encoder reference tensors for C or the initial trainable parameter anchors for D) alongside the model and frozen backbones, using the same pre-write disk-space check and coordinated CPU-group error handling as the parent branch.
 
-## Cell 4 — Compare validation and verify experiment identity
+## Cell 4: Compare validation and verify experiment identity
 
 ```python
 import csv
@@ -262,13 +211,9 @@ with comparison.open('w', newline='') as handle:
 print(comparison.read_text())
 ```
 
-Compare C and D against run B (mild_focus+5 from size-weighted-pyramid),
-which has the same parent, frozen encoders, sampler, weights and optimizer but no
-preservation. The older scale control has different50/50/0 weights and cannot
-isolate preservation alone. Use validation for selection; test is descriptive.
-Inspect large recall alongside both smaller groups' IoU/precision.
+Compare C and D against run B (`mild_focus` at +5 from `exp/size-weighted-pyramid`), which shares the exact parent, frozen encoders, balanced sampler, group weights, and optimizer without a preservation term (whereas the earlier `scale-constrained-pyramid` control used 50/50/0 group weights). Use validation metrics to compare runs, and inspect large-region recall alongside small and medium IoU and precision.
 
-## Cell 5 — ZIP both result folders, excluding all checkpoints
+## Cell 5: ZIP both result folders, excluding all checkpoints
 
 ```python
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -283,58 +228,23 @@ print('Download results:', archive)
 print('Keep the two full checkpoint files separately if needed.')
 ```
 
-The ZIP includes configs, histories, resolved weights/provenance in metrics,
-validation masks, CPU diagnostics, optional test masks and comparison CSV. It
-contains no .pt, partial .tmp or nested ZIP files.
+The ZIP archive bundles the configuration files, training histories, resolved weights and provenance in `metrics.json`, validation masks, CPU diagnostics, optional test masks, and `two_run_comparison.csv`, excluding `.pt`, `.tmp`, and nested `.zip` files.
 
 ## Logs, references and compatibility
 
-New config/CLI options are preservation_mode (--preservation-mode) and
-preservation_strength (--preservation-strength). Modes: none/foreground/parameters.
-Defaults: foreground, strength1.0 (parameters defaults0.01 if not specified;
-none defaults0). Setting strength0 disables reference allocation and reproduces
-the unregularized B path. Both prescribed modes require frozen encoders and no
-projection. focus_alpha remains0.25 in C and D.
+The preservation controls are exposed as `preservation_mode` (`--preservation-mode`) and `preservation_strength` (`--preservation-strength`). Supported modes are `none`, `foreground`, and `parameters`. By default, `preservation_mode` is `foreground` with strength `1.0` (`parameters` defaults to `0.01`, and `none` defaults to `0`). Setting strength to `0` disables reference allocation and reproduces the unregularized run B update path. Both `foreground` and `parameters` modes require frozen encoders and `--no-project-updates`.
 
-- loss_small/medium/large fields: original segmentation objective, including aux.
-- segmentation_objective: group-weighted segmentation term.
-- train_loss/proposal_loss: full objective including the preservation term.
-- preservation_loss: C's raw mean keep loss on large images, or D's half-sum L2.
-- preservation_weighted_loss: its actual contribution to the total objective.
-- protected_foreground_fraction: fraction of GT foreground selected by C's parent.
-- preservation_active_fraction: fraction of large images with protected pixels.
-- parameter_distance_l2 and preservation_gradient_ratio: D's movement from parent
-  and anchor-gradient norm divided by segmentation-gradient norm before clipping.
+Key fields logged in `history.jsonl`:
 
-Check C coverage/activity to see whether the reference has usable foreground.
-Check D's gradient ratio to identify a negligible or dominating anchor. A negative
-result with one strength does not reject every setting of that mechanism.
+- `loss_small`, `loss_medium`, `loss_large`: per-group segmentation losses (including auxiliary heads).
+- `segmentation_objective`: group-weighted segmentation loss.
+- `train_loss` / `proposal_loss`: total objective including the weighted preservation term.
+- `preservation_loss`: raw per-image mean `keep` loss on large images in mode C, or `0.5 * sum((theta - theta0)^2)` in mode D.
+- `preservation_weighted_loss`: scaled contribution added to `segmentation_objective`.
+- `protected_foreground_fraction`: fraction of large-image ground-truth foreground pixels selected by the parent mask in mode C.
+- `preservation_active_fraction`: fraction of large images with non-empty `K` in mode C.
+- `parameter_distance_l2` and `preservation_gradient_ratio`: L2 distance from initial parent parameters and the ratio of anchor gradient norm to segmentation gradient norm before clipping in mode D.
 
-Full checkpoints contain preservation_state separately from model_state_dict.
-C saves the original reference head, D saves the original parameter anchors;
-neither reference is reset to the student on resume. Resume does not require the
-original parent file to remain mounted. Evaluation loads only student state and
-ignores preservation_state. Parent checkpoint and old inference masks remain
-compatible with the new encode/decode refactor.
+Full checkpoints store `preservation_state` separately from `model_state_dict` so resuming a completed C or D checkpoint restores the original parent reference rather than re-anchoring to the student, even if the original 20-epoch parent file is no longer mounted. Standard evaluation (`eval.py`) loads `model_state_dict` only and ignores `preservation_state`.
 
-Full optimizer resume requires parent-preserving-updates-v1 with the same mode,
-strength, alpha, loss, sampler/batch, optimizer/freezing, seed and GPU count. Old
-A/B/scale checkpoints can initialize compatible model weights but cannot silently
-resume this protocol. Use the ORIGINAL parent20 for the C/D comparison.
-
-If C completes and D fails, keep C's results. After resolving the error, run
-Cell3 with `for run in parameters; do` instead of rerunning C. Use a fresh D output
-folder if a failed attempt left history; update later paths consistently.
-No intermediate checkpoint exists before epoch5. An interrupted run without a
-full checkpoint must restart from parent. Do not initialize D from C.
-
-For later continuation of a completed C/D run, replace --init-checkpoint with
---resume-checkpoint for THAT run, keep its config, and set num-epochs to the total
-additional-epoch target. The saved original parent reference is restored along
-with optimizer/scaler. A missing reference or changed preservation mode/strength
-is rejected. No files are automatically deleted.
-
-CPU synthetic/autograd/DDP checks validate implementation contracts; they do not
-establish GPU fit, speed, accuracy gains or transfer. C adds a post-encoder forward
-on large training images; D has no reference forward. Neither adds inference
-parameters. Backbone adapters still need their usual shape/preprocessing work.
+If `foreground` (C) finishes and `parameters` (D) fails, keep `outputs/foreground`, clear any partial files in `outputs/parameters`, and rerun Cell 3 with `for run in parameters; do`. To extend a completed C or D run to more epochs later, replace `--init-checkpoint` with `--resume-checkpoint` pointing to that run's `checkpoint_epoch5.pt`, keep its config unchanged, and set `--num-epochs` to the new total continuation epoch target.
