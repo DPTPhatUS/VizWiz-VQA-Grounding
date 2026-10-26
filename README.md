@@ -1,9 +1,6 @@
 # Grounding first with local answer supervision
 
-Branch: `exp/grounding-first-answer`, based on `exp/spatial-detail-decoder` at `63977d2`.
-This is a new experiment requiring fresh training. It tests whether answer supervision
-can improve the predicted evidence mask when the answer reader must use local RGB
-features selected by that mask.
+Branch `exp/grounding-first-answer` (branched from `exp/spatial-detail-decoder` at `63977d2`) tests whether auxiliary answer supervision improves predicted evidence masks when an auxiliary answer reader is restricted to local RGB features pooled inside the predicted mask.
 
 ## Forward path
 
@@ -12,56 +9,31 @@ Image + Q --> CLIP vision/text --> question-conditioned detail decoder --> mask 
 RGB image --> local reader features -- masked pooling by predicted mask --> answer embedding
 ```
 
-The mask decoder never receives a real or predicted answer. It retains three
-question-conditioned visual skips and RGB detail fusion at decoder stages 2/3.
-There is no cosine spatial interaction, pre-grounding answer predictor, teacher
-checkpoint, oracle-mask decoder, or self-distillation recipe on this branch.
-CLIP text is frozen and stays in eval mode. CLIP vision patch features are trainable.
-The vision `post_layernorm` is frozen because it only normalizes pooled CLS,
-which this decoder does not use. Its weights remain in checkpoints; freezing it
-does not change patch features and avoids unused trainable parameters in DDP.
+The mask decoder receives only the image and question, retaining three question-conditioned visual skips and RGB detail fusion at decoder stages 2 and 3. It omits cosine spatial interaction, pre-grounding answer prediction, external teachers, oracle-mask decoding, and self-distillation. The CLIP text encoder stays frozen in `eval` mode while CLIP vision patch features are trained. The vision `post_layernorm` layer is kept frozen in checkpoints because it only normalizes the unused pooled CLS token, avoiding unused trainable parameters under DDP.
 
-The auxiliary reader has two bias-free 3x3 convolutions, question-gated visual
-channels, and a small bias-free projection. Its visual receptive field is 5x5,
-including at most a two-pixel context halo around a selected location. It has no
-CLIP visual features, global visual skip, spatial normalization, or direct
-question-to-answer residual. Question/appearance priors and soft-mask shortcuts
-remain possible; this architecture is not a proof of causal grounding.
+The auxiliary answer reader consists of two bias-free 3x3 convolutions, question-gated visual channels, and a bias-free linear projection. Its 5x5 visual receptive field covers at most a two-pixel context border around any selected pixel, without access to CLIP visual features, global visual skips, spatial normalization, or a direct question-to-answer residual path. Because the mask is soft during training, question and appearance priors can still influence the pooled representation.
 
-The reader predicts a **CLIP answer embedding**, not a free-form answer string.
-A real answer is encoded as `A: ...` using frozen CLIP token features, with masked
-mean pooling excluding padding and SOT/EOT. Cosine alignment is not answer accuracy.
-The full-size auxiliary reader adds 121,696 parameters and is skipped during mask-only inference.
+The reader predicts a continuous CLIP answer embedding. Ground-truth answers are formatted as `A: ...` and encoded with frozen CLIP token features via masked mean pooling (excluding padding, SOT, and EOT tokens). The full-size auxiliary reader adds 121,696 parameters and is bypassed completely during mask-only inference.
 
 ## Loss and gradient routing
 
-The same reader is evaluated on two regions during training:
+During training, the auxiliary reader is evaluated on two spatial regions per image:
 
-1. **GT region:** updates the reader only, supervised by the real-answer embedding.
-2. **Predicted soft region:** reader features/weights and question features are detached;
-   the answer loss differentiates through the soft mask into the grounding network.
+1. **GT region:** updates the reader parameters only, supervised against the frozen ground-truth answer embedding.
+2. **Predicted soft region:** detaches the reader features, reader weights, and question features so the answer loss backpropagates exclusively through the soft mask probabilities into the grounding network.
 
-The predicted-region path does **not** detach the mask, run under `no_grad`, or
-threshold/crop it with a nondifferentiable operation. Pixel masks come from sigmoid
-of logits resized to the RGB feature resolution. The GT-region path does not feed
-back into mask inference. No GT mask/answer is required at deployment.
+The predicted-region path resizes mask logits to the RGB feature resolution and applies `sigmoid` directly, preserving differentiability without hard thresholding or cropping. At evaluation and deployment, neither ground-truth masks nor answers are used.
 
-The default objective is:
+The training loss is:
 
 ```text
 L = BCE + 0.5 * Dice + 0.5 * reader_GT + effective_answer_weight * mask_answer
 reader_GT and mask_answer = cosine error + mean SmoothL1 against frozen answer embeddings
 ```
 
-`effective_answer_weight` is 0 for epochs 1-2 and 0.5 from epoch 3 onward. This
-calibrates the reader before using it to guide masks, within one training run and
-one optimizer. These are initial research settings, not tuned coefficients.
-Missing answers and empty GT regions are excluded from both answer terms, while
-segmentation supervision is retained. Valid-answer reduction is global across DDP ranks.
-Grounder and reader gradients are clipped separately to norm 1, so reader calibration
-does not change the grounder's update through a shared clipping norm.
+`effective_answer_weight` is `0` during epochs 1-2 and `0.5` from epoch 3 onward, allowing the reader to calibrate on ground-truth regions before sending gradients into the mask decoder. Samples with missing answers or empty ground-truth masks are excluded from both answer loss terms (with valid-sample reductions synchronized across DDP ranks) while still contributing to the segmentation loss. Grounder and reader gradients are clipped independently to a max norm of `1.0` so reader updates do not rescale the grounder's gradient norm.
 
-Optional JSON contains only:
+Optional loss overrides can be passed via `--config`:
 
 ```json
 {
@@ -72,9 +44,7 @@ Optional JSON contains only:
 }
 ```
 
-No config file is needed to use these defaults. The text-freezing and decoder
-architecture are fixed for this experiment. Old flags such as `--training-recipe`,
-`--loss-version`, `--no-spatial-evidence`, and latent alignment configs do not apply.
+No config file is required when using the defaults above. Legacy flags from other branches (`--training-recipe`, `--loss-version`, `--no-spatial-evidence`) are not used on this branch.
 
 ## Train
 
@@ -90,15 +60,9 @@ uv run torchrun --nproc_per_node=2 train.py \
     --save-every 10
 ```
 
-Batch size is global: 4 means 2 images/GPU on two GPUs. AMP FP16 is enabled on
-CUDA. The trainer does not run validation. Full checkpoints are saved at epochs
-10/20 and final raw weights are saved separately. Source hashes and resolved
-training/model settings are stored in full checkpoints.
+`--batch-size` is global across GPUs (`--batch-size 4` on 2 GPUs places 2 images per GPU). FP16 AMP is enabled automatically on CUDA, and no validation runs during training. Full resumable checkpoints (including source hashes and resolved model/training configs) are saved every `--save-every` epochs alongside a separate final raw weights file.
 
-Resume with `--resume-checkpoint outputs/checkpoint_epoch10.pt`, keeping the same
-batch size, LR, seed, world size and loss settings, with `--num-epochs 20` meaning
-20 total epochs. Raw weights cannot resume training. Previous latent/spatial
-checkpoints belong to their original branches and are rejected here.
+To resume from a periodic checkpoint, pass `--resume-checkpoint outputs/checkpoint_epoch10.pt` with the original batch size, learning rate, seed, world size, and loss settings (`--num-epochs 20` specifies 20 total epochs). Raw weight files cannot be used to resume training, and checkpoints from earlier latent or spatial-evidence branches are rejected.
 
 ## Evaluate and diagnose
 
@@ -116,59 +80,36 @@ uv run python diagnose.py \
     --output-dir outputs/diagnostic_ep20
 ```
 
-Mask evaluation bypasses the auxiliary reader entirely. IoU and exported masks
-use native GT resolution; logits are resized before thresholding. Local test
-scoring requires test masks. Select checkpoints and hyperparameters on validation.
+`eval.py` skips the auxiliary reader and scores masks at native ground-truth resolution (resizing logits before thresholding). Use validation metrics to select checkpoints and hyperparameters.
 
-Diagnostics report per-image/size-group IoU and embedding alignment when the reader
-uses GT, predicted, or full-image support. It does not generate answers or prove
-that a correct answer requires the annotated region. Legacy A-prime intervention
-probes are retired on this branch because answers do not condition the mask.
+`diagnose.py` reports IoU across mask size groups and compares reader embedding alignment under ground-truth, predicted, and full-image support masks.
 
-## Required comparison and evidence limits
+## Matched control comparison
 
-A matched control sets only `answer_weight` to 0, retaining the same architecture,
-reader GT training and other settings. That control isolates whether the indirect
-answer gradient helps the mask. Comparing only with the old latent alignment run
-would also change architecture and training objective.
-
-The detail input remains 336x336, so lost source-image detail is not restored.
-If the reader cannot learn useful GT-region representations, its mask gradient may
-be unhelpful or harmful. Inspect the reader diagnostics alongside mask accuracy.
-CPU/synthetic gradient, locality, DDP and checkpoint checks do not establish VizWiz
-accuracy, seed robustness, GPU memory requirements, or Kaggle runtime.
+To isolate the effect of the indirect answer gradient on mask quality, run a matched control with `"answer_weight": 0` in `--config` while keeping the architecture, reader GT training, and all other hyperparameters identical. Because the detail branch operates on 336x336 inputs, inspect the reader alignment diagnostics alongside validation mIoU to verify whether the reader learns informative regional representations.
 
 ## Encoder freezing and optimization
 
-Omitting the options below preserves this branch's existing training behavior:
-Adam, LR `1e-5`, zero weight decay, no LR schedule, and the branch's original
-encoder freezing policy. Freezing is opt-in; the detail CNN and decoder remain
-trainable. No model/state-dict keys or evaluation preprocessing change.
+Omitting the flags below keeps this branch's default training configuration: Adam with learning rate `1e-5`, zero weight decay, a constant learning rate, and the branch's default encoder freezing policy. Encoder freezing is opt-in, while the detail CNN and mask decoder always remain trainable. Model state-dict keys and evaluation preprocessing are unchanged.
 
 | Option | Values / default |
 | --- | --- |
-| `--freeze-backbone [BOOL]` | Set both pretrained encoders; omitted preserves existing policy |
-| `--freeze-vision-encoder [BOOL]` | Set vision encoder only |
-| `--freeze-text-encoder [BOOL]` | Set text encoder only |
+| `--freeze-backbone [BOOL]` | Freeze or unfreeze both pretrained encoders; omitting keeps the branch default |
+| `--freeze-vision-encoder [BOOL]` | Freeze or unfreeze the vision encoder only |
+| `--freeze-text-encoder [BOOL]` | Freeze or unfreeze the text encoder only |
 | `--optimizer` | `adam` (default), `adamw` |
 | `--lr` | Main learning rate; default `0.00001` |
-| `--backbone-lr` | Optional separate LR for unfrozen encoders; default uses `--lr` |
-| `--weight-decay` | Nonnegative; default `0`. Biases, norm vectors and token/position embeddings receive no decay when parameter groups are enabled |
+| `--backbone-lr` | Optional separate learning rate for unfrozen encoders; defaults to `--lr` |
+| `--weight-decay` | Nonnegative weight decay; default `0`. Biases, normalization parameters, and token/position embeddings are excluded from decay when parameter groups are active |
 | `--lr-scheduler` | `none` (default), `cosine`, `linear`, `poly` |
-| `--warmup-ratio` | Fraction of planned optimizer updates, in `[0, 1)`; default `0` |
-| `--min-lr-ratio` | Final LR / starting LR for decay schedules; default `0.1` |
-| `--poly-power` | Positive exponent for `poly`; default `0.9` |
-| `--config` | Flat JSON with training options; optional |
+| `--warmup-ratio` | Fraction of total optimizer updates used for linear warmup, in `[0, 1)`; default `0` |
+| `--min-lr-ratio` | Final LR divided by initial LR for decay schedules; default `0.1` |
+| `--poly-power` | Positive exponent for the `poly` scheduler; default `0.9` |
+| `--config` | Path to a flat JSON file with training options; optional |
 
-`BOOL` accepts `True` or `False`; a freeze flag without a value means `True`.
-The aliases `--no-freeze-backbone`, `--no-freeze-vision-encoder`, and
-`--no-freeze-text-encoder` mean `False`. An explicit component setting overrides
-`freeze_backbone` within the same source. **JSON config > explicit CLI > branch
-defaults**: a config shorthand also overrides component flags on the CLI.
-Existing recipe/loss settings can share the same JSON; unsupported keys fail
-early. Existing branch-specific flags remain available through `train.py --help`.
+`BOOL` accepts `True` or `False`, and passing a freeze flag without an argument sets it to `True`. The negative aliases `--no-freeze-backbone`, `--no-freeze-vision-encoder`, and `--no-freeze-text-encoder` set the corresponding option to `False`. Within the same configuration source, a component-specific flag (`--freeze-vision-encoder` or `--freeze-text-encoder`) overrides `freeze_backbone`. Precedence follows **JSON config > explicit CLI flags > branch defaults**, so a `freeze_backbone` entry in `--config` overrides component flags passed on the CLI. Branch-specific recipe and loss settings can be included in the same JSON file, and unknown keys raise an error immediately. See `train.py --help` for the full list of CLI flags.
 
-Append, for example, to this branch's existing training command:
+Example flags to append to a training command:
 
 ```bash
 --freeze-backbone True \
@@ -180,14 +121,9 @@ Append, for example, to this branch's existing training command:
 --min-lr-ratio 0.1
 ```
 
-This is a configurable experiment example, not a validated best hyperparameter
-setting. To freeze only vision while retaining the text policy, append
-`--freeze-vision-encoder True`. To explicitly train both encoders, use
-`--freeze-backbone False`. Models with a deliberately fixed reference stage
-(gain-guided refinement) reject encoder unfreezing to preserve that algorithm.
-Unused CLIP/SigLIP pooled-output parameters stay frozen when unfreezing token encoders.
+To freeze only the vision encoder while keeping the branch's text encoder policy, pass `--freeze-vision-encoder True`. To train both encoders, pass `--freeze-backbone False`. Architectures with a fixed reference stage (such as gain-guided refinement) reject encoder unfreezing. Unused CLIP and SigLIP pooled-output parameters remain frozen even when token encoders are unfrozen.
 
-Equivalent JSON (`--config path/to/train.json`):
+Equivalent JSON configuration (`--config path/to/train.json`):
 
 ```json
 {
@@ -201,19 +137,6 @@ Equivalent JSON (`--config path/to/train.json`):
 }
 ```
 
-Frozen encoders stay in eval mode during training and are excluded from the
-optimizer when a freezing option is set. LR schedules advance after successful
-optimizer updates, including gradient accumulation; AMP overflow skips do not
-advance them. Checkpoints save the resolved optimization settings, trainable
-parameter layout and schedule progress. Resume restores these settings and
-rejects conflicting options. For scheduled runs, keep the original total
-`--num-epochs`, loader length and accumulation so the LR trajectory is unchanged.
+When frozen, encoders are placed in `eval` mode and omitted from the optimizer. Learning rate schedulers step once per completed optimizer update (accounting for gradient accumulation) and do not advance when AMP skips a step due to gradient overflow. Checkpoints record the resolved optimization configuration, trainable parameter groups, and scheduler state. Resuming restores these settings and rejects conflicting overrides; keep `--num-epochs`, dataset length, and gradient accumulation unchanged when resuming a scheduled run so the learning rate schedule stays aligned.
 
-Old checkpoints still load for evaluation with the same architecture and
-weights. Full legacy resume keeps its original optimizer layout and constant
-LR behavior; changing freezing, optimizer, decay or enabling a new LR schedule
-requires a new run (or an explicit weights-only initialization where supported).
-Resume retains each branch's existing RNG/data-order policy; legacy branches
-that do not save or reconstruct RNG state do not guarantee bitwise replay.
-No freezing/optimization change retroactively changes a previously trained
-checkpoint or its reported results.
+Older checkpoints remain directly loadable for evaluation. Resuming a legacy checkpoint preserves its original optimizer layout and constant learning rate; changing encoder freezing, the optimizer, weight decay, or the learning rate schedule requires starting a new run (or initializing from weights where supported). Resuming also follows each branch's existing RNG and data-ordering behavior.
