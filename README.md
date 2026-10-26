@@ -1,88 +1,51 @@
 # Crop support: four controlled continuations in two Kaggle sessions
 
-Branch: `exp/crop-recall-preservation`, from context-crop-pyramid `2b40528`.
-All runs start INDEPENDENTLY from the FULL B/mild_focus counter5 checkpoint.
-They retain Adam/scaler state, LR1e-5, frozen vision/text, group weights, sampler,
-seed42 and batch6. Train counters6-10 only: five more epochs,30total with parent20.
-No run starts from another run, the crop10 checkpoint, C/D, or original parent20.
+Branch: `exp/crop-recall-preservation`, branched from `exp/context-crop-pyramid` at `2b40528`. All four runs start independently from the full `mild_focus` (B) counter-5 checkpoint (`B5`), retaining its Adam and AMP scaler state, learning rate of `1e-5`, frozen vision and text encoders, group weights, balanced sampler, seed 42, and global batch size of 6. Each run trains counters 6 through 10 (5 additional epochs, or 30 total epochs including the original 20-epoch parent).
 
-No new inference parameters or inputs. No inference crops, teacher or GT are
-needed. Reference state exists only in training/full checkpoints of retain runs.
+No new inference parameters, inputs, or test-time crops are introduced. In the retention variants, the frozen `B5` reference state exists only during training and inside full training checkpoints.
 
 ## Why these experiments
 
-The completed crop25 run improved tiny/medium validation IoU by2.51/2.45pp versus
-matched B10, but lost3.17pp on large regions; large recall88.28->83.42%.
-Unchanged B5->B10 training reduced small/medium accuracy. These runs test the
-crop dose and two targeted responses to missed large foreground, not more epochs.
+In `exp/context-crop-pyramid`, the `crop25` continuation improved tiny and medium validation IoU by 2.51 pp and 2.45 pp over the matched `B10` control, but lost 3.17 pp on large regions as large-region recall dropped from 88.28% to 83.42%. Conversely, continuing `B5` to `B10` without crops reduced small and medium IoU. These four runs test whether a smaller crop dose (`0.10`) or targeted large-region support on uncropped large images can preserve large-object recall while keeping the small and medium gains:
 
-| Session | Folder / --variant | Crop probability | Large/full retention | Large/full final overlap |
+| Session | Folder / `--variant` | Crop probability | Large/full retention | Large/full final overlap |
 |---|---|---:|---|---|
-|1|low_crop|0.10|None|Dice (unchanged)|
-|1|retain|0.25|One-sided B5 foreground penalty, weight1|Dice (unchanged)|
-|2|recall|0.25|None|Tversky: FP0.3 / FN0.7|
-|2|retain_recall|0.25|Same retention, weight1|Same Tversky|
+| 1 | `low_crop` | 0.10 | None | Dice (unchanged) |
+| 1 | `retain` | 0.25 | One-sided `B5` foreground penalty, weight 1.0 | Dice (unchanged) |
+| 2 | `recall` | 0.25 | None | Tversky: FP 0.3 / FN 0.7 |
+| 2 | `retain_recall` | 0.25 | Same retention, weight 1.0 | Same Tversky |
 
-The optional `control` variant replays the previous crop25 recipe; it is NOT run
-by default because its result already exists. This is a fixed set of hypotheses,
-not a hyperparameter sweep or an established winning combination.
+An optional `control` preset reproduces the `crop25` recipe and is omitted from the two sessions because its results already exist.
 
 ### Scope and exact objectives
 
-Group labels/weights use the ORIGINAL uncropped nearest-resized TRAIN mask.
-The support scope S is source foreground area>=10% AND crop_applied==0. Therefore
-an originally tiny crop that becomes large is NEVER treated as a large image.
-Large images that really are cropped use the original objective as well.
+Size-group labels and weights use the original uncropped nearest-resized training mask. The large-region support scope `S` consists of training samples whose source foreground area is `>=10%` and that are not cropped (`crop_applied == 0`). Thus, an originally tiny target that fills a cropped view is never placed in `S`, and large images that do get cropped use the standard objective.
 
-Baseline per-image loss L_B: final BCE+0.5Dice plus the original auxiliary
-BCE+Dice heads. Only the final overlap on S changes for recall variants:
+Let `L_B` be the baseline per-image loss: final `BCE + 0.5 * Dice` plus the three auxiliary `BCE + Dice` heads. In the `recall` variants, only the final overlap term on `S` is replaced with asymmetric [Tversky loss](https://arxiv.org/abs/1706.05721) (`FP = 0.3`, `FN = 0.7`):
 
     T = (TP+1)/(TP + 0.3*FP + 0.7*FN + 1)
     D = (2*TP+1)/(2*TP+FP+FN+1)
     L_recall = L_B + 0.5*(D-T) on S; L_B elsewhere
 
-This is a REPLACEMENT of final Dice, not an extra duplicate BCE/Tversky loss.
-All auxiliary terms stay exactly unchanged. These are soft pixel sums in FP32,
-with the existing loss's smoothing constants. More FN penalty can also increase
-false positives; large precision/IoU must be checked along with recall.
-[Tversky](https://arxiv.org/abs/1706.05721) provides the established FP/FN tradeoff.
+All auxiliary heads remain unchanged. Because weighting false negatives more heavily (`0.7` vs. `0.3`) can increase false positives, inspect large-region precision and IoU alongside recall.
 
-For retention, K is GT-positive AND frozen B5 logit>0 AND S:
+For the `retain` variants, let `K` be the pixels on an image in `S` that are ground-truth foreground and where the frozen `B5` logit is positive (`> 0`):
 
     keep(image) = mean_K relu(sigmoid(B5)-sigmoid(student))^2
     L_retain = L_B + 1.0*keep
     L_retain_recall = L_recall + 1.0*keep
 
-Empty K gives0; normalize per image. Teacher false positives/missed positives are
-not protected. No penalty for exceeding parent confidence. This encourages a
-probability floor, not guaranteed binary recall or perfect localization.
-The idea is related to [Learning without Forgetting](https://arxiv.org/abs/1606.09282);
-it is not a claim to invent distillation. The prior C result remains negative
-for its tested recipe; applying it during crop drift is a NEW hypothesis.
+If `K` is empty, `keep(image)` is `0`. The penalty is normalized per image. Teacher false positives and false negatives are not penalized, and the student is not penalized for exceeding `B5` confidence (see [Learning without Forgetting](https://arxiv.org/abs/1606.09282)). While a similar foreground penalty in `exp/parent-preserving-pyramid` did not improve uncropped training from the 20-epoch parent, here it specifically targets large-region recall drift induced by context cropping.
 
-The B5 reference copies ONLY post-encoder modules (~6.65M parameters), excluding
-CLIP vision/text. Encoder outputs are shared within the student's ONE forward.
-Reference runs eval/no_grad, outside DDP/optimizer/model_state_dict. Its AMP-shared
-features can differ near thresholds from separate FP32 evaluation. Resume restores
-the ORIGINAL B5 body from support_state, never reanchors to the current student.
-Low_crop/recall allocate no teacher. All variants keep the same inference model.
+The `B5` reference copies only the post-encoder modules (~6.65M parameters), sharing the frozen CLIP vision and text encoder outputs computed during the student's forward pass. The reference runs in `eval()` / `no_grad` mode outside DDP, the optimizer, and `model_state_dict`. Resuming a `retain` checkpoint restores the original `B5` body from `support_state` rather than re-anchoring to the current student. `low_crop` and `recall` do not allocate a reference module.
 
 ### Crop policy
 
-Same crop geometry as the completed crop25 experiment: choose a native-RGB
-window preserving all TRAIN GT components, source aspect ratio (pixel rounding
-aside), bbox context and jittered position. Side fraction is between35% and90%,
-with bbox/context constraints; infeasible or empty masks fall back to full image.
-RGB/mask coordinates match BEFORE336/768views and existing CLIP normalization.
-Only crop probability differs for low_crop. Actual crop rate is below requested
-rate because most large GT extents cannot satisfy the context window.
+All variants use the same crop geometry as `exp/context-crop-pyramid`: a source-aspect-ratio window on the native upright RGB image and mask that retains all ground-truth foreground components plus 25% bbox padding and jittered positioning, with window side fraction sampled between 35% and 90% before building the 336 and 768 views. Infeasible or empty masks fall back to the full image. Only the crop attempt probability changes for `low_crop` (`0.10` vs. `0.25`).
 
-## Cell 1 — Setup (both sessions)
+## Cell 1: Setup (both sessions)
 
-Use a fresh Kaggle session with Internet, two GPUs, VizWiz and the FULL B5
-checkpoint attached. Result ZIPs exclude .pt; raw weights cannot resume Adam.
-Optionally attach previous A/B10 and crop10 results, extracted OR zipped, for matched comparison.
-Keep checkpoints mounted in /kaggle/input rather than copying into outputs.
+Start a fresh Kaggle session with Internet and two GPUs enabled, and attach the VizWiz dataset and the full `B5` checkpoint (`mild_focus/checkpoint_epoch5.pt`). Optionally attach the completed `size_weighted_pyramid_two_runs_ep10_seed42` and `context_crop_pyramid_ep10_seed42` results (as extracted directories or `.zip` archives) for comparison in Cell 4. Use `train_group.py` rather than `train.py`.
 
 ```python
 !git clone --single-branch --branch exp/crop-recall-preservation https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
@@ -90,14 +53,11 @@ Keep checkpoints mounted in /kaggle/input rather than copying into outputs.
 !uv sync --frozen
 ```
 
-Already cloned on this branch: `!git pull --ff-only`, then `!uv sync --frozen`.
-Run `train_group.py`, not `train.py`.
+If already cloned on this branch, run `!git pull --ff-only` followed by `!uv sync --frozen`.
 
-## Cell 2 — Choose session and B5
+## Cell 2: Choose session and B5
 
-Set SESSION=1 for low_crop+retain. In a SECOND fresh session, set SESSION=2 for
-recall+retain_recall and repeat cells1-5. Auto-detect B5 by metadata, not filename;
-set B_CKPT explicitly if several copies are attached. Load only trusted files.
+Run `SESSION = 1` (`low_crop` and `retain`) in the first Kaggle session, then run `SESSION = 2` (`recall` and `retain_recall`) in a second fresh session using Cells 1 through 5. The script verifies `B5` from its checkpoint metadata; set `B_CKPT` explicitly if multiple copies are mounted.
 
 ```python
 import gc
@@ -184,13 +144,9 @@ print('B5:', path)
 print('Runs:', os.environ['RUN_VARIANTS'])
 ```
 
-One experiment selector: `--variant`. JSON overrides CLI then defaults. Presets
-replace the previous standalone crop-probability flag; probability/retention/FN
-weights are fixed and versioned to avoid an accidental sweep or hidden overrides.
-The existing optimizer/LR/freeze flags and JSON precedence remain available.
-Do not change these training settings between the prescribed runs.
+The `--variant` flag (and `"variant"` in JSON, with JSON taking precedence over CLI) selects the versioned recipe preset (`crop_probability`, `retention_weight`, and `large_fp_weight`). Keep all optimizer, learning rate, and freezing settings identical across variants.
 
-## Cell 3 — Two independent runs, then evaluate
+## Cell 3: Two independent runs, then evaluate
 
 ```bash
 %%bash
@@ -243,38 +199,13 @@ uv run --frozen python diagnose.py \
     --output-dir "$RUN_ROOT/reference/diagnostic_ep5"
 ```
 
-Commands are sequential independent processes. Preflight updates are discarded;
-training reloads the SAME B5 for every variant, including its optimizer/scaler.
-`num-epochs10` means five new epochs, not ten new epochs or fresh training.
-No validation inside training; full-image FP32 eval/diagnostic runs afterward.
-Use EVAL_BATCH=1 if batch4 exceeds memory. Test needs local GT; choose using val.
+Each command runs in a fresh subprocess. Preflight discards its temporary updates, and `train_group.py` reloads the untouched `B5` checkpoint for each variant (`--num-epochs 10` runs counters 6 through 10). Full-image FP32 validation and diagnostics run after training completes. Lower `EVAL_BATCH` to `1` if batch size 4 exceeds GPU memory.
 
-Each session writes ONLY two new `outputs/<variant>/checkpoint_epoch10.pt` files.
-No checkpoints6-9, copied5, duplicate final weights or checkpoint deletion.
-Retain checkpoints include only an extra post-encoder reference (~26.6MB FP32
-parameters plus small buffers), not a second backbone. Both frozen encoders are
-still stored in every full checkpoint; leave enough disk for both files.
+Each session writes two checkpoint files (`outputs/<variant>/checkpoint_epoch10.pt`). In `retain` and `retain_recall`, the checkpoint includes the post-encoder `B5` reference (~26.6 MB in FP32) alongside the student model and frozen encoders. If a run is interrupted before counter 10, clear its output directory and restart that variant from `B5` (if the first variant in the session already finished, set `RUN_VARIANTS` to run only the second variant).
 
-If interrupted before10, restart the failed variant from B5 in a fresh folder;
-there is no intermediate checkpoint by design. If the first run completes, set
-RUN_VARIANTS to only the failed second run before rerunning Cell3. The reference
-may be reevaluated. For an own-branch checkpoint resume, keep the SAME variant;
-its original reference is restored from support_state, not reset. Previous
-crop/C/D optimizer checkpoints are rejected; old weights still evaluate normally.
+## Cell 4: Compare both runs with B5 and existing B10/crop25
 
-Two five-epoch runs per session are the intended budget. CPU checks do not prove
-Kaggle runtime/VRAM/disk fit; if necessary run one variant per available session.
-Do not shorten one run only and call it a matched comparison.
-
-## Cell 4 — Compare both runs with B5 and existing B10/crop25
-
-Attach the existing results and set BASELINE_RESULTS/CROP_RESULTS in Cell2,
-or leave them empty for auto-detection by the two directory names above.
-Both extracted directories (including the vizwiz-exp layout in the screenshot)
-and ZIP files work. They are read directly; no extra inference or extraction.
-B_CKPT already uses the supplied vizwiz-size-weighted-pyramid-cp/mild_focus path;
-the natural checkpoint and original parent20 are not used by these four runs.
-Without them the table is provisional: B5 has five fewer training epochs.
+If the previous `B10` and `crop25` result folders or ZIP files are attached, Cell 2 auto-detects them (or you can set `BASELINE_RESULTS` and `CROP_RESULTS` explicitly) so this script can include them directly in the comparison table.
 
 ```python
 import csv
@@ -363,28 +294,19 @@ with comparison.open('w', newline='') as handle:
 print(comparison.read_text())
 ```
 
-### Decision rule
+### Decision criteria
 
-Evaluate tiny AND medium IoU, large recall/precision/IoU and overall mean IoU.
-Compare low_crop with B10 and crop25 to understand the dose tradeoff. Compare
-retain/recall/retain_recall directly with crop25, and with each other, at SAME
-30total epochs. B5 is the working checkpoint reference, not a matched-budget
-control. Prior seed42 values:
+Compare `low_crop` against `B10` and `crop25` to evaluate the crop-probability tradeoff, and compare `retain`, `recall`, and `retain_recall` against `crop25` at the matched 30-epoch budget (`B5` serves as the 25-epoch starting reference). Seed-42 validation reference numbers:
 
 | Reference | Val mean | Tiny | Medium | Large | Large recall |
 |---|---:|---:|---:|---:|---:|
-| B5 |66.1693|19.5605|47.8303|79.4138|87.5861|
-| B10 |66.0497|18.8439|46.8101|79.7930|88.2752|
-| crop25+10 |64.9561|21.3502|49.2588|76.6254|83.4239|
+| `B5` | 66.1693 | 19.5605 | 47.8303 | 79.4138 | 87.5861 |
+| `B10` | 66.0497 | 18.8439 | 46.8101 | 79.7930 | 88.2752 |
+| `crop25+10` | 64.9561 | 21.3502 | 49.2588 | 76.6254 | 83.4239 |
 
-A useful candidate should recover the crop large-region deficit while retaining
-small/medium gains. Neither greater recall alone nor global IoU alone is success.
-Do not select using test, declare a winner from one seed, or extend epochs just
-because train loss falls. No new sample annotations or validation-based training
-weights are used. Four exploratory comparisons increase selection optimism;
-additional matched seeds are needed after selecting a recipe.
+Look for candidates that recover the large-region recall and IoU drop relative to `crop25+10` while preserving the tiny and medium IoU gains. Select recipes using validation metrics only.
 
-## Cell 5 — ZIP results, exclude checkpoints
+## Cell 5: ZIP results, exclude checkpoints
 
 ```python
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -399,31 +321,13 @@ print('Download results:', archive)
 print('Keep the two full checkpoint_epoch10.pt files separately.')
 ```
 
-ZIP includes configs/session plan, histories6-10, val/test masks and metrics,
-diagnostics, B5 reference and comparison; no .pt/.tmp/nested.zip files.
-Save each session ZIP under its distinct s1/s2 name.
+Each session archive (`crop_support_s1_ep10_seed42.zip` and `crop_support_s2_ep10_seed42.zip`) packages the session plan, configs, training histories for counters 6 through 10, validation and test masks and metrics, diagnostics, the `B5` reference evaluation, and `support_comparison.csv`, excluding `.pt`, `.tmp`, and nested `.zip` files.
 
-## Logging, compatibility and implementation checks
+## Logging and compatibility
 
-`train_loss` / `proposal_loss` include the active support terms. The original
-mixed full/crop segmentation loss remains available as
-`base_segmentation_objective` and `loss_<group>`. The relationship is:
+In `history.jsonl`, `train_loss` and `proposal_loss` include the active support terms, while the unadjusted mixed full/crop segmentation loss is logged as `base_segmentation_objective` and `loss_<group>`:
 
     train_loss = base_segmentation_objective
                  + retention_objective_contribution + recall_objective_delta
 
-recall_objective_delta is SIGNED (Tversky replacement can be below Dice). A lower
-scalar objective alone is not evidence of better segmentation. Retention support
-logs `retention_shortfall_large`, `protected_coverage_large`, and
-`support_fraction_large`; teacher-free recipes have zero protected coverage.
-Crop request/applied/input-area logs retain their original source-group meaning.
-Source mask groups, all recipe constants, B5 file hash, reference state, data and
-source-code hashes are saved. Subsequent resume validates recipe/policy and
-requires support_state; it cannot silently drop or reset a reference.
-
-The optional control preset must reproduce old crop25 training (same model,
-optimizer and scaler) on a fixed CPU fixture. The model encoder/body split keeps
-state keys and FP32 outputs unchanged. Reference forwards never re-run frozen
-encoders. ContextCrop remains independent of backbone feature dimensions.
-All checks are CPU/synthetic execution checks, not real Kaggle accuracy/fit or
-cross-backbone validation. No changes are made to prior experimental branches.
+Note that `recall_objective_delta` is signed because the Tversky term can be smaller than the Dice term it replaces. Retention variants log `retention_shortfall_large`, `protected_coverage_large`, and `support_fraction_large` (`protected_coverage_large` is zero for teacher-free recipes). Per-group crop request, applied, and input-area fractions retain the same definitions as in `exp/context-crop-pyramid`. Checkpoints record the source mask-group digest, recipe constants, `B5` file hash, and `support_state` so subsequent resumes verify the exact recipe and restore the original `B5` reference.
