@@ -1,24 +1,12 @@
 # Size-weighted pyramid: resume A/B from +5 to +10
 
-Branch: `exp/size-weighted-pyramid`. This session continues the completed
-`natural` (A) and `mild_focus` (B) runs independently, preserving their optimizer,
-AMP scaler, frozen encoders, loss, sampling, seed and learning rate.
-Use `train_group.py`, not `train.py`.
+Branch: `exp/size-weighted-pyramid`. This workflow resumes the completed `natural` (A) and `mild_focus` (B) continuation runs from epoch +5 to epoch +10 independently, preserving each run's optimizer state, AMP scaler, frozen encoders, loss weights, balanced sampler, seed, and constant learning rate. Use `train_group.py` rather than `train.py`.
 
-`--num-epochs 10` is the final continuation counter: train epochs6-10 only.
-Including the original pyramid's20epochs, this reaches30total epochs.
-Do not pass30, use `--init-checkpoint`, or initialize B from A.
-The original parent20 file is not needed for this session.
+Passing `--num-epochs 10` sets the final continuation counter so each run trains epochs 6 through 10 only (reaching 30 total epochs when counting the original 20-epoch parent pyramid). Because both runs resume from their own `checkpoint_epoch5.pt` files via `--resume-checkpoint`, the original 20-epoch parent checkpoint is not needed for this session.
 
-The existing resume implementation already supports this constant-LR extension;
-no model, objective, checkpoint-format or default behavior change is required.
+## Cell 1: Setup
 
-## Cell 1 — Setup
-
-Use a fresh Kaggle session with Internet and two GPUs. Attach VizWiz and the
-TWO FULL A/B `checkpoint_epoch5.pt` files, keeping their folder names if possible.
-The previous results ZIP intentionally excludes checkpoints; it cannot resume
-training. Raw model weights and C/D checkpoints are also not valid substitutes.
+Start a fresh Kaggle session with Internet and two GPUs enabled. Attach the VizWiz dataset and both full A and B `checkpoint_epoch5.pt` files (the previous results ZIP excludes `.pt` files and cannot be used to resume training).
 
 ```python
 !git clone --single-branch --branch exp/size-weighted-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
@@ -26,15 +14,11 @@ training. Raw model weights and C/D checkpoints are also not valid substitutes.
 !uv sync --frozen
 ```
 
-If already cloned on this branch, use `!git pull --ff-only` and `!uv sync --frozen`.
-No notebook file or separate personal guide is required.
+If the repository is already cloned on this branch, run `!git pull --ff-only` and `!uv sync --frozen`.
 
-## Cell 2 — Locate A/B and restore their configurations
+## Cell 2: Locate A/B and restore their configurations
 
-This identifies A/B from checkpoint metadata, not folder names. Set INPUT_ROOT
-to a narrower mounted dataset folder if several copies are attached. If multiple
-valid A or B files remain, set the corresponding path in `selected` explicitly.
-Only load checkpoints you trust.
+This script identifies the A (`natural`, `focus_alpha = 0.0`) and B (`mild_focus`, `focus_alpha = 0.25`) checkpoints from their saved metadata rather than folder names. If multiple matching checkpoints are mounted under `/kaggle/input`, narrow `INPUT_ROOT` or set explicit paths in `selected`.
 
 ```python
 import gc
@@ -127,16 +111,11 @@ for run in selected:
 print(json.dumps(selected, indent=2))
 ```
 
-Config overrides CLI, then defaults. Here loss settings are copied from each
-checkpoint, and the trainer verifies that resume settings/data match. Each run
-continues its OWN optimizer and epoch-indexed sampling; nothing is reset to A/B's
-initial parent. Both encoders remain frozen; only CNN/fusion/decoder train.
+JSON config values take precedence over CLI flags, which take precedence over defaults. Here the loss settings are restored directly from each checkpoint's metadata, and the trainer verifies that all resume settings and dataset hashes match. Each run continues its own optimizer state and epoch-indexed sampling with both encoders frozen.
 
-## Cell 3 — One session: A then B, train and evaluate
+## Cell 3: One session: A then B, train and evaluate
 
-Each command is a separate process. Preflight uses a temporary in-memory copy
-of the resumed state; its updates are discarded. Training reloads the mounted
-checkpoint. No checkpoint is copied to outputs.
+Each command runs as a separate process. Preflight tests a temporary in-memory copy of the resumed state and discards its updates, after which `train_group.py` reloads the mounted checkpoint from `/kaggle/input`.
 
 ```bash
 %%bash
@@ -194,24 +173,16 @@ for run in natural mild_focus; do
 done
 ```
 
-No validation runs inside training. This evaluates after training, at+5 and+10,
-with FP32 inference. Test metrics require local GT; select recipes/checkpoints
-using validation only. Set EVAL_BATCH=1 if evaluation batch4 exceeds VRAM.
+Validation runs after training finishes, evaluating both +5 and +10 checkpoints in FP32 at native mask resolution. Use validation metrics for checkpoint selection; lower `EVAL_BATCH` to `1` if batch size 4 exceeds GPU memory.
 
-Only TWO new checkpoint files are written:
+This workflow writes two new checkpoint files:
 
 - `outputs/natural/checkpoint_epoch10.pt`
 - `outputs/mild_focus/checkpoint_epoch10.pt`
 
-No checkpoints6/7/8/9, copied epoch5 or duplicate final weights are saved.
-No old checkpoints are deleted. Keep the mounted epoch5 files separately.
-If interrupted before10, that run restarts from5. If A completes but B fails,
-rerun Cell3 with `for run in mild_focus; do`, using a fresh B output folder if
-partial history exists. Do not rerun completed A into its existing folder.
-The session budget/VRAM/disk requirements still depend on Kaggle hardware;
-CPU verification does not establish that it fits every session limit.
+Intermediate epochs (6 through 9), duplicate epoch-5 copies, and extra final weight files are not written. Keep the mounted epoch-5 checkpoints separately. If a run is interrupted before epoch 10, restart that run from epoch 5 in a clean output folder. If `natural` (A) completes and `mild_focus` (B) fails, rerun Cell 3 with `for run in mild_focus; do` after clearing any partial files in `outputs/mild_focus`.
 
-## Cell 4 — Compare +5 versus +10
+## Cell 4: Compare +5 versus +10
 
 ```python
 import csv
@@ -258,13 +229,9 @@ with comparison.open('w', newline='') as handle:
 print(comparison.read_text())
 ```
 
-Judge whether more training helps each run, including both smaller groups and
-large-region regressions. Keep parent20 as a fixed reference: val65.7663%,
-small19.4521%, medium46.2369%, large79.5730% for the supplied seed42 run.
-Do not automatically extend to+20 or select the best test score. A/B are close
-at+5; neither is a proven multi-seed winner.
+Compare +5 and +10 across small, medium, and large ground-truth area groups as well as overall validation mean IoU. For reference, the seed-42 20-epoch parent pyramid scores 65.7663% validation mean IoU (19.4521% small, 46.2369% medium, 79.5730% large).
 
-## Cell 5 — ZIP results, exclude checkpoints
+## Cell 5: ZIP results, exclude checkpoints
 
 ```python
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -279,29 +246,19 @@ print('Download results:', archive)
 print('Keep both checkpoint_epoch10.pt files separately for future resume.')
 ```
 
-Includes configs, continuation provenance, history6-10, val/test predictions and
-metrics for5/10, diagnostics and comparison CSV. No .pt/.tmp/nested.zip files.
+The archive contains configuration files, continuation metadata, training history for epochs 6 through 10, validation and test predictions and metrics for counters 5 and 10, diagnostics, and `continuation_comparison.csv`, while excluding `.pt`, `.tmp`, and nested `.zip` files.
 
 ## Objective and compatibility
 
-Weights are derived from TRAIN mask frequencies p:
+Group proposal weights are interpolated from the training split's mask-size frequencies `p`:
 
     weights = (1 - focus_alpha) * p + focus_alpha * (0.5, 0.5, 0)
 
-| Run | focus_alpha | Small / medium / large weights (current train set) |
+| Run | `focus_alpha` | Small / medium / large weights (current train set) |
 |---|---:|---|
-| natural (A) |0|3.83% /25.81% /70.36%|
-| mild_focus (B) |0.25|15.38% /31.86% /52.77%|
+| `natural` (A) | 0 | 3.83% / 25.81% / 70.36% |
+| `mild_focus` (B) | 0.25 | 15.38% / 31.86% / 52.77% |
 
-The balanced sampler is unchanged; A represents the natural-frequency objective
-with stratified sampling, not the original pyramid training recipe.
-`--focus-alpha` defaults0.25; projection defaultsfalse on this branch. JSON takes
-precedence over CLI. Architecture and inference parameters are unchanged.
-Old parent/scale weights remain usable for initialization/inference, but optimizer
-resume requires `size-weighted-updates-v1` with matching loss, alpha, data,
-optimizer, freeze policy, seed, world size, batch and accumulation.
+Both runs use the balanced group sampler, so `natural` (A) pairs natural-frequency loss weighting with stratified group sampling. On this branch, `--focus-alpha` defaults to `0.25` and gradient projection defaults to `False`. Model architecture and inference parameters are unchanged. Full optimizer resume requires a `size-weighted-updates-v1` checkpoint with matching loss configuration, `focus_alpha`, dataset hash, optimizer, encoder freezing policy, seed, world size, batch size, and gradient accumulation steps.
 
-For a fresh A/B experiment, use the same configs/common settings with
-`--init-checkpoint` pointing to original parent20 and `--num-epochs 5 --save-every 5`.
-That is independent initialization with a fresh optimizer, not this continuation.
-Do not use C/D full checkpoints on this branch.
+To start a fresh 5-epoch A/B experiment from the original 20-epoch parent checkpoint instead of continuing from epoch 5, pass `--init-checkpoint` pointing to the parent `checkpoint_epoch20.pt` along with `--num-epochs 5 --save-every 5`.
