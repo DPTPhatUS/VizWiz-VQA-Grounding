@@ -1,4 +1,4 @@
-# VizWiz VQA Grounding — compact-decoder
+# VizWiz VQA Grounding: compact-decoder
 
 Uses residual fusion, fixed joint-text skip conditioning, and a compact decoder with depthwise-separable blocks. This checkout runs the `exp/compact-decoder` model through `train.py` and `eval.py`.
 
@@ -21,9 +21,9 @@ uv run eval.py --checkpoint outputs/compact-decoder/checkpoint_epoch100.pt --dat
 
 Training also supports `--lr`, `--num-workers`, `--seed`, `--resume-checkpoint`, `--validate-every`, and `--save-every`. Set `--save-every 0` to save only the final model; validation defaults to disabled. Use `torchrun` for distributed training. Evaluation requires a checkpoint and supports `--device`, `--batch-size`, and `--num-workers`; use `--dataset test` for the test split.
 
-Checkpoints retain the branch architecture identity and load strictly. Use a checkpoint from this experiment.
+Checkpoints record the branch architecture and load with strict key matching. Use a checkpoint trained on this branch.
 
-Compact checkpoints use `conditioning: joint`. Separate question/answer conditioning belongs to `exp/separate-qa-skips`.
+Compact checkpoints use `conditioning: joint`. Separate question/answer conditioning is implemented on `exp/separate-qa-skips`.
 
 ## Project
 
@@ -33,10 +33,7 @@ Licensed under [Creative Commons Attribution 4.0 International](http://creativec
 
 ## Encoder freezing and optimization
 
-Omitting the options below preserves this branch's existing training behavior:
-Adam, LR `1e-5`, zero weight decay, no LR schedule, and the branch's original
-encoder freezing policy. Freezing is opt-in; the detail CNN and decoder remain
-trainable. No model/state-dict keys or evaluation preprocessing change.
+Omitting the options below keeps this branch's default training setup: Adam, learning rate `1e-5`, zero weight decay, constant learning rate, and the default encoder freezing policy. Freezing is opt-in, and the detail CNN and decoder always remain trainable. Model state-dict keys and evaluation preprocessing are unchanged.
 
 | Option | Values / default |
 | --- | --- |
@@ -53,15 +50,9 @@ trainable. No model/state-dict keys or evaluation preprocessing change.
 | `--poly-power` | Positive exponent for `poly`; default `0.9` |
 | `--config` | Flat JSON with training options; optional |
 
-`BOOL` accepts `True` or `False`; a freeze flag without a value means `True`.
-The aliases `--no-freeze-backbone`, `--no-freeze-vision-encoder`, and
-`--no-freeze-text-encoder` mean `False`. An explicit component setting overrides
-`freeze_backbone` within the same source. **JSON config > explicit CLI > branch
-defaults**: a config shorthand also overrides component flags on the CLI.
-Existing recipe/loss settings can share the same JSON; unsupported keys fail
-early. Existing branch-specific flags remain available through `train.py --help`.
+`BOOL` accepts `True` or `False`; passing a freeze flag without a value sets it to `True`. The negative flags `--no-freeze-backbone`, `--no-freeze-vision-encoder`, and `--no-freeze-text-encoder` set the corresponding option to `False`. Within the same source, a specific encoder flag overrides `freeze_backbone`. Precedence follows JSON config, then explicit CLI flags, then branch defaults, so a JSON config value also overrides CLI flags. Existing recipe and loss settings can share the same JSON file, and unrecognized keys raise an error immediately. See `train.py --help` for branch-specific flags.
 
-Append, for example, to this branch's existing training command:
+For example, append these flags to the training command:
 
 ```bash
 --freeze-backbone True \
@@ -73,12 +64,7 @@ Append, for example, to this branch's existing training command:
 --min-lr-ratio 0.1
 ```
 
-This is a configurable experiment example, not a validated best hyperparameter
-setting. To freeze only vision while retaining the text policy, append
-`--freeze-vision-encoder True`. To explicitly train both encoders, use
-`--freeze-backbone False`. Models with a deliberately fixed reference stage
-(gain-guided refinement) reject encoder unfreezing to preserve that algorithm.
-Unused CLIP/SigLIP pooled-output parameters stay frozen when unfreezing token encoders.
+To freeze only the vision encoder while keeping the default text policy, pass `--freeze-vision-encoder True`. To train both encoders, pass `--freeze-backbone False`. Gain-guided refinement models keep their reference stage fixed and reject encoder unfreezing. Unused CLIP and SigLIP pooled-output parameters stay frozen when token encoders are unfrozen.
 
 Equivalent JSON (`--config path/to/train.json`):
 
@@ -94,19 +80,6 @@ Equivalent JSON (`--config path/to/train.json`):
 }
 ```
 
-Frozen encoders stay in eval mode during training and are excluded from the
-optimizer when a freezing option is set. LR schedules advance after successful
-optimizer updates, including gradient accumulation; AMP overflow skips do not
-advance them. Checkpoints save the resolved optimization settings, trainable
-parameter layout and schedule progress. Resume restores these settings and
-rejects conflicting options. For scheduled runs, keep the original total
-`--num-epochs`, loader length and accumulation so the LR trajectory is unchanged.
+Frozen encoders stay in `eval` mode during training and are excluded from the optimizer. Learning rate schedules step after each completed optimizer update (accounting for gradient accumulation) and do not advance when AMP skips an overflowing step. Checkpoints store the resolved optimization config, trainable parameter layout, and scheduler state; resuming restores these settings and rejects conflicting flags. When resuming a scheduled run, keep `--num-epochs`, dataset length, and gradient accumulation unchanged to preserve the learning rate schedule.
 
-Old checkpoints still load for evaluation with the same architecture and
-weights. Full legacy resume keeps its original optimizer layout and constant
-LR behavior; changing freezing, optimizer, decay or enabling a new LR schedule
-requires a new run (or an explicit weights-only initialization where supported).
-Resume retains each branch's existing RNG/data-order policy; legacy branches
-that do not save or reconstruct RNG state do not guarantee bitwise replay.
-No freezing/optimization change retroactively changes a previously trained
-checkpoint or its reported results.
+Existing checkpoints remain compatible with evaluation. Resuming a legacy checkpoint keeps its original optimizer layout and constant learning rate; changing encoder freezing, optimizer type, weight decay, or learning rate schedule requires starting a new run (or initializing from weights only where supported). Resuming follows each branch's RNG and data-order handling.
