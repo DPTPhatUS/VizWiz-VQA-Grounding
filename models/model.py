@@ -102,7 +102,7 @@ class GroundingModel(nn.Module):
         text = self.text_encoder(questions)
         return features, text
 
-    def decode_features(self, batch, features, text):
+    def decode_features(self, batch, features, text, *, return_detail=False):
         """Run the original trainable pyramid body on already encoded features."""
         detail_image = batch["detail_image"]
         question = masked_mean(text.tokens, text.valid_mask)
@@ -128,7 +128,10 @@ class GroundingModel(nn.Module):
             (*features[:3], fused), question, detail, detail_question, self._run
         )
         final = self._run(self.refiner, logits, semantic, detail[-1], detail_question)
-        return {"logits": final, "auxiliary_logits": auxiliary}
+        output = {"logits": final, "auxiliary_logits": auxiliary}
+        if return_detail:
+            output["detail_features"] = detail[-1]
+        return output
 
     def forward(self, batch: dict) -> dict:
         features, text = self.encode_inputs(batch)

@@ -1,281 +1,343 @@
-# Pyramid weight interpolation: export all models, then evaluate (no training)
+# OCR evidence pyramid
 
-Branch: `exp/pyramid-weight-interpolation`. One Kaggle evaluation session.
-Use the FULL B/mild_focus epoch5 and FULL low_crop epoch10 checkpoints.
-Do NOT use original parent20, A/natural, crop25, retain or retain_recall.
+Branch: `exp/ocr-evidence-pyramid`.
 
-    body(alpha) = (1-alpha)*body(B5) + alpha*body(low_crop10)
+Keep the exact B +5 / mild_focus epoch5 pyramid frozen. Train a small OCR evidence
+adapter to refine regions supported by native-image text proposals. This tests
+whether explicit evidence localization improves small and medium targets without
+sacrificing whole-object grounding. Accuracy and transfer are hypotheses, not
+established results.
 
-The default grid is0,0.1,0.25,0.5,1: FIVE independent weights-only files are saved,
-including exact endpoints. No optimizer, AMP scaler, frozen reference or epoch
-counter is stored. Every file is a complete single inference model, with the
-same number of parameters as the original pyramid. These are not full training
-resumes. Frozen encoders and ALL non-trainable buffers must match bit-for-bit;
-normalization buffers are copied, not averaged. Source hashes and provenance
-are included in every exported model and in interpolation.json.
+## Architecture
 
-This is an established parameter-averaging direction, motivated by
-[Model Soups](https://proceedings.mlr.press/v162/wortsman22a.html), not a claim of
-novelty or guaranteed VizWiz improvement. The goal is to test whether part of
-low_crop's small/medium benefit can be retained nearer the stronger B5 model.
-It does not by itself solve the persistent hard localization cases.
-
-## Storage and checkpoint policy
-
-All five models are saved; the script does NOT keep only the validation winner.
-Each still includes both encoders, so weights-only is not a tiny decoder file.
-The exporter measures actual tensor storage and free disk AFTER uv sync,
-with an explicit14GiB budget cap (about15GB) even if the filesystem reports
-more space than the Kaggle working-directory quota. It uses the LOWER of
-physical free space and that cap, reserving2GiB for masks, metrics, ZIP and serialization overhead. It prints the
-estimated size/file and maximum file count under this conservative budget.
-It rejects a grid that will not fit BEFORE writing any .pt files.
-
-With roughly15GB available, the default five-model grid is the starting setup;
-actual fit depends on the measured checkpoint size. To save six coefficients,
-add0.75 to ALPHAS in Cell2 (endpoints are always included). No files are deleted
-or silently dropped. Do not lower the reserve just to fill the disk completely.
-Existing output folders are never overwritten. Input full checkpoints stay in
-/kaggle/input and are not copied into outputs; the exported endpoint files are
-weights-only versions of them.
-
-## Cell 1 — Setup
-
-Attach VizWiz, full B5 and the low_crop checkpoint from session1. Result ZIPs
-contain no .pt and cannot serve as sources. Enable Internet and a GPU; evaluation
-uses one GPU and does not need torchrun. Export itself runs only on CPU.
-
-```python
-!git clone --single-branch --branch exp/pyramid-weight-interpolation https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
-%cd /kaggle/working/VizWiz-VQA-Grounding
-!uv sync --frozen
+```text
+upright RGB + question
+    |
+    +-- frozen B+5 pyramid ---------------------------------> base logits B,1,768,768
+    |       +-- frozen question tokens B,L,768
+    |       +-- frozen high-resolution detail B,16,768,768
+    |
+    +-- frozen mobile OCR, cached once
+            +-- polygons + recognized strings + confidence
+            +-- top 24 candidates, chosen WITHOUT Q/answer/GT
+                    |
+                    +-- native RGB crops B,N,3,48,128 -> shared small CNN
+                    +-- aligned pyramid detail + base-logit crops
+                    +-- geometry / confidence
+                    +-- same frozen CLIP text encoder for OCR strings (full run)
+                            |
+                        candidate features B,N,128
+                            |
+                  candidate queries attend to ALL question tokens
+                            |
+                  candidate self-attention + explicit NULL candidate
+                            |
+                  probabilities B,N+1 (NULL means visual fallback)
+                            |
+                  local signed correction B,N,1,48,128
+                            |
+                  inverse crop mapping within candidate support
+                            |
+final logits = base logits + sum(candidate_probability * local_correction)
 ```
 
-Already cloned on this branch: `!git pull --ff-only`, then `!uv sync --frozen`.
+The production adapter has **293,938 trainable parameters**. This excludes the
+frozen parent and frozen OCR; report all three components when claiming efficiency.
+No second language backbone is instantiated. Only short OCR strings are mean
+pooled; the selector receives the complete question token sequence.
 
-## Cell 2 — Paths and the predeclared alpha grid
+The final correction layer starts at zero: initialization reproduces B+5 exactly.
+Missing OCR gives exact fallback even after training. Nonempty but wrong OCR
+does not have an accuracy guarantee: the model must learn NULL. Corrections can
+add or remove foreground, but only within 1.25x candidate boxes on the 768 grid.
+Native resizing can affect boundary pixels; bounding support does not guarantee
+large-object preservation. OCR polygons are NOT used directly as final masks.
 
-B5 uses your existing mount. Low_crop is auto-detected under a low_crop folder;
-paste its full path into LOW_CROP_CKPT if the upload uses another name/layout.
-Only load trusted checkpoint files.
+The adapter accepts arbitrary text/detail channel dimensions; the current wrapper
+connects the existing CLIP pyramid. Another backbone needs the corresponding
+feature wrapper and training; existing weights are not automatically transferable.
+Cache schema is OCR-provider neutral, with upright native xy coordinates and
+decoded-RGB hashes. No image IDs, answer vocabulary or GT-size gates enter the
+adapter. `predict_ocr.py` supports arbitrary images with no GT files.
+
+## Two matched runs
+
+| Run | Candidate geometry + native appearance | Recognized OCR text |
+|---|---|---|
+| geometry | Yes | No |
+| full | Yes | Yes, same frozen CLIP encoder |
+
+Both start independently from the same B+5 and adapter seed; both parents stay
+frozen. This is adapter training, NOT continuing B+5's optimizer.
+OCR dropout=0.2 removes all candidates for a training image; text dropout=0.2
+removes recognized content while retaining geometry/appearance.
+Defaults: AdamW, LR 1e-4 constant, decay 0.01, global batch 4, accumulation 1,
+FP16 AMP on CUDA, 20 epochs, save every 5, no per-epoch validation.
+All listed training controls can be overridden by flat JSON: **config > CLI > default**.
+Paths stay on CLI. See `uv run train_ocr.py --help`.
+
+Loss: final per-image BCE + 0.5 Dice, plus 0.1 selection and 0.1 local loss.
+Selection uses soft native-GT box Dice across relevant candidates; NULL is
+supervised when all candidate Dice values are below 0.1. Local native-crop
+targets use area downsampling; unrelated candidates do not receive local
+segmentation supervision. This avoids learning a gate solely from whether an
+adapter beats an overfit parent's training predictions. All GT relevance/patch
+targets are dataset-side training fields and are never model inputs.
+This gate threshold is a training relevance definition, not a tuned inference
+threshold. Empty-GT images use NULL.
+
+## Recommended schedule: CPU preparation, then one GPU session
+
+OCR preprocessing may take substantial time on native images. Cache it once in a
+CPU session and attach the resulting dataset in the GPU session. The exact same
+cache is used by both runs. Train time on 2xT4 has not been measured; if two runs do
+not fit one GPU session, split them without changing their configs. Do not reduce
+one run's epochs and call the pair matched.
+
+### Session 1: cache and coverage (CPU, no PyTorch setup needed)
+
+Enable Internet. Attach the VizWiz dataset.
 
 ```python
-import json
+!pip install -q uv
+!git clone --single-branch --branch exp/ocr-evidence-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+%cd VizWiz-VQA-Grounding
+
 import os
-from pathlib import Path
-
-os.environ['DATA_ROOT'] = '/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz'
-os.environ['B_CKPT'] = '/kaggle/input/datasets/khoahoang0512/vizwiz-size-weighted-pyramid-cp/mild_focus/checkpoint_epoch5.pt'
-os.environ['LOW_CROP_CKPT'] = ''  # Full low_crop/checkpoint_epoch10.pt from session1.
-os.environ['RUN_ROOT'] = 'outputs'
-os.environ['RUN_NAME'] = 'pyramid_weight_interpolation_seed42'
-os.environ['ALPHAS'] = '0.1 0.25 0.5'  # Automatically includes0/1. Add0.75 for six files.
-os.environ['EVAL_BATCH'] = '4'
-os.environ['EVAL_TEST'] = '1'  # Use0 if local test GT is unavailable.
-os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['MPLBACKEND'] = 'Agg'
-
-if not Path(os.environ['B_CKPT']).is_file():
-    raise FileNotFoundError('Set B_CKPT to the original full B/mild_focus epoch5 file.')
-if not os.environ['LOW_CROP_CKPT']:
-    candidates = [path for path in Path('/kaggle/input').rglob('checkpoint_epoch10.pt')
-                  if path.parent.name == 'low_crop']
-    if len(candidates) != 1:
-        raise ValueError(f'Set LOW_CROP_CKPT explicitly; candidates: {candidates}')
-    os.environ['LOW_CROP_CKPT'] = str(candidates[0])
-if not Path(os.environ['LOW_CROP_CKPT']).is_file():
-    raise FileNotFoundError(os.environ['LOW_CROP_CKPT'])
-root = Path(os.environ['RUN_ROOT'])
-if root.exists() and any(root.iterdir()):
-    raise ValueError('Use a fresh output folder. Existing files are not deleted.')
-print('Base:', os.environ['B_CKPT'])
-print('Candidate:', os.environ['LOW_CROP_CKPT'])
+os.environ["DATA_ROOT"] = "/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz"
+os.environ["RUN_ROOT"] = "outputs"
+os.environ["OCR_CACHE"] = "outputs/ocr_cache"
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["MPLBACKEND"] = "Agg"
 ```
 
-The tool validates model config, source B5 file hash, original parent/data/group
-identity, trainable-name layout, frozen policy, tensor shapes/dtypes and exact
-frozen tensor equality. It blends only finite FP32 post-encoder parameters.
-A mismatch is rejected; there is no force flag that changes frozen encoders.
-Loading both source checkpoints briefly needs CPU RAM; only one complete frozen
-weight set plus two small trainable bodies is retained for exporting the grid.
-
-## Cell 3 — Export ALL weights-only models, then full validation/diagnostics
+Keep Paddle out of the PyTorch environment. These tested backend versions use
+mobile detection/recognition, disable document dewarping/orientation modules and
+retain all recognition confidences. Max side=1600 caps detection compute; the
+backend returns coordinates in the original upright image.
 
 ```bash
 %%bash
 set -euo pipefail
-uv run --frozen python interpolate.py \
-    --base-checkpoint "$B_CKPT" \
-    --candidate-checkpoint "$LOW_CROP_CKPT" \
-    --alphas $ALPHAS \
-    --storage-budget-gib 14 \
-    --disk-reserve-gib 2 \
-    --output-dir "$RUN_ROOT"
+uv venv /tmp/ocr-env --python 3.12
+uv pip install --python /tmp/ocr-env/bin/python \
+    "paddleocr==3.3.2" "paddlepaddle==3.2.2"
+/tmp/ocr-env/bin/python cache_ocr.py \
+    --data-root "$DATA_ROOT" --cache-root "$OCR_CACHE" \
+    --splits val --device cpu --max-side 1600
+/tmp/ocr-env/bin/python audit_ocr.py \
+    --data-root "$DATA_ROOT" --cache-root "$OCR_CACHE" \
+    --split val --max-candidates 24 --output-dir outputs/ocr_coverage
+```
 
-for checkpoint in "$RUN_ROOT"/alpha_*.pt; do
-    tag="$(basename "$checkpoint" .pt)"
-    run_dir="$RUN_ROOT/$tag"
-    uv run --frozen python eval.py \
-        --checkpoint "$checkpoint" --dataset val --data-root "$DATA_ROOT" \
-        --device cuda --batch-size "$EVAL_BATCH" --num-workers 2 \
-        --output-dir "$run_dir/eval_val"
-    uv run --frozen python diagnose.py \
-        --predictions "$run_dir/eval_val" --data-root "$DATA_ROOT" \
-        --output-dir "$run_dir/diagnostic_val"
+Read `outputs/ocr_coverage/coverage.json` first. It reports full-validation and
+size-group coverage, top-24 versus all-proposal best polygon IoU, support area and
+GT coverage. These metrics do NOT measure OCR string accuracy or prove transfer.
+If proposals miss the target regions, improve the detector/input policy before
+spending GPU time on the adapter. This is a human research decision; no automatic
+validation-tuned training gate is installed.
+
+When coverage warrants training:
+
+```bash
+%%bash
+set -euo pipefail
+/tmp/ocr-env/bin/python cache_ocr.py \
+    --data-root "$DATA_ROOT" --cache-root "$OCR_CACHE" \
+    --splits train test --device cpu --max-side 1600
+python - <<'PY'
+import os
+from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
+root = Path(os.environ["RUN_ROOT"])
+with ZipFile(root / "ocr_cache_and_coverage.zip", "w", ZIP_DEFLATED) as archive:
+    for folder in ("ocr_cache", "ocr_coverage"):
+        for path in sorted((root / folder).rglob("*")):
+            if path.is_file() and path.suffix not in {".pt", ".tmp", ".zip"}:
+                archive.write(path, path.relative_to(root))
+PY
+```
+
+Download the ZIP and upload its extracted contents as a Kaggle dataset. Caching is
+resumable: existing image records are verified and skipped. Missing files stop
+training instead of silently masquerading as images with no text. Recognition
+failures are retained as low-confidence candidates. OCR is run only on RGB;
+question/answer/GT are never passed to the backend.
+
+### Session 2: setup, train both adapters, evaluate
+
+Enable Internet and 2xT4. Attach VizWiz, the exact B+5 checkpoint, and the OCR cache.
+
+```python
+!pip install -q uv
+!git clone --single-branch --branch exp/ocr-evidence-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+%cd VizWiz-VQA-Grounding
+!uv sync
+
+import os
+os.environ["DATA_ROOT"] = "/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz"
+os.environ["PARENT_CKPT"] = "/kaggle/input/datasets/khoahoang0512/vizwiz-size-weighted-pyramid-cp/mild_focus/checkpoint_epoch5.pt"
+os.environ["OCR_CACHE"] = "/kaggle/input/datasets/YOUR_USERNAME/YOUR_OCR_DATASET/ocr_cache"
+os.environ["RUN_ROOT"] = "outputs"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MPLBACKEND"] = "Agg"
+```
+
+Edit only OCR_CACHE to match the dataset sidebar. Do not use original parent20,
+natural/A, crop checkpoints, or interpolation endpoints as the parent.
+
+```bash
+%%bash
+set -euo pipefail
+for MODE in geometry full; do
+    uv run torchrun --standalone --nproc_per_node=2 train_ocr.py \
+        --parent-checkpoint "$PARENT_CKPT" \
+        --data-root "$DATA_ROOT" --cache-root "$OCR_CACHE" \
+        --output-dir "$RUN_ROOT/$MODE" --evidence-mode "$MODE" \
+        --num-epochs 20 --batch-size 4 --gradient-accumulation-steps 1 \
+        --num-workers 2 --lr 0.0001 --optimizer adamw --weight-decay 0.01 \
+        --max-candidates 24 --ocr-dropout 0.2 --text-dropout 0.2 \
+        --selection-weight 0.1 --local-weight 0.1 \
+        --save-every 5 --seed 42 --amp
 done
 ```
 
-Default files: alpha_0.pt, alpha_0p1.pt, alpha_0p25.pt, alpha_0p5.pt, alpha_1.pt.
-The loop discovers actual exported files, so adding0.75 needs no loop edits.
-No gradients or training epochs. FP32/native-resolution evaluation rules and
-question-only inference stay unchanged. Each evaluation is a new process and
-releases GPU allocations afterward. Set EVAL_BATCH=1 if needed.
+All epoch5/10/15/20 checkpoints are retained. Each contains only adapter weights,
+optimizer, scaler and provenance; no duplicate parent. They should be a few MB
+each, not GB. Keep the original B+5 separately: both artifacts are required for
+loading. SHA256 mismatch is an error. Rank-zero disk errors are propagated through
+a CPU group rather than leaving other ranks waiting in NCCL.
 
-Export finishes BEFORE any evaluation. If a later evaluation fails, all exported
-models remain usable with the ordinary eval.py command; do not rerun export into
-that nonempty directory. Run only the pending evaluation/diagnostic commands,
-with a new output directory if partial predictions already exist. No automatic
-cleanup or checkpoint deletion is performed.
-
-## Cell 4 — Compare and select using validation only
-
-This selects highest validation mean IoU; ties favor smaller alpha (closer to
-B5). This is a numerical selection convenience, not a multi-seed conclusion.
-Inspect tiny/medium and large regressions before adopting it as the research
-candidate. The primary choice does not use test, global IoU or GT area gating.
-
-```python
-import csv
-
-root = Path(os.environ['RUN_ROOT'])
-manifest = json.loads((root / 'interpolation.json').read_text())
-assert manifest['complete'] and len(manifest['checkpoints']) == len(manifest['alphas'])
-rows = []
-for tag, entry in manifest['checkpoints'].items():
-    metrics = json.loads((root / tag / 'eval_val/metrics.json').read_text())
-    diagnostic = json.loads((root / tag / 'diagnostic_val/summary.json').read_text())
-    summary = metrics['summary']
-    info = summary['weight_interpolation']
-    assert info['alpha'] == entry['alpha']
-    assert info['base']['sha256'] == manifest['provenance']['base']['sha256']
-    assert info['candidate']['sha256'] == manifest['provenance']['candidate']['sha256']
-    rows.append({
-        'tag': tag, 'alpha': entry['alpha'], 'checkpoint': entry['filename'],
-        'val_miou_pct': 100 * summary['mean_iou'],
-        'val_global_iou_pct': 100 * summary['global_iou'],
-        **{f'{name}_miou_pct': 100 * diagnostic['by_gt_area'][group]['mean_iou']
-           for name, group in [('small', 'small_lt_1pct'),
-                               ('medium', 'medium_1_to_10pct'),
-                               ('large', 'large_ge_10pct')]},
-        'large_recall_pct': 100 * diagnostic['by_gt_area']['large_ge_10pct']['mean_recall'],
-        'test_miou_pct': None,
-    })
-rows.sort(key=lambda row: row['alpha'])
-best = max(rows, key=lambda row: (row['val_miou_pct'], -row['alpha']))
-base = next(row for row in rows if row['alpha'] == 0)
-for row in rows:
-    for key in ('val_miou_pct', 'small_miou_pct', 'medium_miou_pct', 'large_miou_pct'):
-        row[key + '_delta_vs_B5_pp'] = row[key] - base[key]
-selection = {
-    'criterion': 'validation_mean_per_image_iou',
-    'best_tag': best['tag'], 'best_alpha': best['alpha'],
-    'best_checkpoint': str(root / best['checkpoint']),
-    'test_tags': [row['tag'] for row in rows
-                  if row['alpha'] in (0, 1) or row['tag'] == best['tag']],
-    'all_weights_retained': True,
-}
-(root / 'selection.json').write_text(json.dumps(selection, indent=2))
-with (root / 'interpolation_comparison.csv').open('w', newline='') as handle:
-    writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
-    writer.writeheader()
-    writer.writerows(rows)
-print((root / 'interpolation_comparison.csv').read_text())
-print('Validation-selected model:', selection['best_checkpoint'])
-```
-
-The endpoint scores should reproduce B5 and low_crop10 under this evaluation
-setup. Supplied seed42 validation references: B5 66.1693%, low_crop10 65.3050%.
-Small/medium/large: B5 19.5605/47.8303/79.4138%; low_crop21.3001/49.1806/77.2213%.
-Tiny GPU/batch/version rounding differences near threshold are possible; a material
-endpoint mismatch requires investigation before interpreting interior coefficients.
-
-## Cell 5 — Test the two endpoints and validation-selected model
-
-At most three test evaluations; if an endpoint wins, only the two endpoints run.
-This saves evaluation time and keeps test out of alpha selection. To evaluate
-ALL retained files on test instead, replace the tag source with all manifest
-checkpoint keys. Keep selection.json unchanged.
+Evaluate validation at epochs10 and20, with native masks, mean/global IoU, size
+groups and the unchanged parent's paired score. These are NOT test-selected runs.
 
 ```bash
 %%bash
 set -euo pipefail
-if [[ "$EVAL_TEST" == '1' ]]; then
-    mapfile -t tags < <(uv run --frozen python -c 'import json,os;from pathlib import Path;print("\n".join(json.loads((Path(os.environ["RUN_ROOT"])/"selection.json").read_text())["test_tags"]))')
-    for tag in "${tags[@]}"; do
-        uv run --frozen python eval.py \
-            --checkpoint "$RUN_ROOT/$tag.pt" --dataset test --data-root "$DATA_ROOT" \
-            --device cuda --batch-size "$EVAL_BATCH" --num-workers 2 \
-            --output-dir "$RUN_ROOT/$tag/eval_test"
+for MODE in geometry full; do
+    for EPOCH in 10 20; do
+        uv run eval_ocr.py \
+            --parent-checkpoint "$PARENT_CKPT" \
+            --checkpoint "$RUN_ROOT/$MODE/checkpoint_epoch$EPOCH.pt" \
+            --data-root "$DATA_ROOT" --cache-root "$OCR_CACHE" \
+            --dataset val --view full --batch-size 4 --num-workers 2 \
+            --output-dir "$RUN_ROOT/$MODE/eval_val_ep$EPOCH"
+        uv run diagnose.py \
+            --data-root "$DATA_ROOT" \
+            --predictions "$RUN_ROOT/$MODE/eval_val_ep$EPOCH" \
+            --output-dir "$RUN_ROOT/$MODE/diagnostic_val_ep$EPOCH"
     done
-fi
+done
 ```
+
+Select the epoch with validation mean IoU (tie -> earlier epoch), then run test
+for that checkpoint in each experiment. Also evaluate full's robustness views at
+its selected epoch. Shuffled text uses a fixed cross-image permutation independent
+of evaluation batch size; boxes/appearance stay aligned.
 
 ```python
-root = Path(os.environ['RUN_ROOT'])
-for row in rows:
-    path = root / row['tag'] / 'eval_test/metrics.json'
-    if path.is_file():
-        row['test_miou_pct'] = 100 * json.loads(path.read_text())['summary']['mean_iou']
-with (root / 'interpolation_comparison.csv').open('w', newline='') as handle:
-    writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
-    writer.writeheader()
-    writer.writerows(rows)
-print((root / 'interpolation_comparison.csv').read_text())
+import json
+from pathlib import Path
+import subprocess
+
+root = Path(os.environ["RUN_ROOT"])
+selection = {}
+for mode in ("geometry", "full"):
+    best = max((10, 20), key=lambda e: (
+        json.loads((root / mode / f"eval_val_ep{e}/metrics.json").read_text())["summary"]["mean_iou"], -e))
+    selection[mode] = best
+    views = [("test", "full")] + (
+        [("val", v) for v in ("base", "missing", "geometry", "shuffled_text")]
+        if mode == "full" else [])
+    for split, view in views:
+        subprocess.run([
+            "uv", "run", "eval_ocr.py",
+            "--parent-checkpoint", os.environ["PARENT_CKPT"],
+            "--checkpoint", str(root / mode / f"checkpoint_epoch{best}.pt"),
+            "--data-root", os.environ["DATA_ROOT"],
+            "--cache-root", os.environ["OCR_CACHE"],
+            "--dataset", split, "--view", view,
+            "--batch-size", "4", "--num-workers", "2",
+            "--output-dir", str(root / mode / f"eval_{split}_{view}_ep{best}")
+        ], check=True)
+(root / "selection.json").write_text(json.dumps(selection, indent=2))
 ```
 
-Missing test entries mean not evaluated, not zero accuracy. Do not change the
-chosen alpha using these test scores. A validation improvement from several
-coefficients is exploratory and needs additional seeds before a strong claim.
+Optional coverage/oracle headroom relative to a saved B+5 prediction folder:
 
-## Cell 6 — ZIP results, keep every weights file separately
+```bash
+%%bash
+set -euo pipefail
+uv run audit_ocr.py --data-root "$DATA_ROOT" --cache-root "$OCR_CACHE" \
+    --split val --max-candidates 24 \
+    --predictions outputs/full/eval_val_base_ep20 \
+    --output-dir outputs/ocr_oracle_headroom
+```
+
+Change ep20 to the selected epoch if necessary. Candidate-set and perfect local
+correction oracles use GT and are diagnostic upper bounds, never model scores.
+
+### Export the session
+
+The result ZIP contains metrics, masks, diagnostics and configs; checkpoints stay
+outside it for separate Kaggle download. All adapter checkpoints are retained.
 
 ```python
 from zipfile import ZIP_DEFLATED, ZipFile
 
-root = Path(os.environ['RUN_ROOT'])
-archive = Path('/kaggle/working') / f"{os.environ['RUN_NAME']}.zip"
-with ZipFile(archive, 'w', compression=ZIP_DEFLATED) as bundle:
-    for path in sorted(root.rglob('*')):
-        if path.is_file() and path.suffix.lower() not in {'.pt', '.tmp', '.zip'}:
-            bundle.write(path, path.relative_to(root))
-print('Download results:', archive)
-print('All retained weights-only models:')
-for path in sorted(root.glob('alpha_*.pt')):
-    print(path, f'{path.stat().st_size / 1024**3:.2f} GiB')
+root = Path(os.environ["RUN_ROOT"])
+archive_path = root / "ocr_evidence_two_runs_ep20_seed42.zip"
+with ZipFile(archive_path, "w", ZIP_DEFLATED) as archive:
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and path.suffix not in {".pt", ".tmp", ".zip"}:
+            archive.write(path, path.relative_to(root))
+print(archive_path)
 ```
 
-The ZIP includes all validation masks, diagnostics, tested masks, source
-provenance, disk plan, selection and comparison. It excludes .pt/.tmp/nested.zip.
-Every model remains in outputs for Kaggle output retention/download; the script
-never removes losing models. Do not zip the weights too and duplicate their disk
-usage. No best-model duplicate is saved: selection.json points to its alpha file.
+### Resume and arbitrary-image inference
 
-## Compatibility and limits
+Resume uses a NEW output directory, the same parent/cache/settings, and a larger
+total epoch count. Both mode and optimizer settings must match. For example, add
+`--resume-checkpoint outputs/full/checkpoint_epoch10.pt` to the full command,
+set output to `outputs/full_resume`, and keep `--num-epochs 20`.
+The epoch counter refers to adapter epochs, not the parent's training history.
+No automatic checkpoint deletion or extra final duplicate is performed.
 
-Every alpha file works with existing eval.py and GroundingModel.from_checkpoint.
-They contain model_state_dict and architecture/provenance metadata, with NO
-optimizer_state_dict, scaler_state_dict, training_controls, support_state or
-training epoch. They cannot resume the prior Adam trajectory. A new fine-tuning
-experiment would need its own initialization/optimizer protocol.
+For an arbitrary image, run cache_ocr in the separate OCR environment:
 
-Frozen encoders/buffers are compared tensor-by-tensor before exporting; only the
-recorded compatible FP32 body parameters are interpolated. Alpha0/1 copy exact
-endpoint tensors instead of relying on floating-point arithmetic. Inputs remain
-unchanged. Artifacts are atomically written with disk-space checks, and existing
-outputs are rejected rather than overwritten. There is no multi-model inference
-ensemble: each file is used as one normal pyramid model.
+```bash
+/tmp/ocr-env/bin/python cache_ocr.py --image /path/photo.jpg \
+    --cache-root outputs/new_image_ocr --device cpu --max-side 1600
+uv run predict_ocr.py --parent-checkpoint "$PARENT_CKPT" \
+    --checkpoint outputs/full/checkpoint_epoch20.pt \
+    --image /path/photo.jpg --question "What does the label say?" \
+    --cache-root outputs/new_image_ocr --output outputs/photo_mask.png
+```
 
-This branch does not change training recipes, architecture or losses. Only the
-evaluation metadata adds weight_interpolation provenance. CPU arithmetic,
-checkpoint and tiny end-to-end checks do not establish Kaggle runtime/VRAM fit
-or segmentation improvements. No actual GPU training is required by this plan.
+To bypass OCR entirely for deployment fallback, replace `--cache-root ...` in
+the prediction command with `--no-ocr`. The parent checkpoint is still required.
+
+## Interpretation and transfer protocol
+
+Compare each run to its frozen parent's paired native predictions. Require useful
+small AND medium gains, inspect large-region damage, and report overall mean IoU
+alongside global IoU. Missing-OCR must reproduce the parent. Shuffled/removed text
+tests whether recognized content is used; it does not prove semantic reasoning.
+Do not infer transfer from these perturbations: evaluate a held-out dataset or
+backbone with its own preprocessing adapter and disclose whether any fine-tuning
+was performed. Full OCR runtime plus grounding runtime is the deployment cost;
+cached grounding timing alone excludes OCR and is explicitly labeled in metrics.
+
+Known limits: unreadable text, logos missed by the detector, targets outside
+candidate support, top-N truncation, line-level rather than word-level boxes, and
+CLIP's text length limit. Non-text regions rely on the parent. Different OCR
+protocols must be evaluated as a separate experiment, not silently substituted.
+
+Implementation is based on standard OCR, cross-attention and residual refinement.
+Relevant references: [PaddleOCR API](https://www.paddleocr.ai/v3.3.1/en/version3.x/pipeline_usage/OCR.html),
+[PP-OCR](https://arxiv.org/abs/2009.09941),
+[M4C / OCR-aware multimodal reasoning](https://openaccess.thecvf.com/content_CVPR_2020/html/Hu_Iterative_Answer_Prediction_With_Pointer-Augmented_Multimodal_Transformers_for_TextVQA_CVPR_2020_paper.html).
+These references motivate components, not a claim of already improved VizWiz scores.
+
+Legacy pyramid utilities remain available. Original train.py/eval.py and old
+checkpoints retain their behavior; use train_ocr.py/eval_ocr.py for this experiment.
