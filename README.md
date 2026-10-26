@@ -1,18 +1,20 @@
 # scale-constrained-pyramid
 
-Branch `exp/scale-constrained-pyramid`. Input: image+question. Original 336/768 pyramid architecture/state-dict keys remain unchanged. The objective/projection does not depend on CLIP channels or resolution; changing the backbone still requires its normal feature/preprocessing adapter.
+Branch `exp/scale-constrained-pyramid`. Input: image + question. The original 336/768 pyramid architecture and state-dict keys remain unchanged. The group-constrained objective and update projection do not depend on CLIP channel dimensions or input resolution, and no extra architecture or inference parameters are added.
 
 ## Method and scope
 
-Start both projected and control runs from the SAME trained pyramid checkpoint. Freeze pretrained vision/text; CNN and decoder still train. Collect gradients for <1%, 1-10%, >=10% GT-area groups. Adam/AdamW proposes an update focused equally on the two smaller groups. Project its ACTUAL parameter displacement (including momentum/decay) onto all three non-increase half-spaces. This is a local first-order constraint on sampled training losses, not a validation-IoU guarantee. Zero movement is feasible; monitor stalls/rejections. No architecture or inference parameters are added.
+Both the projected run and the unprojected control start from the same trained 20-epoch parent pyramid checkpoint. Pretrained vision and text encoders stay frozen while the CNN pyramid and decoder continue training. Each step collects gradients separately for three ground-truth foreground area groups: `<1%`, `1-10%`, and `>=10%`.
 
-A run is20 additional epochs from the parent. Its comparison must be the matched continuation control, not only the original20epoch parent. Multiple backward passes cost training time. This is different from freezing pretrained encoders before the parent was trained.
+Adam/AdamW proposes a parameter step weighted equally across the two smaller groups (`<1%` and `1-10%`), and the projection step projects the actual parameter displacement (including momentum and weight decay) onto the non-increase half-spaces of all three size groups. If the constraints conflict strongly, zero movement is a valid solution, so monitor the projection logs for stalls or rejected updates.
+
+Each run trains for 20 additional epochs from the parent checkpoint. Because balanced group sampling and frozen encoders also affect training dynamics, compare the projected run against the matched 20-epoch continuation control (`--no-project-updates`) in addition to the original 20-epoch parent. Computing separate per-group backward passes increases wall-clock training time per step.
 
 References: [GEM](https://papers.neurips.cc/paper/2017/file/f87522788a2be2d171666752f97ddebb-Paper.pdf), [Gradient Surgery](https://proceedings.neurips.cc/paper_files/paper/2020/hash/3fe78a8acf5fda99de95303940a2420c-Abstract.html).
 
 ## Setup
 
-Enable Internet and two GPUs. CPU tests do not establish CUDA memory fit, speed or accuracy. Start with fresh outputs and run preflight first. No notebook is generated.
+Enable Internet and two GPUs. Start with a fresh `outputs` directory and run preflight before launching training.
 
 ```python
 !git clone --single-branch --branch exp/scale-constrained-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
@@ -46,7 +48,7 @@ if not checkpoint.is_file():
     )
 ```
 
-JSON > explicit flags > defaults. Loss/optimizer/freezing options can share the config. fp_weight is inactive for Dice/Lovasz.
+Precedence is JSON config > explicit CLI flags > defaults. Loss, optimizer, and encoder-freezing options can all be specified in the JSON config. `fp_weight` is only active when using Tversky loss.
 
 ## Preflight
 
@@ -61,11 +63,11 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 preflight_group.py \
     --config "$RUN_ROOT/configs/objective.json"
 ```
 
-Both ranks must pass; no checkpoint is written and updates are discarded.
+Both ranks must pass; updates are discarded and no checkpoint is written.
 
-## Train20epochs
+## Train 20 epochs
 
-Global batch6 has2 images/group across2 GPUs. Each GPU forwards one image at a time, separately per group. Accumulation multiplies this count. All three training groups must be nonempty. Balanced sampling cycles shuffled indices: small groups repeat and large groups can be undersampled relative to standard epochs. This sampling also applies to the control.
+A global batch size of 6 allocates 2 images per size group across 2 GPUs (1 image per group per GPU before gradient accumulation). All three training size groups must be non-empty. The balanced sampler cycles through shuffled indices within each group, repeating smaller groups and undersampling the large group relative to natural dataset frequencies. The same sampler is used for the unprojected control.
 
 ```bash
 %%bash
@@ -81,15 +83,15 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 train_group.py \
     --config "$RUN_ROOT/configs/objective.json"
 ```
 
-Use `train_group.py` / `preflight_group.py` for this protocol. The standard `train.py` entrypoint does not project updates. Size groups are indexed on the nearest-resized training-mask grid; native evaluation bins can differ slightly near a cutoff.
+Use `train_group.py` and `preflight_group.py` for this experiment (`train.py` runs standard ungrouped training). Training size groups are indexed on the nearest-resized training-mask grid, so boundary samples near a size cutoff can fall into a neighboring bin during native-resolution evaluation.
 
-Run the matched control in a separate session using the SAME parent and settings; append `--no-project-updates` and rename RUN_NAME to `scale_control_ep20_seed42`. JSON project_updates, if supplied, outranks the flag. Do not change this mode on resume.
+To run the matched control in a separate session, start from the same parent checkpoint and settings, append `--no-project-updates`, and set `RUN_NAME` to `scale_control_ep20_seed42`. If `project_updates` is set in the JSON config, it overrides the CLI flag. Keep the projection mode unchanged when resuming a run.
 
-Adam moments retain the proposed update's gradients; projection controls realized parameter displacement. A numerical constraint violation restores original weights and is logged; optimizer moments/schedule still advance for that successful proposal. Rejection or zero movement is not scientific success. Inspect gradient_cosine_small_medium/small_large/medium_large, conflict_fraction, projection_applied/rejected, update_ratio and min_group_cosine in history.jsonl.
+During projected training, Adam moments track the proposed update's gradients while the projection step adjusts the realized parameter displacement. If a numerical constraint violation occurs, the trainer restores the pre-step weights and logs the event while optimizer moments and scheduler state advance. In `history.jsonl`, inspect `gradient_cosine_small_medium`, `gradient_cosine_small_large`, `gradient_cosine_medium_large`, `conflict_fraction`, `projection_applied`, `projection_rejected`, `update_ratio`, and `min_group_cosine`.
 
 ## Evaluation and diagnostic
 
-No validation runs internally. Evaluate the saved epoch10/20 checkpoints only; test10/20 is descriptive, not a selection criterion. Test metrics require local GT. Native mean IoU and global foreground IoU are separate. Reduce eval batch size if needed.
+Training runs without internal validation. Afterward, evaluate the saved epoch 10 and epoch 20 checkpoints. Use validation metrics for checkpoint selection; test evaluation is descriptive and requires local test ground truth. Evaluation reports per-image native mean IoU and global foreground IoU separately. Reduce `--batch-size` if evaluation exceeds GPU memory.
 
 ```bash
 %%bash
@@ -108,7 +110,7 @@ for epoch in 10 20; do
 done
 ```
 
-No epoch5/15 checkpoints are created by this recipe. Both projected/control runs use identical save/evaluation schedules. Report <1%,1-10%,>=10%, overall mean/global IoU, precision/recall and area ratio; do not hide either smaller group behind a pooled score.
+This schedule saves checkpoints at epochs 10 and 20 (skipping epochs 5 and 15) for both projected and control runs. When reporting results, include `<1%`, `1-10%`, `>=10%`, overall mean IoU, global IoU, precision/recall, and area ratio.
 
 ## ZIP without checkpoints
 
@@ -124,29 +126,14 @@ with ZipFile(archive, 'w', compression=ZIP_DEFLATED) as bundle:
 print(archive)
 ```
 
-Download checkpoints separately. Session duration is unmeasured.
+Download `.pt` checkpoints separately if needed.
 
 ## Compatibility
 
-Old parent weights remain valid for evaluation with identical predictions. Other architectures stay on their branches. Full resume requires this objective/protocol, original optimizer/sampler/batch/world-size/mode and `--resume-checkpoint`. num-epochs is the final total. Initialization from weights is not optimizer resume. No existing experiment or result archive is changed.
+Parent pyramid checkpoints remain compatible with `eval.py` and produce identical predictions. Full training resume requires `--resume-checkpoint` with matching objective, optimizer, sampler, batch size, world size, and projection mode (`--num-epochs` sets the total continuation epochs). Note that `--init-checkpoint` loads model weights for a new continuation run rather than resuming optimizer state.
 
-## Checkpoint storage and execution risks
+## Checkpoint storage and diagnostics
 
-The guide saves ONLY full checkpoint_epoch10.pt and checkpoint_epoch20.pt.
-Default save interval is10; extra final raw weights are disabled by default.
-Do not reuse an old command/config setting save_every5 or save_final_weights=true.
-This policy does not delete old files already present. Full checkpoints still
-contain both frozen backbones; freezing only reduces optimizer-state storage.
-Use a fresh output/session with enough free disk for the next atomic write.
-The writer estimates tensor storage plus a safety margin, retains previous
-checkpoints, and coordinates disk failures on a CPU group rather than leaving
-peers waiting in NCCL. Available disk can change; fit is not guaranteed.
-Checkpoint spacing/output changes do not alter gradients, projection, optimizer
-updates or the resume protocol.
+The command above saves only `checkpoint_epoch10.pt` and `checkpoint_epoch20.pt` (`--save-every 10 --no-save-final-weights`). Avoid passing `--save-every 5` or enabling final raw weight exports so the run stays within Kaggle disk limits. Full checkpoints still include weights for both frozen backbones (freezing only omits their optimizer states), so start in a fresh output directory with sufficient free disk space. Before writing, the checkpoint saver estimates tensor storage plus a safety margin, retains prior checkpoints, and coordinates disk-full errors across ranks over a CPU process group so workers do not hang in NCCL.
 
-The method itself may not improve validation. Sampled first-order constraints
-do not guarantee validation IoU, and strongly conflicting groups can leave
-very small updates. Inspect optimizer_update/overflow alongside update_ratio,
-projection_rejected and qp_zero_fallback. A near-zero update_ratio with otherwise
-successful optimizer updates suggests stalled learning, not a successful model.
-Compare against the same-parent, same-duration unprojected control.
+When analyzing training logs, check `optimizer_update` and `overflow` alongside `update_ratio`, `projection_rejected`, and `qp_zero_fallback`. A near-zero `update_ratio` during otherwise valid optimizer steps indicates that conflicting group constraints are stalling parameter movement. Always compare against the unprojected continuation control trained from the same parent for the same number of epochs.
