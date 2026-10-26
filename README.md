@@ -1,18 +1,18 @@
-# VizWiz VQA Grounding — evidence extent
+# VizWiz VQA Grounding: Evidence Extent
 
-This branch predicts evidence masks from an image and question. It extends the compact CLIP grounding model with two learned tokens for evidence location and extent. Location supervision uses the mask's bounding rectangle; final-mask and area losses learn the extent, including empty masks.
+This branch predicts visual evidence masks from an image and a question by extending the compact CLIP grounding model with two learned tokens representing evidence location and spatial extent. Location supervision uses the ground-truth mask's bounding box, while final-mask and area losses supervise the extent (including empty masks).
 
-Use `train.py` and `eval.py`. This branch fixes the image size at 336, token width at 64, support loss weight at 0.2, and area loss weight at 0.1. Training and evaluation use questions only. There are no architecture, text-mode, test-model, or loss-weight switches. The model adds 148,545 parameters to the compact backbone; real-data accuracy and GPU throughput remain unmeasured.
+Training and evaluation run through `train.py` and `eval.py` using question-only text inputs. The image resolution is fixed at 336x336 pixels, the learned token width is 64, the support loss weight is `0.2`, and the area loss weight is `0.1`. The two-token module adds 148,545 parameters to the compact backbone.
 
 ## Kaggle
 
-Enable a GPU and Internet for pretrained CLIP downloads. Keep Kaggle's Torch/Torchvision installation and install missing dependencies:
+Enable a GPU and internet access (for downloading pretrained CLIP weights). Keep Kaggle's preinstalled PyTorch and Torchvision packages and install the remaining dependencies:
 
 ```bash
 pip install transformers tqdm pillow
 ```
 
-The data directory contains `<split>_grounding.json`, image folders `train/`, `val/`, `test/`, and `binary_masks_png/<split>/`. In a Kaggle `%%bash` cell:
+The dataset root (`--data-root`) must contain `<split>_grounding.json`, the image folders `train/`, `val/`, `test/`, and ground-truth masks under `binary_masks_png/<split>/`. Run training and evaluation in a Kaggle `%%bash` cell:
 
 ```bash
 set -e
@@ -22,11 +22,11 @@ python train.py --data-root "$DATA_ROOT" --num-epochs 100 --batch-size 1 --num-w
 python eval.py --data-root "$DATA_ROOT" --checkpoint /kaggle/working/outputs-extent/checkpoint_epoch100.pt --dataset test --batch-size 1 --num-workers 2 --output-dir /kaggle/working/results-extent
 ```
 
-Training selects CUDA when available. `--init-checkpoint /path/to/compact/checkpoint_epoch100.pt` optionally initializes the coarse model from a compatible corrected compact checkpoint. It starts a fresh optimizer. Matching extent checkpoints can also initialize a run.
+Training uses CUDA automatically when available. Passing `--init-checkpoint /path/to/compact/checkpoint_epoch100.pt` initializes the coarse backbone from a compatible compact checkpoint (or a prior extent checkpoint) with a fresh optimizer.
 
 ## Optional paired questions
 
-`--pairs /path/to/pairs.json` enables extra supervision from verified same-image question pairs. Each question must have its own real mask. Mask paths resolve relative to the manifest:
+Passing `--pairs /path/to/pairs.json` adds training supervision from verified same-image question pairs, where each question has its own ground-truth mask. Mask paths in the manifest resolve relative to the manifest file:
 
 ```json
 [
@@ -41,9 +41,9 @@ Training selects CUDA when available. `--init-checkpoint /path/to/compact/checkp
 ]
 ```
 
-This illustrates the schema, not supplied annotations. `relation` is `change` or `same`; verified `same` pairs must have identical original-resolution binary masks. Questions must be nonempty, both masks must match the image dimensions, and the image must belong to the training split. Masks are never generated from rewritten questions. Unpaired images keep ordinary supervision.
+Each entry sets `relation` to `"change"` or `"same"`. Entries marked `"same"` must have identical native-resolution binary masks. Both questions must be non-empty, both masks must match the image dimensions, and the image must belong to `train`. Unpaired training images continue to receive standard single-question supervision.
 
-With a manifest, signed mask-difference and same-region consistency losses each have weight 0.1. All contributions are normalized by original-image count so batches with different pair counts retain consistent weighting. Pairs increase training compute and memory. Evaluation and single-image inference need neither answers nor pair files.
+When `--pairs` is active, the signed mask-difference loss and same-region consistency loss are each weighted by `0.1`. Loss terms are normalized by the number of original images so batches with varying pair counts maintain consistent scaling. Evaluation and single-image inference require only an image and question.
 
 ## Single-image prediction
 
@@ -52,65 +52,53 @@ python predict_save.py --checkpoint /path/to/checkpoint_epoch100.pt --image /pat
 python visualize_predictions.py --checkpoint /path/to/checkpoint_epoch100.pt --image /path/to/image.jpg --question "What does it say?" --output overlay.png
 ```
 
-`IoU.py` delegates to the same evaluator. `models/model.py` contains the extent model, the compact coarse model is in that same file, `dataset.py` the aligned data loader, and `losses.py` the objective. `docs/` and `tests/` remain ignored local development files.
+`IoU.py` delegates to `eval.py`. `models/model.py` defines both the compact coarse model and the two-token extent model, `dataset.py` implements the aligned dataset loader, and `losses.py` defines the training objective. `docs/` and `tests/` are git-ignored for local development.
 
 ## Training output and separate evaluation
 
-Training reads only the training split: no validation dataset is loaded and no validation runs, including after the final epoch. Paired question supervision is training-only.
+`train.py` loads only the training split and does not run validation during or after training.
 
-Training saves only periodic resumable checkpoints: `checkpoint_epoch10.pt`, `checkpoint_epoch20.pt`, etc. `--save-every` defaults to **10**. Each checkpoint contains model weights, optimizer/scaler state, completed epoch, and embedded run configuration, and uses legacy PyTorch serialization. There is no additional final raw-model export or automatic final checkpoint. If training ends between checkpoint intervals, the latest saved model is from the preceding interval; use `--save-every 1` to save every completed epoch. `--save-every 0` disables all model saving.
+Training writes periodic resumable checkpoints (`checkpoint_epoch10.pt`, `checkpoint_epoch20.pt`, etc.), with `--save-every` defaulting to `10`. Each checkpoint stores the model weights, optimizer and GradScaler states, the completed epoch, and the embedded `run_config` and `experiment_config`. No separate `model_final_epoch*.pt`, `last.pt`, or `best.pt` file is written automatically; if training stops between checkpoint intervals, the most recent saved file is from the previous interval (use `--save-every 1` to save every epoch, or `--save-every 0` to disable saving).
 
-Existing raw weights remain loadable using this branch's default model settings. Resumable checkpoints retain their own `run_config` and `experiment_config`; no standalone configuration file is written or read. `history.jsonl` contains training losses only. Run `eval.py` separately with `--dataset val` or `--dataset test`; the commands above use the periodic checkpoint saved at their epoch count.
+Raw weight files remain loadable using the branch's default model settings. `history.jsonl` logs training losses only. Run `eval.py` with `--dataset val` or `--dataset test` to evaluate saved checkpoints.
 
-To resume a periodic checkpoint, use `--resume-checkpoint /path/to/checkpoint_epoch10.pt` with its existing output directory or a fresh one; optimizer/scaler state and completed epoch are restored, and `--num-epochs` is the final total epoch count. To start a new run from checkpoint weights, use `--init-checkpoint /path/to/checkpoint_epoch<N>.pt`; this starts a fresh optimizer and epoch counter. Repeat the original batch size, seed, learning rate, and experiment-specific training arguments when continuing a run. Older supported full checkpoints remain loadable.
+To resume an interrupted run from a periodic checkpoint, pass `--resume-checkpoint /path/to/checkpoint_epoch10.pt`; this restores the optimizer, GradScaler, and completed epoch, and `--num-epochs` sets the target total epoch count. To initialize a new run from existing weights with a fresh optimizer and epoch counter, pass `--init-checkpoint /path/to/checkpoint_epoch<N>.pt`. Keep the original batch size, seed, learning rate, and experiment flags when continuing a run (including `--pairs` and its referenced mask files if continuing a paired-question run).
 
-Existing output directories are accepted for all training modes. Matching model filenames are overwritten; other model files remain. History is appended to `history.jsonl`, creating it if absent. To continue in a fresh Kaggle notebook, only the resumable checkpoint is needed to restore training state; no previous history or separate configuration file is required. The training dataset must still be available. To continue a paired run, repeat `--pairs` and provide the manifest and all masks it references.
-
+Existing output directories can be reused across runs: matching checkpoint filenames are overwritten, other files are preserved, and new log entries are appended to `history.jsonl`. Resuming in a fresh Kaggle session requires only the periodic `.pt` checkpoint and the training dataset.
 
 ## Code layout
 
-- `models/model.py`: the compact coarse model and the two-token location/extent model.
-- `models/image_encoder.py` and `models/text_encoder.py`: CLIP feature extraction.
-- `models/mask_decoder.py`: the decoder used by this experiment.
-- `train.py`: construct the model and dataset, run training, save periodic resumable checkpoints.
-- `eval.py`: construct the model, load weights, evaluate and export masks.
-- `utils.py`: batch transfer and a few plain weight-loading helpers.
+- `models/model.py`: compact coarse model and two-token location/extent model.
+- `models/image_encoder.py` and `models/text_encoder.py`: CLIP vision and text feature extractors.
+- `models/mask_decoder.py`: mask decoder module.
+- `train.py`: dataset loading, training loop, and periodic checkpoint saving.
+- `eval.py`: checkpoint loading, native-resolution evaluation, and mask export.
+- `utils.py`: batch device transfer and checkpoint loading helpers.
 
-The separate backbone, experiment, and checkpoint modules and model factory are removed. Training uses no validation and saves only resumable checkpoints every 10 epochs by default.
-
-Training shows a batch progress bar for each epoch (rank 0 under `torchrun`), and evaluation shows a batch progress bar. Install `tqdm` alongside Transformers and Pillow in the Kaggle notebook.
+Both training (on rank 0 under `torchrun`) and evaluation display `tqdm` batch progress bars.
 
 ## Encoder freezing and optimization
 
-Omitting the options below preserves this branch's existing training behavior:
-Adam, LR `1e-5`, zero weight decay, no LR schedule, and the branch's original
-encoder freezing policy. Freezing is opt-in; the detail CNN and decoder remain
-trainable. No model/state-dict keys or evaluation preprocessing change.
+Omitting the flags below keeps this branch's default training configuration: Adam with learning rate `1e-5`, zero weight decay, a constant learning rate, and the branch's default encoder freezing policy. Encoder freezing is opt-in, while the detail CNN and mask decoder always remain trainable. Model state-dict keys and evaluation preprocessing are unchanged.
 
 | Option | Values / default |
 | --- | --- |
-| `--freeze-backbone [BOOL]` | Set both pretrained encoders; omitted preserves existing policy |
-| `--freeze-vision-encoder [BOOL]` | Set vision encoder only |
-| `--freeze-text-encoder [BOOL]` | Set text encoder only |
+| `--freeze-backbone [BOOL]` | Freeze or unfreeze both pretrained encoders; omitting keeps the branch default |
+| `--freeze-vision-encoder [BOOL]` | Freeze or unfreeze the vision encoder only |
+| `--freeze-text-encoder [BOOL]` | Freeze or unfreeze the text encoder only |
 | `--optimizer` | `adam` (default), `adamw` |
 | `--lr` | Main learning rate; default `0.00001` |
-| `--backbone-lr` | Optional separate LR for unfrozen encoders; default uses `--lr` |
-| `--weight-decay` | Nonnegative; default `0`. Biases, norm vectors and token/position embeddings receive no decay when parameter groups are enabled |
+| `--backbone-lr` | Optional separate learning rate for unfrozen encoders; defaults to `--lr` |
+| `--weight-decay` | Nonnegative weight decay; default `0`. Biases, normalization parameters, and token/position embeddings are excluded from decay when parameter groups are active |
 | `--lr-scheduler` | `none` (default), `cosine`, `linear`, `poly` |
-| `--warmup-ratio` | Fraction of planned optimizer updates, in `[0, 1)`; default `0` |
-| `--min-lr-ratio` | Final LR / starting LR for decay schedules; default `0.1` |
-| `--poly-power` | Positive exponent for `poly`; default `0.9` |
-| `--config` | Flat JSON with training options; optional |
+| `--warmup-ratio` | Fraction of total optimizer updates used for linear warmup, in `[0, 1)`; default `0` |
+| `--min-lr-ratio` | Final LR divided by initial LR for decay schedules; default `0.1` |
+| `--poly-power` | Positive exponent for the `poly` scheduler; default `0.9` |
+| `--config` | Path to a flat JSON file with training options; optional |
 
-`BOOL` accepts `True` or `False`; a freeze flag without a value means `True`.
-The aliases `--no-freeze-backbone`, `--no-freeze-vision-encoder`, and
-`--no-freeze-text-encoder` mean `False`. An explicit component setting overrides
-`freeze_backbone` within the same source. **JSON config > explicit CLI > branch
-defaults**: a config shorthand also overrides component flags on the CLI.
-Existing recipe/loss settings can share the same JSON; unsupported keys fail
-early. Existing branch-specific flags remain available through `train.py --help`.
+`BOOL` accepts `True` or `False`, and passing a freeze flag without an argument sets it to `True`. The negative aliases `--no-freeze-backbone`, `--no-freeze-vision-encoder`, and `--no-freeze-text-encoder` set the corresponding option to `False`. Within the same configuration source, a component-specific flag (`--freeze-vision-encoder` or `--freeze-text-encoder`) overrides `freeze_backbone`. Precedence follows **JSON config > explicit CLI flags > branch defaults**, so a `freeze_backbone` entry in `--config` overrides component flags passed on the CLI. Branch-specific recipe and loss settings can be included in the same JSON file, and unknown keys raise an error immediately. See `train.py --help` for the full list of CLI flags.
 
-Append, for example, to this branch's existing training command:
+Example flags to append to a training command:
 
 ```bash
 --freeze-backbone True \
@@ -122,14 +110,9 @@ Append, for example, to this branch's existing training command:
 --min-lr-ratio 0.1
 ```
 
-This is a configurable experiment example, not a validated best hyperparameter
-setting. To freeze only vision while retaining the text policy, append
-`--freeze-vision-encoder True`. To explicitly train both encoders, use
-`--freeze-backbone False`. Models with a deliberately fixed reference stage
-(gain-guided refinement) reject encoder unfreezing to preserve that algorithm.
-Unused CLIP/SigLIP pooled-output parameters stay frozen when unfreezing token encoders.
+To freeze only the vision encoder while keeping the branch's text encoder policy, pass `--freeze-vision-encoder True`. To train both encoders, pass `--freeze-backbone False`. Architectures with a fixed reference stage (such as gain-guided refinement) reject encoder unfreezing. Unused CLIP and SigLIP pooled-output parameters remain frozen even when token encoders are unfrozen.
 
-Equivalent JSON (`--config path/to/train.json`):
+Equivalent JSON configuration (`--config path/to/train.json`):
 
 ```json
 {
@@ -143,19 +126,6 @@ Equivalent JSON (`--config path/to/train.json`):
 }
 ```
 
-Frozen encoders stay in eval mode during training and are excluded from the
-optimizer when a freezing option is set. LR schedules advance after successful
-optimizer updates, including gradient accumulation; AMP overflow skips do not
-advance them. Checkpoints save the resolved optimization settings, trainable
-parameter layout and schedule progress. Resume restores these settings and
-rejects conflicting options. For scheduled runs, keep the original total
-`--num-epochs`, loader length and accumulation so the LR trajectory is unchanged.
+When frozen, encoders are placed in `eval` mode and omitted from the optimizer. Learning rate schedulers step once per completed optimizer update (accounting for gradient accumulation) and do not advance when AMP skips a step due to gradient overflow. Checkpoints record the resolved optimization configuration, trainable parameter groups, and scheduler state. Resuming restores these settings and rejects conflicting overrides; keep `--num-epochs`, dataset length, and gradient accumulation unchanged when resuming a scheduled run so the learning rate schedule stays aligned.
 
-Old checkpoints still load for evaluation with the same architecture and
-weights. Full legacy resume keeps its original optimizer layout and constant
-LR behavior; changing freezing, optimizer, decay or enabling a new LR schedule
-requires a new run (or an explicit weights-only initialization where supported).
-Resume retains each branch's existing RNG/data-order policy; legacy branches
-that do not save or reconstruct RNG state do not guarantee bitwise replay.
-No freezing/optimization change retroactively changes a previously trained
-checkpoint or its reported results.
+Older checkpoints remain directly loadable for evaluation. Resuming a legacy checkpoint preserves its original optimizer layout and constant learning rate; changing encoder freezing, the optimizer, weight decay, or the learning rate schedule requires starting a new run (or initializing from weights where supported). Resuming also follows each branch's existing RNG and data-ordering behavior.
