@@ -1,18 +1,18 @@
 # per-image-lovasz
 
-Branch `exp/per-image-lovasz`. Input: image+question. Original 336/768 pyramid architecture/state-dict keys remain unchanged. The objective/projection does not depend on CLIP channels or resolution; changing the backbone still requires its normal feature/preprocessing adapter.
+Branch `exp/per-image-lovasz`. Input: image + question. The original 336/768 pyramid architecture and state-dict keys remain unchanged. The loss function does not depend on CLIP channel dimensions or resolution, and no extra architecture or inference parameters are introduced.
 
 ## Method and scope
 
-Keep the original pyramid, BCE and three auxiliary BCE+Dice losses. Replace ONLY the final-mask Dice term with binary Lovasz hinge, sorted independently per image, then average original images. No reader, area head, hard mining or new inference rule. Empty foreground is supervised, not skipped. This is an IoU-motivated surrogate, not a guarantee of improved generalization.
+This branch retains the original pyramid architecture, binary cross-entropy (BCE), and the three auxiliary BCE + Dice losses, replacing only the final-mask Dice term with a binary Lovasz hinge loss. Pixel errors are sorted independently per image and averaged across images in the batch, without adding a reader module, area head, hard mining, or modified inference rule. Images with empty foreground are supervised normally.
 
-Train fresh20epochs from pretrained CLIP. Vision fine-tunes; text stays frozen. To reproduce the original-loss control, change overlap_loss to dice in a fresh run. Auxiliary overlap stays Dice even when main overlap is Lovasz.
+Training runs for 20 fresh epochs from pretrained CLIP encoders, with the vision encoder fine-tuning and the text encoder frozen. Auxiliary supervision remains BCE + Dice even when `overlap_loss` is set to `lovasz`. To run the original-loss baseline from this branch, set `overlap_loss` to `dice` in a fresh run.
 
-References: [Berman et al., CVPR2018](https://arxiv.org/abs/1705.08790). Independent implementation of the binary Lovasz construction.
+Reference: [Berman et al., CVPR 2018](https://arxiv.org/abs/1705.08790).
 
 ## Setup
 
-Enable Internet and two GPUs. CPU tests do not establish CUDA memory fit, speed or accuracy. Start with fresh outputs and run preflight first. No notebook is generated.
+Enable Internet and two GPUs. Start with a fresh `outputs` directory and run preflight before launching training.
 
 ```python
 !git clone --single-branch --branch exp/per-image-lovasz https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
@@ -36,7 +36,7 @@ config = {'overlap_loss': 'lovasz', 'overlap_weight': 0.5, 'fp_weight': 0.7, 'au
 (root / 'configs/objective.json').write_text(json.dumps(config, indent=2))
 ```
 
-JSON > explicit flags > defaults. Loss/optimizer/freezing options can share the config. fp_weight is inactive for Dice/Lovasz.
+Precedence is JSON config > explicit CLI flags > defaults. Loss, optimizer, and encoder-freezing options can share the JSON config. `fp_weight` is inactive for Dice and Lovasz losses.
 
 ## Preflight
 
@@ -50,11 +50,11 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
     --config "$RUN_ROOT/configs/objective.json"
 ```
 
-Both ranks must pass; no checkpoint is written and updates are discarded.
+Both ranks must pass; updates are discarded and no checkpoint is written.
 
-## Train20epochs
+## Train 20 epochs
 
-Global microbatch2 plus accumulation2 gives effective batch4. If memory permits, preflight with batch4 then use batch4/accumulation1. Full-resolution sorting adds training cost, no inference cost.
+A global microbatch of 2 with gradient accumulation of 2 gives an effective batch size of 4. If GPU memory permits, preflight with batch size 4 and train with `--batch-size 4 --gradient-accumulation-steps 1`. Sorting pixel errors at full resolution adds compute during training only and has no inference overhead.
 
 ```bash
 %%bash
@@ -72,7 +72,7 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
 
 ## Evaluation and diagnostic
 
-Training exports validation masks/metrics at5/10/15/20 without saving weights at5/15. Full checkpoints are ONLY epoch10/20; no duplicate final raw weights. Validation batch size is per GPU. Run CPU diagnostics on those existing folders; test10/20 is descriptive, not a selection criterion. Test metrics require local GT. Native mean IoU and global foreground IoU are separate. Reduce eval batch size if needed.
+Training exports validation masks and metrics at epochs 5, 10, 15, and 20 (`--validate-every 5`, where `--val-batch-size` is per GPU), while full model checkpoints are written only at epochs 10 and 20 (`--save-every 10 --no-save-final-weights`). Run CPU diagnostics on all four validation folders, and run test evaluation on the saved epoch 10 and 20 checkpoints. Local test evaluation requires ground-truth test masks. Evaluation reports per-image native mean IoU and global foreground IoU separately.
 
 ```bash
 %%bash
@@ -88,7 +88,7 @@ for epoch in 10 20; do
 done
 ```
 
-Epoch5/15 have masks/metrics but no saved weights. Select a deployable checkpoint from epoch10/20; validation does not automatically save a best model. Report <1%,1-10%,>=10%, overall mean/global IoU, precision/recall and area ratio; do not hide either smaller group behind a pooled score.
+Because weights are saved at epochs 10 and 20, select the deployable checkpoint from those two epochs using validation metrics. Report `<1%`, `1-10%`, `>=10%`, overall mean IoU, global IoU, precision/recall, and area ratio.
 
 ## ZIP without checkpoints
 
@@ -104,57 +104,31 @@ with ZipFile(archive, 'w', compression=ZIP_DEFLATED) as bundle:
 print(archive)
 ```
 
-Download checkpoints separately. Session duration is unmeasured.
+Download `.pt` checkpoints separately if needed.
 
 ## Compatibility
 
-Old parent weights remain valid for evaluation with identical predictions. Other architectures stay on their branches. Full resume requires this objective/protocol, original optimizer/sampler/batch/world-size/mode and `--resume-checkpoint`. num-epochs is the final total. Initialization from weights is not optimizer resume. No existing experiment or result archive is changed.
+Existing parent pyramid checkpoints remain valid for evaluation and produce identical predictions. Resuming an interrupted training run requires `--resume-checkpoint` with the same objective, optimizer, sampler, batch size, world size, and `--num-epochs` set to the final total epoch count.
 
 ## Recover the disk-full run without restarting
 
-The earlier guide saved at5/10/15/20; that storage schedule was unsuitable for
-this Kaggle run. Use the latest COMPLETE full checkpoint that was successfully
-saved (for example epoch15). An incomplete .tmp is not a checkpoint. Existing
-successful checkpoints are not changed by this update. Put the chosen .pt in an
-attached Kaggle dataset and use a fresh session/output directory with free space.
-Do not delete your only recoverable checkpoint.
+An earlier storage schedule saved full checkpoints at epochs 5, 10, 15, and 20, which exceeded Kaggle's working disk quota after epoch 15. To finish training from epoch 15 to 20 without restarting from scratch, attach the latest complete checkpoint (`checkpoint_epoch15.pt`; ignore any partial `.tmp` file) as a Kaggle dataset and start a fresh session with a clean `outputs` folder.
 
-Update to this branch's latest code before resuming. Keep the old objective,
-optimizer, freezing, batch/accumulation, seed and GPU count. Add to the train
-command above, replacing the path with the actual saved file:
+Pull the latest code on this branch, keep all objective, optimizer, freezing, batch/accumulation, seed, and GPU settings identical, and append `--resume-checkpoint` to the training command:
 
 ```bash
 --resume-checkpoint /kaggle/input/YOUR_LOVASZ_CHECKPOINT/checkpoint_epoch15.pt
 ```
 
-Keep `--num-epochs 20`: epoch15 resumes at16, with only five training epochs
-remaining. Do not pass a pyramid or scale checkpoint. For a fresh output folder,
-history starts at the resumed epoch+1. Checkpoint settings must match; do not
-change loss to Dice on resume. In this recovered session only future validation
-folders are generated (for epoch15 ->20, only eval_val_ep20). Run diagnostic and
-test on those available epochs instead of the fresh-run loops above. Earlier
-mask exports can be kept separately. Save spacing may change without resetting
-the optimizer or altering the training objective.
+Keep `--num-epochs 20` so `checkpoint_epoch15.pt` resumes at epoch 16 and runs the remaining 5 epochs. In the fresh output directory, `history.jsonl` logs epochs 16 through 20 and generates `eval_val_ep20` plus `checkpoint_epoch20.pt`. Run `diagnose.py` and `eval.py --dataset test` on epoch 20 (earlier validation exports from epochs 5, 10, and 15 can be kept from the first session). Changing `--save-every` on resume does not alter optimizer state or training gradients.
 
-Full checkpoints include Adam moments and are much larger than weights-only
-files. Even two full checkpoints require enough free disk for the NEXT atomic
-write; model caches and the environment also consume storage. The writer checks
-estimated tensor storage plus a safety margin before writing, retains previous
-checkpoints, and removes a partial .tmp on a failed write. Available space may
-still change during the operation. Disk errors are shared over a CPU control
-group so another GPU does not sit in NCCL waiting for a rank-zero save failure.
-CPU tests do not establish Kaggle disk fit or GPU performance.
+Full checkpoints include Adam state and are much larger than weights-only files. Before writing, the checkpoint saver checks estimated tensor storage plus a safety margin, retains prior checkpoints, removes any partial `.tmp` file on failure, and broadcasts disk errors over a CPU control group so peer GPUs do not hang in NCCL.
 
 ## Analyze the existing epoch-5/10/15 checkpoints (no more training)
 
-Run only Cells E1-E6 below in a fresh Kaggle session. Do not run preflight or
-training. These three complete checkpoints remain compatible with this branch.
-One GPU is sufficient; evaluation does not use torchrun. Keep the checkpoints
-in an attached Kaggle dataset under /kaggle/input, without copying them into
-outputs or /kaggle/working. This avoids storing a second copy of the large .pt
-files. Enable Internet for dependency/model setup.
+To evaluate the existing complete checkpoints from epochs 5, 10, and 15 without running further training, execute Cells E1 through E6 in a fresh single-GPU Kaggle session. Keep the `.pt` files mounted under `/kaggle/input` rather than copying them into `/kaggle/working`.
 
-### Cell E1 — Clone the evaluation branch
+### Cell E1: Clone the evaluation branch
 
 ```python
 !git clone --single-branch --branch exp/per-image-lovasz https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
@@ -162,15 +136,11 @@ files. Enable Internet for dependency/model setup.
 !uv sync --frozen
 ```
 
-If this branch is already cloned, use `!git pull --ff-only` then
-`!uv sync --frozen` instead of cloning again.
+If this branch is already cloned, run `!git pull --ff-only` followed by `!uv sync --frozen`.
 
-### Cell E2 — Dataset, three checkpoint paths and output directory
+### Cell E2: Dataset, three checkpoint paths and output directory
 
-Replace YOUR_LOVASZ_CHECKPOINTS with the actual directory containing all three
-files. The missing-file message lists available checkpoint paths if needed.
-Evaluation batch4 is a starting setting; change EVAL_BATCH to1 if it exceeds
-memory. This does not change the model weights or evaluation threshold.
+Replace `YOUR_LOVASZ_CHECKPOINTS` with the mounted dataset directory containing all three `.pt` files. If `EVAL_BATCH = '4'` exceeds GPU memory, lower it to `'1'` (predictions and thresholds are unaffected by evaluation batch size).
 
 ```python
 import json
@@ -217,7 +187,7 @@ protocol = {
 print(json.dumps(protocol, indent=2))
 ```
 
-### Cell E3 — All three validation evaluations and CPU diagnostics
+### Cell E3: All three validation evaluations and CPU diagnostics
 
 ```bash
 %%bash
@@ -235,17 +205,11 @@ for epoch in 5 10 15; do
 done
 ```
 
-Masks are restored to each original GT resolution before thresholding. Each
-validation folder contains PNG masks plus metrics.json (mean IoU/global IoU and
-per-image IoUs). Each diagnostic folder contains summary.json and per_image.csv,
-including groups <1%, 1-10%, >=10%, precision/recall and area ratio. Diagnostics
-need no GPU. No new model checkpoint is written.
+Predicted masks are resized to each image's original ground-truth resolution before thresholding. Each validation folder writes PNG masks and `metrics.json` (mean IoU, global IoU, and per-image IoUs), and each diagnostic folder writes `summary.json` and `per_image.csv` (including `<1%`, `1-10%`, `>=10%`, precision/recall, and area ratio).
 
-### Cell E4 — Optional: test evaluation for all three checkpoints
+### Cell E4: Optional test evaluation for all three checkpoints
 
-Run this only if local test annotations AND GT masks are available. Otherwise
-skip this cell; validation analysis, comparison and ZIP still work. Test scores
-are descriptive; choose a checkpoint using validation, not test.
+Run this cell only if local test annotations and ground-truth test masks are available; otherwise skip to Cell E5. Select checkpoints using validation metrics rather than test scores.
 
 ```bash
 %%bash
@@ -259,7 +223,7 @@ for epoch in 5 10 15; do
 done
 ```
 
-### Cell E5 — Compare the three epochs
+### Cell E5: Compare the three epochs
 
 ```python
 import csv
@@ -294,12 +258,9 @@ with comparison.open('w', newline='') as handle:
 print(comparison.read_text())
 ```
 
-Inspect both smaller groups and the large group, not only overall mIoU. These
-are results from the same run at epochs5/10/15; do not label them epoch20 or
-claim a matched 20-epoch comparison. A rising curve through15 does not establish
-convergence. Compare methods at the same epoch where available.
+Inspect the `<1%`, `1-10%`, and `>=10%` groups alongside overall mean IoU, and compare against baselines at matching epochs (5, 10, and 15).
 
-### Cell E6 — ZIP results, excluding every checkpoint
+### Cell E6: ZIP results, excluding every checkpoint
 
 ```python
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -314,6 +275,4 @@ print('Download:', archive)
 print('Checkpoint files are excluded; keep the original .pt files separately.')
 ```
 
-The ZIP includes comparison/protocol files, validation masks/metrics, all three
-CPU diagnostics, and optional test masks/metrics. It contains no .pt files,
-partial .tmp files or nested ZIP archives. It can be analyzed offline on CPU.
+The archive packages `analysis_protocol.json`, `checkpoint_comparison.csv`, validation masks and metrics, all three CPU diagnostic folders, and any test masks and metrics, while excluding `.pt`, `.tmp`, and nested `.zip` files.
