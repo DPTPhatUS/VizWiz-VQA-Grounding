@@ -1,41 +1,41 @@
 # Latent-answer grounding: Spatial Evidence-Decoder Interaction (`exp/spatial-evidence-decoder`)
 
-This branch extends the latent-answer grounding architecture with **Spatial Evidence-Decoder Interaction** (inspired by DaVI / dual visual-evidence principles adapted for dense segmentation). Alongside the shared CLIP image/question encoders, latent answer predictor, and conditioned mask decoder, it introduces direct, continuous 2D spatial compatibility gating between dense visual representations and answer evidence ($A$ or predicted $A'$).
+This branch extends the latent-answer grounding model with **Spatial Evidence-Decoder Interaction** (adapted from DaVI / dual visual-evidence gating for dense segmentation). Alongside the shared CLIP image and question encoders, latent answer predictor, and conditioned mask decoder, it adds continuous 2D spatial compatibility gating between dense decoder feature maps and the answer representation ($A$ or predicted $A'$).
 
-Student inference requires only image + question. CLIP input is fixed at 336 pixels.
+Student inference requires only the image and question. CLIP image inputs are fixed at 336x336 pixels.
 
 ## Architecture: Spatial Evidence Interaction
 
 ### 1. Motivation and Mechanism
 
-In the baseline architecture, answer conditioning in the decoder relies primarily on global scalar affine modulation (FiLM) inside the `SkipConditioner`. While effective for global feature recalibration, it lacks direct spatial localization of answer evidence across the decoder hierarchy.
+In the baseline latent-answer decoder, answer conditioning relies on global scalar affine modulation (FiLM) inside `SkipConditioner`, which recalibrates channels globally without explicitly localizing answer evidence across 2D spatial positions.
 
-`SpatialEvidenceInteraction` introduces continuous 2D position-wise compatibility gating:
-1. **L2-Normalized Projection**: Dense visual features $V \in \mathbb{R}^{B \times C_v \times H \times W}$ and answer evidence vector $A \in \mathbb{R}^{B \times D_t}$ (or tokens $(B, K, D_t)$) are projected into a common space and normalized:
+`SpatialEvidenceInteraction` adds position-wise 2D compatibility gating:
+1. **L2-Normalized Projection**: Dense visual features $V \in \mathbb{R}^{B \times C_v \times H \times W}$ and the answer vector $A \in \mathbb{R}^{B \times D_t}$ (or token sequence $(B, K, D_t)$) are projected into a shared embedding space and L2-normalized:
    $$\widehat{V} = \frac{\text{Conv}_{1\times 1}(V)}{\|\text{Conv}_{1\times 1}(V)\|_2}, \quad \widehat{A} = \frac{\text{Linear}(A)}{\|\text{Linear}(A)\|_2}$$
 2. **Continuous 2D Spatial Gate**:
    $$S(b, 1, h, w) = \sum_c \widehat{V}(b, c, h, w) \cdot \widehat{A}(b, c)$$
    $$\text{Gate}(b, 1, h, w) = \sigma(\text{gate\_scale} \cdot S + \text{gate\_bias})$$
-   Position-wise sigmoid gating avoids the single-token softmax degeneracy inherent in standard cross-attention.
+   Position-wise sigmoid gating avoids the single-token softmax collapse of standard cross-attention.
 3. **Depthwise-Separable Feature Refinement & Zero-Init Residual**:
    $$\Delta V = \text{Refine}([V \odot \text{Gate}, \text{Gate}])$$
    $$V_{\text{out}} = V + \text{residual\_scale} \cdot \Delta V$$
-   Where `residual_scale` is initialized to $0.0$, guaranteeing **exact numerical identity** to the baseline at step 0.
-4. **Question-Only View Bypass**: When `answer_vec` is `None` (in question-only evaluation or distillation reference views), the interaction is cleanly bypassed.
+   Initializing `residual_scale` to $0.0$ preserves exact numerical parity with the baseline at initialization (step 0).
+4. **Question-Only View Bypass**: When `answer_vec` is `None` (during question-only evaluation or distillation reference views), the interaction block is bypassed.
 
 ### 2. Multi-Level Decoder Hierarchy & Configurable Upsampling Stages
 
-The spatial interaction is applied hierarchically across the decoder:
-- **Bottleneck Stage**: Always enabled after skip fusion at the lowest resolution ($24 \times 24$, 128 channels).
-- **Progressive Upsampling Stages**: Modularized and configurable across 4 upsampling resolutions:
+Spatial interaction is applied across the decoder hierarchy:
+- **Bottleneck Stage**: Always active after skip fusion at the coarsest grid ($24 \times 24$, 128 channels).
+- **Progressive Upsampling Stages**: Configurable across the 4 decoder upsampling blocks:
   - **Stage 0**: $48 \times 48$, 64 channels
   - **Stage 1**: $96 \times 96$, 32 channels
   - **Stage 2**: $192 \times 192$, 16 channels
   - **Stage 3**: $384 \times 384$, 16 channels
 
 #### Configuration & Defaults
-- **Default configuration**: Strictly stages `(0, 1)` ($48 \times 48$ and $96 \times 96$) alongside the bottleneck.
-- **Arbitrary stage configuration**: Any subset of stages (or all 4 stages `(0, 1, 2, 3)`) can be configured:
+- **Default configuration**: Stages `(0, 1)` ($48 \times 48$ and $96 \times 96$) in addition to the bottleneck.
+- **Custom stage configuration**: Any subset of upsampling stages (including all 4 stages `(0, 1, 2, 3)` or bottleneck-only `()`) can be selected in Python or via the CLI:
   ```python
   from models.model import GroundingModel
 
@@ -48,21 +48,19 @@ The spatial interaction is applied hierarchically across the decoder:
   # Bottleneck only:
   model_bottleneck_only = GroundingModel(spatial_upsample_stages=())
   ```
-- **CLI Flag**: Specify via `--spatial-upsample-stages 0 1 2 3` in `train.py`.
+- **CLI Flag**: Pass `--spatial-upsample-stages 0 1 2 3` to `train.py`.
 
 ### 3. Checkpoint Compatibility & Auto-Detection
 
-- **Strict backward compatibility**: Checkpoints trained with the default 2 stages `(0, 1)` (including legacy checkpoints without stage metadata) load seamlessly with `strict=True`.
-- **Automatic detection**: `checkpoint_model_kwargs(saved)` inspects checkpoint metadata and state dict keys to automatically instantiate the exact architecture (2 stages, 4 stages, bottleneck only, or baseline plain model).
-- **Mismatch protection**: Incompatible stage configurations (e.g. attempting to load a 4-stage checkpoint into a 2-stage model) are explicitly rejected during weight validation.
+- **Backward compatibility**: Checkpoints trained with the default stages `(0, 1)` (including older checkpoints without stage metadata) load directly with `strict=True`.
+- **Automatic detection**: `checkpoint_model_kwargs(saved)` inspects checkpoint metadata and state-dict keys to instantiate the matching stage layout (2 stages, 4 stages, bottleneck-only, or plain baseline).
+- **Mismatch protection**: Incompatible stage layouts (such as loading a 4-stage checkpoint into a 2-stage model) raise an explicit validation error during weight loading.
 
 ## Training
 
-The dataset root contains `train_grounding.json`, `val_grounding.json`, image
-folders `train/`, `val/`, and masks in `binary_masks_png/<split>/`.
+The dataset directory (`--data-root`) must contain `train_grounding.json`, `val_grounding.json`, the `train/` and `val/` image folders, and ground-truth masks under `binary_masks_png/<split>/`.
 
-The original single-stage training behavior is `full + legacy`. Both are fresh-run
-defaults; writing them explicitly makes the configuration clear:
+The default single-stage training configuration uses `--training-recipe full` and `--loss-version legacy`:
 
 ```bash
 uv run torchrun --nproc_per_node=2 train.py \
@@ -78,7 +76,7 @@ uv run torchrun --nproc_per_node=2 train.py \
     --output-dir outputs/latent_full_legacy
 ```
 
-To train with custom stages (e.g. all 4 upsampling stages enabled):
+To train with custom upsampling stages (for example, enabling all 4 stages):
 
 ```bash
 uv run torchrun --nproc_per_node=2 train.py \
@@ -91,33 +89,20 @@ uv run torchrun --nproc_per_node=2 train.py \
     --output-dir outputs/spatial_4stages
 ```
 
-
-Batch size is **global across GPUs**: 4 on two GPUs means 2 per GPU. Training
-chooses CUDA automatically, uses AMP on CUDA, and does not run validation.
-Training is single-stage: real answers supervise the same model's oracle view.
-There is no external teacher checkpoint or separate teacher-training command.
+`--batch-size` is global across GPUs, so a batch size of 4 across 2 GPUs places 2 images on each GPU. Training uses CUDA and AMP automatically when available and skips in-training validation. Real answers supervise the model's own oracle path within a single stage, without requiring an external teacher checkpoint or separate teacher training step.
 
 | `--training-recipe` | Objective |
 |---|---|
-| `full` | Predicted-answer mask + oracle/Q-reference masks + gain-weighted mask KD + answer alignment + attention guidance; no warm-up |
-| `grounding-only` | Predicted-answer mask supervision only; the latent predictor remains present |
+| `full` | Predicted-answer mask + oracle/Q-reference masks + gain-weighted mask KD + answer alignment + attention guidance; no warmup |
+| `grounding-only` | Predicted-answer mask supervision only; the latent predictor remains in the forward pass |
 | `alignment` | Predicted-answer mask supervision + answer-vector alignment |
-| `warmup` | Answer alignment throughout; mask supervision transitions from real A to predicted A' |
+| `warmup` | Answer alignment throughout; mask supervision transitions from real `A` to predicted `A'` |
 
-For new matched comparisons, explicitly select `--loss-version stable`. This
-uses the audited KL calculations and valid-answer reductions. `legacy` preserves
-the previous objective. Grounding-only segmentation is identical in both versions.
-New training objectives require new runs to obtain results for those objectives.
+For new matched comparisons, pass `--loss-version stable` to enable the updated KL divergence and valid-answer loss reductions. `--loss-version legacy` retains the original loss formulation. Under `grounding-only`, both loss versions produce identical segmentation updates.
 
-Warmup defaults to 5 real-answer epochs followed by a 5-epoch transition. For a
-20-epoch run, predicted-mask weights on answer-available samples are 0 in epochs
-1-5, then 0.2/0.4/0.6/0.8/1.0 in epochs 6-10, and 1 thereafter. Missing-answer
-samples always use predicted grounding. The schedule mixes per-image losses,
-not answer vectors. Full has no warm-up.
+The `warmup` recipe defaults to 5 real-answer epochs followed by a 5-epoch linear transition. In a 20-epoch run, the predicted-mask loss weight on samples with valid answers is `0` during epochs 1-5, steps through `0.2, 0.4, 0.6, 0.8, 1.0` during epochs 6-10, and stays at `1.0` from epoch 10 onward. Samples without valid answers always use the predicted-answer grounding path. The transition schedule interpolates per-image losses rather than blending answer vectors.
 
-`--help` lists the complete CLI. Normal runs need no configuration file.
-For an advanced experiment, `--config /path/to/settings.json` accepts a flat JSON
-object with only the settings to override, for example:
+Run `train.py --help` for the full CLI reference. For custom overrides, pass a flat JSON file via `--config /path/to/settings.json`:
 
 ```json
 {
@@ -126,39 +111,17 @@ object with only the settings to override, for example:
 }
 ```
 
-Supported keys are `training_recipe`, `loss_version`, `dice_weight`,
-`latent_weight`, `detach_predicted_answer`, `freeze_text_encoder`, `warmup_epochs`,
-`answer_transition_epochs`, and the full-recipe weights `oracle_weight`,
-`question_weight`, `kd_weight`, `attn_weight`, `gain_mix`. Schedule settings
-require the warmup recipe. Explicit recipe/loss flags must agree with the file.
-Resolved settings are recorded in checkpoints and training history.
+Supported JSON keys are `training_recipe`, `loss_version`, `dice_weight`, `latent_weight`, `detach_predicted_answer`, `freeze_text_encoder`, `warmup_epochs`, `answer_transition_epochs`, and the full-recipe weights (`oracle_weight`, `question_weight`, `kd_weight`, `attn_weight`, `gain_mix`). Warmup schedule keys are only valid when `training_recipe` is `warmup`. Any recipe or loss version specified on both the CLI and in the JSON file must match. Resolved parameters are saved in checkpoints and `history.jsonl`.
 
-For frozen-text controls, use `{"freeze_text_encoder": true}` in the JSON.
-This freezes the shared CLIP question/answer encoder and keeps it in eval mode
-during training. Vision, text projection, latent predictor and decoder still
-train. The default is false, preserving previous runs. Resume restores the
-saved policy before constructing the optimizer; conflicting overrides fail.
+Setting `{"freeze_text_encoder": true}` in the config freezes the shared CLIP question/answer text encoder and keeps it in `eval` mode during training, while the vision encoder, text projection, latent predictor, and mask decoder remain trainable. By default `freeze_text_encoder` is `false`. Resuming a checkpoint restores the saved freezing policy before building the optimizer and rejects conflicting overrides.
 
-The former individual loss/schedule/detachment flags, `--help-advanced`,
-`--teacher-checkpoint`, and the duplicate `--supervised-only` alias are removed.
-Use `--training-recipe grounding-only` for the latter. Unsupported flags fail
-explicitly; they are never silently ignored.
+Removed legacy flags (`--help-advanced`, `--teacher-checkpoint`, `--supervised-only`, and standalone per-loss weight flags) raise an immediate CLI error; use `--training-recipe grounding-only` in place of `--supervised-only`.
 
 ## Checkpoints and evaluation
 
-`--save-every 10` writes resumable `checkpoint_epoch10.pt`, etc. Training also
-writes final raw weights as `model_final_epoch<N>.pt`. Periodic checkpoints
-include optimizer/scaler state, epoch, and training configuration; raw weights
-contain model tensors only.
+`--save-every 10` saves resumable checkpoints (`checkpoint_epoch10.pt`, etc.) containing model weights, optimizer and GradScaler states, the completed epoch, and the resolved configuration. At the end of training, the script also exports raw model weights to `model_final_epoch<N>.pt`.
 
-Use `--resume-checkpoint` for a periodic checkpoint. Recipe, loss weights,
-detachment and schedule are restored; conflicting overrides are rejected.
-The original JSON file is not needed when resuming. Historical external-teacher
-training runs require their original runner rather than this single-stage trainer.
-Repeat the original batch size, LR and seed. `--num-epochs` is the final total
-count on resume. Use `--init-checkpoint` for a new run initialized from weights,
-with a new optimizer and epoch counter. Keep different experiments in separate
-output directories.
+Pass `--resume-checkpoint` to continue training from a periodic checkpoint. The saved recipe, loss weights, detachment mode, and warmup schedule are restored automatically without needing the original JSON config file. Keep the original batch size, learning rate, and seed when resuming; `--num-epochs` sets the target total epoch count. To start a fresh run initialized from existing weights (resetting the optimizer and epoch counter), use `--init-checkpoint`. Store separate experiments in distinct output directories.
 
 ```bash
 uv run python eval.py \
@@ -170,18 +133,11 @@ uv run python eval.py \
     --output-dir outputs/eval_val_ep20
 ```
 
-Evaluation scores and exports masks at native resolution by default. Use
-validation for checkpoint selection. Complete existing latent checkpoints retain
-matching parameter names/shapes and load for inference. Student predictions do
-not use ground-truth answers. `predict_save.py` and `visualize_predictions.py`
-provide single-image prediction and overlays. Historical standalone teacher
-checkpoint formats are detected automatically; no `--teacher` flag is needed.
+`eval.py` computes metrics and exports predicted masks at native image resolution by default. Use the validation split for checkpoint selection. Student evaluation uses only the image and question. Single-image mask export and visualization are available through `predict_save.py` and `visualize_predictions.py`, and historical standalone teacher checkpoints are detected automatically.
 
 ## Diagnostics
 
-All diagnostic tools are included at the repository root. `diagnose.py`
-compares Q-only, predicted-answer and real-answer masks. For Q/A interventions,
-embedding retrieval and conditioning traces, run:
+Repository-root diagnostic scripts inspect how answer conditioning affects predictions. `diagnose.py` compares question-only, predicted-answer, and ground-truth-answer masks. For question/answer interventions, embedding retrieval, and conditioning traces, run:
 
 ```bash
 uv run python probe_latent_conditioning.py \
@@ -194,14 +150,9 @@ uv run python probe_latent_conditioning.py \
     --output-dir outputs/probe_val_ep20
 ```
 
-Use one process, without torchrun, and a new or empty output directory. The
-probe leaves weights and annotations unchanged. It exports summaries, per-image
-measurements, embeddings and a gallery. Intervention scores use the original
-GT and measure sensitivity; they are not accuracy for a newly posed question.
-The pretrained text reference runs on CPU; `--skip-pretrained-reference` omits
-that comparison when needed. Reports, data and local tests remain untracked.
+Run `probe_latent_conditioning.py` as a single process (without `torchrun`) pointing to a new or empty output directory. The script leaves model weights and dataset annotations untouched and writes summary metrics, per-image logs, embeddings, and a visual gallery. Intervention metrics are scored against each image's original ground-truth mask to measure conditioning sensitivity. The pretrained text reference comparison runs on CPU and can be skipped with `--skip-pretrained-reference`.
 
-To test predicted-answer content directly, use `probe_predicted_answer.py`:
+To test sensitivity to the predicted answer vector directly, run `probe_predicted_answer.py`:
 
 ```bash
 uv run python probe_predicted_answer.py \
@@ -214,48 +165,30 @@ uv run python probe_predicted_answer.py \
     --output-dir outputs/latent_alignment_frozen_ep20
 ```
 
-This validation-only probe caches predicted vectors in a first pass, then keeps
-each image/question fixed while replaying, swapping, averaging or zeroing the
-answer vector. Replacements preserve the answer-token slot and affect both
-attention and skip conditioning; a separate Q-only view removes the slot.
-It exports JSON/CSV summaries, donor mappings and a gallery without creating PT
-files or changing weights. Check cached-replay differences before interpreting
-effects. The mean uses the label-free validation cache as a diagnostic control;
-it is not a deployable learned constant. Distinct-answer donors are selected by
-annotation strings, not verified semantic negatives. Use the original GT to
-measure sensitivity, not accuracy for the donor question/answer.
+This validation probe caches predicted answer vectors in a first pass, then holds each image and question fixed while replaying, swapping, averaging, or zeroing the answer vector. Vector replacements preserve the answer-token slot across both cross-attention and skip conditioning, whereas the question-only view removes the slot entirely. The script outputs JSON/CSV summaries, donor mappings, and a visual gallery without writing `.pt` files or modifying checkpoints. Check the cached-replay parity metrics first when reviewing results. The mean-vector baseline averages the cached validation predictions as a diagnostic control, and distinct-answer donors are chosen by comparing normalized annotation strings. All intervention views are evaluated against the original ground-truth mask to measure sensitivity.
 
 ## Encoder freezing and optimization
 
-Omitting the options below preserves this branch's existing training behavior:
-Adam, LR `1e-5`, zero weight decay, no LR schedule, and the branch's original
-encoder freezing policy. Freezing is opt-in; the detail CNN and decoder remain
-trainable. No model/state-dict keys or evaluation preprocessing change.
+Omitting the flags below keeps this branch's default training configuration: Adam with learning rate `1e-5`, zero weight decay, a constant learning rate, and the branch's default encoder freezing policy. Encoder freezing is opt-in, while the detail CNN and mask decoder always remain trainable. Model state-dict keys and evaluation preprocessing are unchanged.
 
 | Option | Values / default |
 | --- | --- |
-| `--freeze-backbone [BOOL]` | Set both pretrained encoders; omitted preserves existing policy |
-| `--freeze-vision-encoder [BOOL]` | Set vision encoder only |
-| `--freeze-text-encoder [BOOL]` | Set text encoder only |
+| `--freeze-backbone [BOOL]` | Freeze or unfreeze both pretrained encoders; omitting keeps the branch default |
+| `--freeze-vision-encoder [BOOL]` | Freeze or unfreeze the vision encoder only |
+| `--freeze-text-encoder [BOOL]` | Freeze or unfreeze the text encoder only |
 | `--optimizer` | `adam` (default), `adamw` |
 | `--lr` | Main learning rate; default `0.00001` |
-| `--backbone-lr` | Optional separate LR for unfrozen encoders; default uses `--lr` |
-| `--weight-decay` | Nonnegative; default `0`. Biases, norm vectors and token/position embeddings receive no decay when parameter groups are enabled |
+| `--backbone-lr` | Optional separate learning rate for unfrozen encoders; defaults to `--lr` |
+| `--weight-decay` | Nonnegative weight decay; default `0`. Biases, normalization parameters, and token/position embeddings are excluded from decay when parameter groups are active |
 | `--lr-scheduler` | `none` (default), `cosine`, `linear`, `poly` |
-| `--warmup-ratio` | Fraction of planned optimizer updates, in `[0, 1)`; default `0` |
-| `--min-lr-ratio` | Final LR / starting LR for decay schedules; default `0.1` |
-| `--poly-power` | Positive exponent for `poly`; default `0.9` |
-| `--config` | Flat JSON with training options; optional |
+| `--warmup-ratio` | Fraction of total optimizer updates used for linear warmup, in `[0, 1)`; default `0` |
+| `--min-lr-ratio` | Final LR divided by initial LR for decay schedules; default `0.1` |
+| `--poly-power` | Positive exponent for the `poly` scheduler; default `0.9` |
+| `--config` | Path to a flat JSON file with training options; optional |
 
-`BOOL` accepts `True` or `False`; a freeze flag without a value means `True`.
-The aliases `--no-freeze-backbone`, `--no-freeze-vision-encoder`, and
-`--no-freeze-text-encoder` mean `False`. An explicit component setting overrides
-`freeze_backbone` within the same source. **JSON config > explicit CLI > branch
-defaults**: a config shorthand also overrides component flags on the CLI.
-Existing recipe/loss settings can share the same JSON; unsupported keys fail
-early. Existing branch-specific flags remain available through `train.py --help`.
+`BOOL` accepts `True` or `False`, and passing a freeze flag without an argument sets it to `True`. The negative aliases `--no-freeze-backbone`, `--no-freeze-vision-encoder`, and `--no-freeze-text-encoder` set the corresponding option to `False`. Within the same configuration source, a component-specific flag (`--freeze-vision-encoder` or `--freeze-text-encoder`) overrides `freeze_backbone`. Precedence follows **JSON config > explicit CLI flags > branch defaults**, so a `freeze_backbone` entry in `--config` overrides component flags passed on the CLI. Branch-specific recipe and loss settings can be included in the same JSON file, and unknown keys raise an error immediately. See `train.py --help` for the full list of CLI flags.
 
-Append, for example, to this branch's existing training command:
+Example flags to append to a training command:
 
 ```bash
 --freeze-backbone True \
@@ -267,14 +200,9 @@ Append, for example, to this branch's existing training command:
 --min-lr-ratio 0.1
 ```
 
-This is a configurable experiment example, not a validated best hyperparameter
-setting. To freeze only vision while retaining the text policy, append
-`--freeze-vision-encoder True`. To explicitly train both encoders, use
-`--freeze-backbone False`. Models with a deliberately fixed reference stage
-(gain-guided refinement) reject encoder unfreezing to preserve that algorithm.
-Unused CLIP/SigLIP pooled-output parameters stay frozen when unfreezing token encoders.
+To freeze only the vision encoder while keeping the branch's text encoder policy, pass `--freeze-vision-encoder True`. To train both encoders, pass `--freeze-backbone False`. Architectures with a fixed reference stage (such as gain-guided refinement) reject encoder unfreezing. Unused CLIP and SigLIP pooled-output parameters remain frozen even when token encoders are unfrozen.
 
-Equivalent JSON (`--config path/to/train.json`):
+Equivalent JSON configuration (`--config path/to/train.json`):
 
 ```json
 {
@@ -288,19 +216,6 @@ Equivalent JSON (`--config path/to/train.json`):
 }
 ```
 
-Frozen encoders stay in eval mode during training and are excluded from the
-optimizer when a freezing option is set. LR schedules advance after successful
-optimizer updates, including gradient accumulation; AMP overflow skips do not
-advance them. Checkpoints save the resolved optimization settings, trainable
-parameter layout and schedule progress. Resume restores these settings and
-rejects conflicting options. For scheduled runs, keep the original total
-`--num-epochs`, loader length and accumulation so the LR trajectory is unchanged.
+When frozen, encoders are placed in `eval` mode and omitted from the optimizer. Learning rate schedulers step once per completed optimizer update (accounting for gradient accumulation) and do not advance when AMP skips a step due to gradient overflow. Checkpoints record the resolved optimization configuration, trainable parameter groups, and scheduler state. Resuming restores these settings and rejects conflicting overrides; keep `--num-epochs`, dataset length, and gradient accumulation unchanged when resuming a scheduled run so the learning rate schedule stays aligned.
 
-Old checkpoints still load for evaluation with the same architecture and
-weights. Full legacy resume keeps its original optimizer layout and constant
-LR behavior; changing freezing, optimizer, decay or enabling a new LR schedule
-requires a new run (or an explicit weights-only initialization where supported).
-Resume retains each branch's existing RNG/data-order policy; legacy branches
-that do not save or reconstruct RNG state do not guarantee bitwise replay.
-No freezing/optimization change retroactively changes a previously trained
-checkpoint or its reported results.
+Older checkpoints remain directly loadable for evaluation. Resuming a legacy checkpoint preserves its original optimizer layout and constant learning rate; changing encoder freezing, the optimizer, weight decay, or the learning rate schedule requires starting a new run (or initializing from weights where supported). Resuming also follows each branch's existing RNG and data-ordering behavior.
