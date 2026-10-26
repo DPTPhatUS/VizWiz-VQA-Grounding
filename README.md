@@ -1,57 +1,29 @@
 # Context-crop pyramid: one additional Kaggle run
 
-Branch: `exp/context-crop-pyramid`, from `exp/size-weighted-pyramid` at `e89dc65`.
-This tests TRAIN-ONLY scale/context augmentation, with no new network modules,
-loss terms, inference crops, answer input or inference parameters.
+Branch: `exp/context-crop-pyramid`, branched from `exp/size-weighted-pyramid` at `e89dc65`. This experiment evaluates training-only scale and context augmentation without adding new network modules, loss terms, inference crops, answer inputs, or inference parameters.
 
-Start from the FULL B/mild_focus checkpoint at counter5. Keep its model,
-optimizer, AMP scaler, frozen vision/text, weighted BCE+Dice, balanced sampler,
-LR1e-5, seed42 and update count. Train counters6-10 (five more epochs;30total
-including the original parent20). Compare with B continued to10 WITHOUT crops
-on `exp/size-weighted-pyramid`, not only with B5 or original parent20.
+Training resumes from the full `mild_focus` (B) checkpoint at counter 5 (`B5`), retaining its model weights, optimizer state, AMP scaler, frozen vision and text encoders, group-weighted BCE + Dice loss, balanced sampler, learning rate of `1e-5`, seed 42, and update count. Training runs counters 6 through 10 (5 additional epochs, or 30 total epochs including the original 20-epoch parent). Compare the resulting model (`crop10`) against `mild_focus` continued to counter 10 without crops (`B10` from `exp/size-weighted-pyramid`) as well as `B5`.
 
 ## What changes
 
-For each sampled TRAIN image, attempt a crop with probability0.25. Other samples
-use the complete image. If a valid crop exists:
+For each sampled training image, the dataset attempts a context crop with probability `0.25`; otherwise it uses the full image. When a crop is attempted and a valid crop window exists:
 
-1. Derive the foreground bounding extent from the existing TRAIN mask.
-2. Choose a source-aspect-ratio window, retaining ALL GT components and context.
-3. Jitter the window position while retaining the padded foreground extent.
-4. Crop native upright RGB and mask using the SAME coordinates, BEFORE creating
-   the336RGB and768detail views. Existing RGB normalization and mask-nearest
-   resizing stay unchanged. Question text is unchanged.
+1. Compute the foreground bounding box from the training ground-truth mask.
+2. Select a crop window matching the source image aspect ratio that contains all ground-truth foreground components plus surrounding context.
+3. Jitter the window position while keeping the padded foreground extent inside the window.
+4. Crop the native upright RGB image and ground-truth mask using identical coordinates before constructing the 336 RGB and 768 detail views. Standard RGB normalization, nearest-neighbor mask resizing, and question text remain unchanged.
 
-The scale is shared between width/height (integer rounding aside). Let r be the
-larger of bbox-width/image-width and bbox-height/image-height. The lower side
-fraction is max(0.35,1.5*r, padded bbox extent); the upper is min(0.9,max(0.5,3*r)).
-Sample uniformly between these limits. Pad the bbox by25% of its width/height
-on available sides. Position is random among valid integer windows, not forced
-to put the object at the center. Retain all GT pixels BEFORE normal mask resize.
+Width and height share the same scale factor (up to integer pixel rounding). Let `r` be `max(bbox_width / image_width, bbox_height / image_height)`. The bounding box is padded by 25% of its width and height on available sides, and the window side fraction is sampled uniformly between `max(0.35, 1.5 * r, padded_bbox_extent)` and `min(0.9, max(0.5, 3 * r))`. Window position is sampled uniformly across valid integer coordinates rather than centering the target. All ground-truth foreground pixels are retained prior to mask resizing.
 
-Empty GT, a foreground extent too wide for this policy, or infeasible context
-falls back to the full image. Disjoint masks must ALL fit; do not crop one
-component and silently remove the others. Large images often fall back, so25%
-is the attempted rate, not a promise that25% of all draws are cropped.
+If the ground-truth mask is empty, if disjoint foreground components span too wide an extent, or if the padded context window is infeasible, the loader falls back to the uncropped full image. Because large foreground regions frequently trigger this fallback, the realized crop fraction is lower than the requested `0.25` attempt probability.
 
-Group membership and weights use the UNCROPPED nearest-resized TRAIN mask.
-A crop can make an originally small object occupy a larger fraction, but it
-still contributes to its original group's objective. Train data order, frequency
-weights and number of model forwards per update remain the same as B.
-A crop REPLACES one training view; there is no extra crop model or extra forward.
+Size-group membership and loss weights are determined from the uncropped nearest-resized training mask, so a small target that occupies a larger fraction of a cropped view still contributes to its original size group's objective. Training data order, group frequency weights, and the number of forward passes per step match run B (each crop replaces the full-image training view rather than adding an extra forward pass).
 
-Val/test always use full images with their normal native-resolution metrics.
-GT-dependent crop selection is training augmentation only. The risk is learning
-crop-specific context/position shortcuts; unchanged full-image validation is the
-test of transfer. This does not promise recovery of detail missing in the photo.
-The general context/detail motivation is related to
-[HRDA](https://arxiv.org/abs/2204.13132), but this is not the HRDA architecture.
+Validation and test evaluation always run on uncropped full images at native mask resolution. Background reference on multi-scale context and detail: [HRDA](https://arxiv.org/abs/2204.13132).
 
-## Cell 1 — Setup
+## Cell 1: Setup
 
-Fresh Kaggle session: Internet, two GPUs, VizWiz dataset and the FULL B epoch5
-checkpoint attached. The results ZIP excludes .pt and cannot resume training.
-The original parent20, A/natural, C/D and raw final weights are not substitutes.
+Start a fresh Kaggle session with Internet and two GPUs enabled, and attach the VizWiz dataset along with the full `B5` (`mild_focus/checkpoint_epoch5.pt`) checkpoint.
 
 ```python
 !git clone --single-branch --branch exp/context-crop-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
@@ -59,13 +31,11 @@ The original parent20, A/natural, C/D and raw final weights are not substitutes.
 !uv sync --frozen
 ```
 
-If already cloned on this branch, use `!git pull --ff-only` and `!uv sync --frozen`.
+If already cloned on this branch, run `!git pull --ff-only` and `!uv sync --frozen`.
 
-## Cell 2 — Select B5 and write the crop config
+## Cell 2: Select B5 and write the crop config
 
-Auto-detect by checkpoint metadata. Set B_CKPT explicitly if multiple B5 files
-are mounted. Only load checkpoints you trust. INPUT_ROOT can be narrowed to the
-attached checkpoint dataset, avoiding unrelated files.
+The script locates the `B5` checkpoint via its saved metadata. If multiple `checkpoint_epoch5.pt` files are mounted, set `B_CKPT` explicitly or narrow `INPUT_ROOT`.
 
 ```python
 import gc
@@ -133,13 +103,9 @@ print('B5 checkpoint:', path)
 print('Training config:', config)
 ```
 
-Only one new flag: `--crop-probability` (default0.25), also available in JSON.
-Config > explicit CLI > defaults. To run a no-crop control on this branch,
-change crop_probability in the JSON to0; an explicit flag cannot override JSON.
-The prescribed run uses0.25. Remaining crop geometry is fixed, versioned and
-saved in metadata rather than exposed as many new flags.
+This branch adds a single option, `--crop-probability` (default `0.25`), which can also be set via JSON (`crop_probability`). Because JSON overrides CLI flags, set `"crop_probability": 0` in the JSON config if you want to run a no-crop control on this branch. All other crop geometry bounds are fixed and recorded in checkpoint metadata.
 
-## Cell 3 — Preflight, train, evaluate and diagnostic
+## Cell 3: Preflight, train, evaluate and diagnostic
 
 ```bash
 %%bash
@@ -189,29 +155,13 @@ for epoch in 5 10; do
 done
 ```
 
-Preflight updates are discarded; the next process reloads B5 from disk, including
-its optimizer/scaler. Each command exits before the next, releasing GPU state.
-Training uses AMP; evaluation FP32, full images and original mask resolution.
-No validation inside training. Eval batch4 can be changed to1 if it exceeds VRAM.
+Preflight discards its temporary updates, and `train_group.py` reloads `B5` (including optimizer and scaler state) from disk. Training uses AMP, while evaluation runs in FP32 on uncropped full images at native resolution. Set `EVAL_BATCH = '1'` if evaluation batch size 4 exceeds GPU memory.
 
-Only ONE new checkpoint is saved: `outputs/context_crop/checkpoint_epoch10.pt`.
-No intermediate6/7/8/9, copied5 or duplicate final weights. No files are deleted.
-The mounted B5 checkpoint stays separate. ZIP excludes checkpoints.
-If interrupted before10, restart from B5 into a fresh output folder. To resume
-this branch's own later full checkpoint, retain the same probability/geometry,
-flags and data; set num-epochs to the final counter. A changed crop policy is
-rejected on resume. Scheduled runs cannot extend a fixed scheduler budget.
+Only one new checkpoint is written: `outputs/context_crop/checkpoint_epoch10.pt` (intermediate epochs 6 through 9 and duplicate final weights are skipped). If training is interrupted before counter 10, restart from `B5` in a fresh output directory.
 
-Intended budget: one5epoch continuation plus evaluation/diagnostics. Actual Kaggle
-runtime, memory and disk fit still require measurement on the user's hardware.
+## Cell 4: Compare with B5 and optionally matched B10
 
-## Cell 4 — Compare with B5 and optionally matched B10
-
-CONTROL_RESULTS_ZIP may point to the completed
-`size_weighted_pyramid_two_runs_ep10_seed42.zip`. This reads B10 metrics directly
-from the ZIP, without extracting masks or loading another checkpoint/model.
-If it is unavailable, the table is provisional: B5 versus crop10 changes both
-training length and augmentation. B10 is required to isolate augmentation.
+If you attach `size_weighted_pyramid_two_runs_ep10_seed42.zip` and set `CONTROL_RESULTS_ZIP`, this script reads the matched `B10` control metrics directly from the archive so you can compare `crop10` against `B10` at the same 30-epoch budget.
 
 ```python
 import csv
@@ -270,12 +220,9 @@ with comparison.open('w', newline='') as handle:
 print(comparison.read_text())
 ```
 
-Choose using validation. Inspect both small groups, large regressions, precision,
-recall and native visualizations; do not select using test. B5's supplied seed42
-reference is val66.1693%, small19.5605%, medium47.8303%, large79.4138%.
-A crop10 gain over B5 alone is not evidence that crop augmentation helps.
+Use validation metrics to evaluate the effect of cropping across small, medium, and large ground-truth regions, precision, and recall. For reference, the seed-42 `B5` checkpoint scores 66.1693% validation mean IoU (19.5605% small, 47.8303% medium, 79.4138% large).
 
-## Cell 5 — ZIP results without .pt files
+## Cell 5: ZIP results without .pt files
 
 ```python
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -290,29 +237,15 @@ print('Download results:', archive)
 print('Keep outputs/context_crop/checkpoint_epoch10.pt separately.')
 ```
 
-Contains configs, source metadata, history6-10, full-image val/test5/10 masks and
-metrics, diagnostics and comparison. No checkpoints or nested ZIPs.
+The ZIP archive includes configs, continuation metadata, training history for epochs 6 through 10, full-image validation and test masks and metrics for counters 5 and 10, diagnostics, and `crop_comparison.csv`, while excluding `.pt`, `.tmp`, and nested `.zip` files.
 
 ## Logs and compatibility
 
-`train_loss` remains the B weighted segmentation objective (all existing heads).
-It now mixes full/crop targets; its value is not directly a full-image loss.
-`crop_requested_<group>`, `crop_applied_<group>` and
-`crop_input_area_fraction_<group>` report draw-averaged statistics per SOURCE
-size group. `crop_applied_fraction` is the fraction of actual training draws
-cropped across the balanced sampler, not the natural dataset population.
-Low applied rate with requested~0.25 means geometry/context fallback, not that
-probability was ignored. An input-area fraction1 means a full image.
+In `history.jsonl`, `train_loss` records the group-weighted segmentation objective across both full-image and cropped training views. Additional per-group crop statistics are logged for each source size group:
 
-Checkpoint metadata stores the complete versioned crop policy, original B5 file
-hash, original parent identity, source group mask digest and resolved weights.
-The first B5 import deliberately retains optimizer/scaler and counter5; this is
-an augmentation intervention, NOT a fresh optimizer initialization. Subsequent
-resumes require this branch's policy and exact training settings. Crops0 replay
-the original B update path; C/D optimizer checkpoints are not accepted.
+- `crop_requested_<group>`: fraction of draws in `<group>` where a crop was attempted (target ~`0.25`).
+- `crop_applied_<group>`: fraction of draws in `<group>` where a valid crop window was applied (a low applied rate when `crop_requested` is near `0.25` reflects geometry/context fallbacks on large masks).
+- `crop_input_area_fraction_<group>`: mean area of the selected crop window relative to the full image (`1.0` indicates an uncropped full image).
+- `crop_applied_fraction`: overall fraction of balanced-sampler draws that were cropped.
 
-Model/state-dict keys, preprocessing defaults and inference architecture are
-unchanged. Old B checkpoints evaluate with full images as before. The augmentation
-uses only PIL RGB/masks, not CLIP-specific features; another dataset/backbone still
-needs its normal adapter and independent validation. CPU geometry/gradient/DDP
-checks do not establish GPU fit, accuracy gains or cross-backbone performance.
+Checkpoint metadata stores the versioned crop policy, source `B5` file hash, original 20-epoch parent identity, source group mask digest, and resolved group weights. Importing `B5` retains its optimizer, AMP scaler, and epoch counter (`5`) to apply the augmentation intervention mid-stream; any subsequent resume from a `context-crop-updates-v1` checkpoint requires matching crop probability, geometry policy, and training settings. Model state-dict keys and inference behavior remain unchanged.
