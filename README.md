@@ -1,4 +1,4 @@
-# VizWiz VQA Grounding — main
+# VizWiz VQA Grounding: main
 
 Original CLIP grounding baseline with cross-attention and the original mask decoder. This checkout runs the `main` model through `train.py` and `eval.py`.
 
@@ -29,6 +29,6 @@ Licensed under [Creative Commons Attribution 4.0 International](http://creativec
 
 ## Repository scope
 
-This checkout contains research code for data preparation, training, evaluation, and prediction. The upstream static website and its decorative assets have been removed. The original presentation remains available in the upstream repository.
+This checkout contains research code for data preparation, training, evaluation, and prediction. The upstream static website and its decorative assets have been removed; the original presentation remains in the upstream repository.
 
-The retained upstream figures are historical illustrations, not results from this fork's experiments: [architecture](images/model.png), [grounding examples](images/task.png), and [prediction examples 1](images/m1.png), [2](images/m2.png), [3](images/m3.png).
+Upstream reference figures are kept in `images/`: [architecture](images/model.png), [grounding examples](images/task.png), and [prediction examples 1](images/m1.png), [2](images/m2.png), [3](images/m3.png).
