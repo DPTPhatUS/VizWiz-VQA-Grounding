@@ -2,11 +2,7 @@
 
 Branch: `exp/ocr-evidence-pyramid`.
 
-Keep the exact B +5 / mild_focus epoch5 pyramid frozen. Train a small OCR evidence
-adapter to refine regions supported by native-image text proposals. This tests
-whether explicit evidence localization improves small and medium targets without
-sacrificing whole-object grounding. Accuracy and transfer are hypotheses, not
-established results.
+This branch freezes the `B+5` (`mild_focus` epoch 5) pyramid and trains a lightweight OCR evidence adapter to refine predictions within native-image text regions, testing whether explicit text-proposal localization improves small and medium targets while preserving whole-object grounding.
 
 ## Architecture
 
@@ -41,73 +37,42 @@ upright RGB + question
 final logits = base logits + sum(candidate_probability * local_correction)
 ```
 
-The production adapter has **293,938 trainable parameters**. This excludes the
-frozen parent and frozen OCR; report all three components when claiming efficiency.
-No second language backbone is instantiated. Only short OCR strings are mean
-pooled; the selector receives the complete question token sequence.
+The adapter adds **293,938 trainable parameters** on top of the frozen `B+5` pyramid and frozen mobile OCR pipeline. Rather than instantiating a second language model, the `full` run encodes short recognized OCR strings with the existing frozen CLIP text encoder (mean-pooled per candidate), while candidate queries attend to the full sequence of question tokens.
 
-The final correction layer starts at zero: initialization reproduces B+5 exactly.
-Missing OCR gives exact fallback even after training. Nonempty but wrong OCR
-does not have an accuracy guarantee: the model must learn NULL. Corrections can
-add or remove foreground, but only within 1.25x candidate boxes on the 768 grid.
-Native resizing can affect boundary pixels; bounding support does not guarantee
-large-object preservation. OCR polygons are NOT used directly as final masks.
+The final correction layer is zero-initialized so the model reproduces `B+5` at initialization, and images with zero OCR detections fall back to `B+5` even after training. When OCR detections are present but irrelevant to the question, the selector can route probability to the explicit `NULL` candidate. Local corrections can add or remove foreground within a `1.25x` padded bounding box around each candidate on the `768x768` grid (OCR polygons themselves are not used directly as output masks).
 
-The adapter accepts arbitrary text/detail channel dimensions; the current wrapper
-connects the existing CLIP pyramid. Another backbone needs the corresponding
-feature wrapper and training; existing weights are not automatically transferable.
-Cache schema is OCR-provider neutral, with upright native xy coordinates and
-decoded-RGB hashes. No image IDs, answer vocabulary or GT-size gates enter the
-adapter. `predict_ocr.py` supports arbitrary images with no GT files.
+The adapter constructor accepts arbitrary text and detail channel dimensions and is wired here to the 336/768 CLIP pyramid. The OCR cache schema stores upright native `(x, y)` polygon coordinates, recognized strings, confidences, and decoded-RGB SHA256 hashes without image IDs, answer vocabularies, or ground-truth size gates. `predict_ocr.py` runs inference on arbitrary images without ground-truth annotations.
 
 ## Two matched runs
 
 | Run | Candidate geometry + native appearance | Recognized OCR text |
 |---|---|---|
-| geometry | Yes | No |
-| full | Yes | Yes, same frozen CLIP encoder |
+| `geometry` | Yes | No |
+| `full` | Yes | Yes (via frozen CLIP text encoder) |
 
-Both start independently from the same B+5 and adapter seed; both parents stay
-frozen. This is adapter training, NOT continuing B+5's optimizer.
-OCR dropout=0.2 removes all candidates for a training image; text dropout=0.2
-removes recognized content while retaining geometry/appearance.
-Defaults: AdamW, LR 1e-4 constant, decay 0.01, global batch 4, accumulation 1,
-FP16 AMP on CUDA, 20 epochs, save every 5, no per-epoch validation.
-All listed training controls can be overridden by flat JSON: **config > CLI > default**.
-Paths stay on CLI. See `uv run train_ocr.py --help`.
+Both runs start independently from the same frozen `B+5` parent and adapter seed (`42`). During training, `ocr_dropout = 0.2` drops all OCR candidates for an image, and `text_dropout = 0.2` masks out recognized strings while keeping candidate geometry and visual appearance.
 
-Loss: final per-image BCE + 0.5 Dice, plus 0.1 selection and 0.1 local loss.
-Selection uses soft native-GT box Dice across relevant candidates; NULL is
-supervised when all candidate Dice values are below 0.1. Local native-crop
-targets use area downsampling; unrelated candidates do not receive local
-segmentation supervision. This avoids learning a gate solely from whether an
-adapter beats an overfit parent's training predictions. All GT relevance/patch
-targets are dataset-side training fields and are never model inputs.
-This gate threshold is a training relevance definition, not a tuned inference
-threshold. Empty-GT images use NULL.
+Default training hyperparameters: AdamW, constant learning rate `1e-4`, weight decay `0.01`, global batch size `4`, gradient accumulation `1`, FP16 AMP on CUDA, 20 epochs, checkpoint saving every 5 epochs, and no per-epoch validation. Training controls can be overridden via a flat JSON config (**JSON config > CLI flag > default**; file paths remain on the CLI). See `uv run train_ocr.py --help` for all options.
+
+The training loss combines final per-image `BCE + 0.5 * Dice` with `0.1 * selection_loss` and `0.1 * local_loss`. Candidate selection supervision uses soft native-GT box Dice across relevant candidates, supervising `NULL` whenever all candidate Dice overlaps fall below `0.1` (including on empty-GT images). Local crop supervision uses area-downsampled ground-truth masks on relevant candidates only, so candidate gating is supervised by ground-truth overlap rather than whether the adapter improves on the parent's training logits. All ground-truth relevance and crop targets are computed in the dataset loader during training only.
 
 ## Kaggle workflow: one CPU session, then GPU sessions A and B
 
-Use THREE fresh sessions in this order. Do not train both experiments in one session.
+Run three fresh Kaggle sessions in order:
 
 | Session | Accelerator | Inputs to attach | Work | Download |
 |---|---|---|---|---|
 | CPU | None | VizWiz | Cache OCR for train/val/test; audit coverage | `ocr_cache_and_coverage.zip` |
-| A | 2xT4 | VizWiz + B+5 + uploaded OCR cache | Train `geometry` for 20 epochs; evaluate/diagnose | `ocr_geometry_ep20_seed42.zip` and adapter checkpoints |
+| A | 2xT4 | VizWiz + `B+5` + uploaded OCR cache | Train `geometry` for 20 epochs; evaluate/diagnose | `ocr_geometry_ep20_seed42.zip` and adapter checkpoints |
 | B | 2xT4 | Same inputs as A | Train `full` for 20 epochs; evaluate/diagnose | `ocr_full_ep20_seed42.zip` and adapter checkpoints |
 
-A and B start independently from the SAME B+5 parent and seed42. B does NOT resume
-A. The complete parent (CLIP encoders, CNN pyramid and decoder) stays frozen.
-Only the 293,938-parameter adapter is trained. Frozen parent forward computation
-is still required each epoch; runtime on 2xT4 has not been measured.
+Sessions A and B each train only the 293,938-parameter adapter while running frozen parent forward passes each epoch.
 
-## CPU session — create the reusable OCR cache
+## CPU session: create the reusable OCR cache
 
-Enable Internet and set Accelerator to None. Attach only VizWiz. No B+5 checkpoint
-is needed here. Do NOT run `uv sync` in this CPU session: OCR preprocessing and
-coverage do not need PyTorch or CLIP.
+Enable Internet, set Accelerator to **None**, and attach only the VizWiz dataset. Skip `uv sync` in the CPU session because OCR caching and coverage auditing do not use PyTorch or CLIP.
 
-### CPU cell 1 — Clone and paths
+### CPU cell 1: Clone and paths
 
 ```python
 !pip install -q uv
@@ -121,13 +86,9 @@ os.environ["OCR_CACHE"] = "outputs/ocr_cache"
 os.environ["OMP_NUM_THREADS"] = "2"
 ```
 
-### CPU cell 2 — Install OCR and cache all three splits
+### CPU cell 2: Install OCR and cache all three splits
 
-The separate `/tmp/ocr-env` is only a local Python environment, not an artifact
-to upload. The mobile OCR weights download automatically. These pinned backend
-versions were smoke-tested. Document dewarping/orientation modules are disabled;
-max detection side=1600 bounds compute and coordinates refer to upright native
-RGB images. All recognition confidences are retained for the downstream selector.
+The `/tmp/ocr-env` virtual environment is a local scratch environment for running PaddleOCR on CPU. Mobile OCR weights download automatically, document orientation/dewarping modules are disabled, and `--max-side 1600` bounds detection resolution while recording coordinates in upright native RGB image space.
 
 ```bash
 %%bash
@@ -143,17 +104,9 @@ uv pip install --python /tmp/ocr-env/bin/python \
     --split val --max-candidates 24 --output-dir outputs/ocr_coverage
 ```
 
-This processes each image once, without using Q/answer/GT as OCR input.
-The audit reads validation masks to measure proposal coverage; it does not train
-a model. Read `outputs/ocr_coverage/coverage.json` before starting A/B. Missing
-target coverage is a reason to reconsider OCR proposals before spending GPU time.
-Coverage/oracle metrics are diagnostics, not model accuracy or transfer evidence.
+`cache_ocr.py` processes each image once without reading questions, answers, or ground-truth masks. `audit_ocr.py` then compares the cached validation proposals against validation ground-truth masks and writes `outputs/ocr_coverage/coverage.json` so you can inspect proposal coverage before running the GPU sessions. If `cache_ocr.py` is interrupted, rerunning it with the same `--cache-root` verifies and skips completed image records.
 
-If interrupted within the same session, rerun cache_ocr with the same cache
-directory: existing image records are verified and skipped. For an audit rerun,
-choose a fresh output directory because the audit does not overwrite results.
-
-### CPU cell 3 — Verify completeness and ZIP for download
+### CPU cell 3: Verify completeness and ZIP for download
 
 ```python
 import json
@@ -181,9 +134,7 @@ with ZipFile(archive_path, "w", ZIP_DEFLATED) as archive:
 print(archive_path)
 ```
 
-Download `outputs/ocr_cache_and_coverage.zip`, extract it, and upload the
-`ocr_cache/` folder as a new Kaggle dataset. You may include `ocr_coverage/`
-for reference. Keep this folder structure:
+Download `outputs/ocr_cache_and_coverage.zip`, extract it, and upload the `ocr_cache/` directory as a Kaggle dataset (optionally alongside `ocr_coverage/`):
 
 ```text
 ocr_cache/
@@ -195,34 +146,28 @@ ocr_coverage/
     coverage.json
 ```
 
-The cache contains polygons, recognized strings, confidence, image hashes and
-provenance. Do not upload images, GT masks, Python environments or OCR weights
-again. In both GPU notebooks, OCR_CACHE must point to the folder containing
-`manifest.json` and the three split directories. Use its actual mounted path
-from the Kaggle sidebar.
+In both GPU sessions, point `OCR_CACHE` to the mounted directory containing `manifest.json` and the `train/`, `val/`, and `test/` folders.
 
-## GPU sessions A and B — run the following cells once per session
+## GPU sessions A and B: run the following cells once per session
 
-Create TWO fresh notebooks/sessions with Internet and 2xT4.
+Create two separate Kaggle sessions with Internet and **2x T4** GPUs enabled, attaching the same three inputs in each:
 
-Attach the same three inputs in each:
-1. VizWiz.
-2. The existing B+5 checkpoint dataset containing `mild_focus/checkpoint_epoch5.pt`.
-3. The OCR cache dataset uploaded after the CPU session.
+1. VizWiz dataset.
+2. The `B+5` checkpoint dataset containing `mild_focus/checkpoint_epoch5.pt`.
+3. The uploaded `ocr_cache` dataset from the CPU session.
 
 | Setting | Session A | Session B |
 |---|---|---|
-| MODE in cell 1 | `geometry` | `full` |
+| `MODE` in cell 1 | `geometry` | `full` |
 | Adapter epochs | 20 | 20 |
-| Parent | B+5 | Same B+5 |
+| Parent | `B+5` | Same `B+5` |
 | OCR cache | Uploaded CPU cache | Same cache |
 | Trainable weights | Fresh adapter | Independent fresh adapter |
 | Result ZIP | `ocr_geometry_ep20_seed42.zip` | `ocr_full_ep20_seed42.zip` |
 
-The remaining cells are identical. Each notebook trains ONLY its selected MODE.
-No Paddle installation or OCR regeneration is needed on the GPU.
+All remaining cells are identical across Sessions A and B, and no PaddleOCR installation is needed on the GPU machines.
 
-### GPU cell 1 — Setup (set MODE for A or B)
+### GPU cell 1: Setup (set MODE for A or B)
 
 ```python
 !pip install -q uv
@@ -249,12 +194,9 @@ for split in ("train", "val", "test"):
     assert (Path(os.environ["OCR_CACHE"]) / split).is_dir(), f"Missing OCR split: {split}"
 ```
 
-Edit OCR_CACHE to the real mounted path in BOTH notebooks. Change MODE to
-`full` in session B. Do not use original parent20, A/natural, crop or interpolation
-checkpoints as the parent. Output stays directly in `outputs/`; session A and B
-are separate filesystems and do not need nested run folders.
+Update `OCR_CACHE` to the mounted dataset path in both notebooks, and change `MODE` from `"geometry"` to `"full"` in Session B.
 
-### GPU cell 2 — Train this session's adapter for 20 epochs
+### GPU cell 2: Train this session's adapter for 20 epochs
 
 ```bash
 %%bash
@@ -270,13 +212,9 @@ uv run torchrun --standalone --nproc_per_node=2 train_ocr.py \
     --save-every 5 --seed 42 --amp
 ```
 
-There is no per-epoch validation. Save epochs5/10/15/20 and retain all four files.
-Each contains only adapter/optimizer/scaler/provenance, not another copy of B+5.
-Keep the original B+5 separately: both parent and adapter are required for loading.
-The loader checks the exact parent's SHA256. No automatic checkpoint deletion
-or duplicate final model is performed.
+This saves compact adapter checkpoints at epochs 5, 10, 15, and 20 (`checkpoint_epoch5.pt` through `checkpoint_epoch20.pt`), storing only the adapter weights, optimizer state, AMP scaler, and provenance (including the parent checkpoint's SHA256 hash) rather than duplicating the frozen `B+5` parent weights.
 
-### GPU cell 3 — Validation and diagnostics at epochs10 and20
+### GPU cell 3: Validation and diagnostics at epochs 10 and 20
 
 ```bash
 %%bash
@@ -295,16 +233,11 @@ for EPOCH in 10 20; do
 done
 ```
 
-`--view full` here means normal inference for the saved architecture: a geometry
-checkpoint still ignores recognized content. Evaluation reports native-resolution
-mean/global IoU, original-GT size groups and the frozen parent's paired score.
+Passing `--view full` runs normal inference for the checkpoint's trained architecture (a `geometry` checkpoint still ignores recognized text). Evaluation computes native-resolution mean and global IoU, size-group breakdowns, and paired deltas against the frozen `B+5` parent.
 
-### GPU cell 4 — Select on validation, test, and robustness diagnostics
+### GPU cell 4: Select on validation, test, and ablation diagnostics
 
-This selects the better validation mean IoU of epochs10/20; ties prefer epoch10.
-Test scores are never used for selection. Base/missing-OCR checks run in both
-sessions; removing/shuffling recognized text additionally runs in session B.
-Shuffling is fixed across images and independent of evaluation batch size.
+This cell picks the higher validation mean IoU between epochs 10 and 20 (breaking ties in favor of epoch 10), evaluates that checkpoint on the test split, and runs validation ablations (`base` parent-only and `missing` empty-OCR in both sessions, plus `geometry`-only and `shuffled_text` in Session B) along with an oracle headroom audit.
 
 ```python
 import json
@@ -351,10 +284,9 @@ subprocess.run([
 print(f"Session {mode}: selected adapter epoch {best}")
 ```
 
-Candidate-set and perfect-local-correction oracles use GT: they are diagnostic
-upper bounds, not deployable model scores.
+Note that `ocr_oracle_headroom` uses validation ground truth to compute upper-bound diagnostic metrics for the candidate set.
 
-### GPU cell 5 — ZIP this session's results
+### GPU cell 5: ZIP this session's results
 
 ```python
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -369,27 +301,13 @@ with ZipFile(archive_path, "w", ZIP_DEFLATED) as archive:
 print(archive_path)
 ```
 
-Download this result ZIP from each session for analysis. It contains masks,
-metrics, diagnostics and configs; it does NOT contain .pt files, the input OCR
-cache or the parent checkpoint. Download the four adapter checkpoints separately
-if you want to keep/resume them. Both sessions retain their checkpoints.
+Download `ocr_<mode>_ep20_seed42.zip` from each GPU session, and download the four compact adapter `.pt` files separately if you want to keep or resume them.
 
 ## Resume and inference notes
 
-If training is interrupted after a saved epoch, resume the SAME mode with the
-same parent/cache/settings, a NEW output directory and total `--num-epochs 20`.
-Add `--resume-checkpoint /path/checkpoint_epoch10.pt` to GPU cell 2 and use, for
-example, `--output-dir outputs_resume`. Then point RUN_ROOT at the resumed
-directory before evaluation. B must never resume A. The epoch counter refers to
-adapter epochs, not the parent's history.
+If a GPU session is interrupted after saving an intermediate checkpoint (such as `checkpoint_epoch10.pt`), resume that same mode in a new output directory (e.g., `--output-dir outputs_resume`) with `--resume-checkpoint /path/to/checkpoint_epoch10.pt` and `--num-epochs 20`. After training finishes, copy the earlier `checkpoint_epoch10.pt` into `outputs_resume` and set `RUN_ROOT = "outputs_resume"` so GPU cells 3 through 5 can evaluate both epoch 10 and epoch 20 unchanged.
 
-A resumed segment does not recreate earlier checkpoint files. To reuse GPU cells
-3-5 unchanged, copy the original small adapter checkpoint_epoch10.pt into the
-new RUN_ROOT AFTER resumed training finishes. If epoch10 is unavailable, evaluate
-the available checkpoints and adjust the selection list accordingly.
-
-For an arbitrary image, create its OCR record in an environment with the same
-pinned backend, then predict without any GT files:
+To run standalone prediction on a new image without ground-truth files, cache its OCR proposals with the pinned PaddleOCR environment and run `predict_ocr.py`:
 
 ```bash
 /tmp/ocr-env/bin/python cache_ocr.py --image /path/photo.jpg \
@@ -400,33 +318,12 @@ uv run predict_ocr.py --parent-checkpoint "$PARENT_CKPT" \
     --cache-root outputs/new_image_ocr --output outputs/photo_mask.png
 ```
 
-The CPU-only session does not install PyTorch; the GPU sessions do not install
-Paddle. This arbitrary-image example therefore needs both environments available
-on the same machine, or an OCR record transferred between them. It is not an
-extra required Kaggle training cell. To bypass OCR entirely, replace
-`--cache-root ...` in predict_ocr with `--no-ocr`.
+To bypass OCR at inference time and fall back to the frozen parent, replace `--cache-root ...` with `--no-ocr`.
 
-## Interpretation and transfer protocol
+## Interpretation and references
 
-Compare each run to its frozen parent's paired native predictions. Require useful
-small AND medium gains, inspect large-region damage, and report overall mean IoU
-alongside global IoU. Missing-OCR must reproduce the parent. Shuffled/removed text
-tests whether recognized content is used; it does not prove semantic reasoning.
-Do not infer transfer from these perturbations: evaluate a held-out dataset or
-backbone with its own preprocessing adapter and disclose whether any fine-tuning
-was performed. Full OCR runtime plus grounding runtime is the deployment cost;
-cached grounding timing alone excludes OCR and is explicitly labeled in metrics.
+Compare each adapter run against its frozen `B+5` parent on small, medium, and large ground-truth regions as well as overall mean and global IoU. Verify that `--view missing` matches `--view base` (`B+5`), and compare `full` against `geometry` and `shuffled_text` to measure the contribution of recognized text strings. Note that cached evaluation timing measures only the pyramid + adapter pass; end-to-end deployment latency also includes running mobile OCR on the input image.
 
-Known limits: unreadable text, logos missed by the detector, targets outside
-candidate support, top-N truncation, line-level rather than word-level boxes, and
-CLIP's text length limit. Non-text regions rely on the parent. Different OCR
-protocols must be evaluated as a separate experiment, not silently substituted.
+Known limitations of the OCR pipeline include severely blurred or unreadable text, logos missed by the text detector, targets outside the `1.25x` candidate box support, top-24 candidate truncation, line-level rather than word-level polygon boxes, and CLIP's token length limit.
 
-Implementation is based on standard OCR, cross-attention and residual refinement.
-Relevant references: [PaddleOCR API](https://www.paddleocr.ai/v3.3.1/en/version3.x/pipeline_usage/OCR.html),
-[PP-OCR](https://arxiv.org/abs/2009.09941),
-[M4C / OCR-aware multimodal reasoning](https://openaccess.thecvf.com/content_CVPR_2020/html/Hu_Iterative_Answer_Prediction_With_Pointer-Augmented_Multimodal_Transformers_for_TextVQA_CVPR_2020_paper.html).
-These references motivate components, not a claim of already improved VizWiz scores.
-
-Legacy pyramid utilities remain available. Original train.py/eval.py and old
-checkpoints retain their behavior; use train_ocr.py/eval_ocr.py for this experiment.
+References: [PaddleOCR API](https://www.paddleocr.ai/v3.3.1/en/version3.x/pipeline_usage/OCR.html), [PP-OCR](https://arxiv.org/abs/2009.09941), and [M4C / OCR-aware multimodal reasoning](https://openaccess.thecvf.com/content_CVPR_2020/html/Hu_Iterative_Answer_Prediction_With_Pointer-Augmented_Multimodal_Transformers_for_TextVQA_CVPR_2020_paper.html). Standard pyramid training and evaluation (`train.py` and `eval.py`) remain unchanged on this branch.
