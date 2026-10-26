@@ -1,8 +1,8 @@
 # Latent-Answer Grounding: Region/Pixel & Multi-Scale Detail Decoder (`exp/spatial-detail-decoder`)
 
-This branch tests a **Region/Pixel & Multi-scale Detail Decoder**. It combines the **Spatial Evidence-Decoder Interaction** from `exp/spatial-evidence-decoder` with a shallow **Pixel Detail Stem** and **Semantic-Guided Region-Pixel Detail Fusion** modules. This is a custom fusion design inspired by multi-level aggregation in [DDVT (Zhang et al., 2026)](https://arxiv.org/html/2607.23921v1#S3.SS2), rather than a reproduction of its CMA module.
+This branch implements a **Region/Pixel & Multi-Scale Detail Decoder**. It combines the **Spatial Evidence-Decoder Interaction** from `exp/spatial-evidence-decoder` with a shallow **Pixel Detail Stem** and **Semantic-Guided Region-Pixel Detail Fusion** modules, adapting multi-level aggregation ideas from [DDVT (Zhang et al., 2026)](https://arxiv.org/html/2607.23921v1#S3.SS2).
 
-Student inference requires only image + question. CLIP input is fixed at 336 pixels.
+Student inference requires only the image and question. CLIP input resolution is fixed at 336 pixels.
 
 ---
 
@@ -10,11 +10,11 @@ Student inference requires only image + question. CLIP input is fixed at 336 pix
 
 ### 1. Motivation and Problem Formulation
 
-The CLIP ViT-L/14-336 backbone uses $14 \times 14$ pixel patches, producing a $24 \times 24$ feature grid. A shallow image path lets the decoder access local features before this spatial compression. Whether it improves small-object grounding and boundary accuracy must be measured on validation data.
+The CLIP ViT-L/14-336 backbone uses $14 \times 14$ pixel patches, producing a $24 \times 24$ feature grid. Adding a shallow image path gives the decoder access to local spatial features before this patch compression.
 
-Inspired by DDVT (Zhang et al., 2026), this architecture introduces a dual-level vision representation:
+Inspired by DDVT (Zhang et al., 2026), the model uses a dual-stream vision representation:
 1. **Semantic Stream**: High-level semantic features modulated by latent answer evidence $A'$ across the decoder hierarchy.
-2. **Detail Stream**: A shallow convolutional stem operating on the same normalized, resized $336 \times 336$ image, without further downsampling. It cannot recover information already lost when the original image was resized.
+2. **Detail Stream**: A shallow convolutional stem operating directly on the normalized, resized $336 \times 336$ image without further downsampling.
 
 ```
 Resized RGB Image (3 x 336 x 336), then CLIP normalization
@@ -41,39 +41,38 @@ Resized RGB Image (3 x 336 x 336), then CLIP normalization
 ### 2. Core Components
 
 #### A. Pixel Detail Stem (`PixelDetailStem`)
-A lightweight, shallow 2-layer convolutional network operating directly on normalized, resized input images:
+A lightweight 2-layer convolutional stem operating on the normalized, resized input image:
 - **Layer 1**: $\text{Conv}_{3\times 3}(3 \to 16, \text{pad}=1) \to \text{GroupNorm}(4, 16) \to \text{GELU}$
 - **Layer 2**: $\text{Conv}_{3\times 3}(16 \to 16, \text{pad}=1) \to \text{GroupNorm}(4, 16) \to \text{GELU}$
-- **Output**: Learned local feature map $D \in \mathbb{R}^{B \times 16 \times 336 \times 336}$. No explicit high-pass or edge supervision is imposed.
+- **Output**: Local feature map $D \in \mathbb{R}^{B \times 16 \times 336 \times 336}$ trained end-to-end with the segmentation loss.
 
 #### B. Semantic-Guided Region-Pixel Fuser (`RegionPixelFuser`)
-Custom semantic-guided fusion. DDVT's Cross-Modal Multi-Scale Aggregation (CMA) also uses deformable alignment and CondConv; those operations are not implemented here.
+A semantic-guided fusion module that gates high-resolution detail features using the decoder's semantic stream:
 1. **Semantic Guidance Mask**: Visual features $X_{\text{sem}}$ (which already integrate latent answer evidence) generate a continuous 2D spatial guidance mask:
    $$M_{\text{guide}} = \sigma(\text{guide\_scale} \cdot \text{Conv}_{1\times 1}(X_{\text{sem}}) + \text{guide\_bias}) \in (0, 1)^{B \times 1 \times H_i \times W_i}$$
-2. **Spatial Gating**: Detail features $D$ are dynamically resampled to stage resolution $(H_i, W_i)$ and selectively gated:
+2. **Spatial Gating**: Detail features $D$ are resampled to the stage resolution $(H_i, W_i)$ and gated by the guidance mask:
    $$\widetilde{D} = D \odot M_{\text{guide}}$$
-   The mask is trained indirectly by segmentation loss. Suppression of clutter and selection of useful detail are hypotheses to evaluate, rather than guaranteed properties.
 3. **Depthwise-Separable Refinement**:
    $$\Delta X = \text{Refine}([\,X_{\text{sem}} \,\|\, \widetilde{D}\,])$$
 4. **Zero-Init Identity Residual**:
    $$X_{\text{out}} = X_{\text{sem}} + \text{residual\_scale} \cdot \Delta X$$
-   `residual_scale` is initialized to $0.0$, preserving the spatial-evidence decoder's output when common weights, inputs, and execution settings match. Scale parameters receive gradients first; gradients reach the detail stem as scales move away from zero.
+   `residual_scale` is initialized to $0.0$, preserving the spatial-evidence decoder's initial output when shared weights and inputs match. Scale parameters receive gradients on the first backward pass, and gradients flow into the detail stem as `residual_scale` moves away from zero.
 
-The default detail path adds **4,504 trainable parameters**. Its dense spatial activations still add computation and memory; parameter count alone does not establish runtime cost.
+The default detail path adds **4,504 trainable parameters**.
 
 ---
 
 ### 3. Modular Upsampling Hierarchy & Defaults
 
-The decoder features 4 progressive upsampling stages:
+The decoder has 4 progressive upsampling stages:
 - **Stage 0**: $48 \times 48$, 64 channels
 - **Stage 1**: $96 \times 96$, 32 channels
 - **Stage 2**: $192 \times 192$, 16 channels
 - **Stage 3**: $384 \times 384$, 16 channels
 
 #### Modular Configuration
-- **Strict Default**: Region-pixel detail fusion is applied to the **last 2 upsampling stages** (`detail_upsample_stages=(2, 3)` corresponding to $192 \times 192$ and $384 \times 384$), exactly where channels are narrow and boundary sharpness is most critical.
-- **Configurable Stages**: Can be set to any subset of stages or all 4 stages:
+- **Default Stages**: Region-pixel detail fusion is applied at the **last 2 upsampling stages** (`detail_upsample_stages=(2, 3)`, corresponding to $192 \times 192$ and $384 \times 384$), where channel width is narrow and boundary detail is finest.
+- **Configurable Stages**: Detail fusion can be enabled on any subset of the 4 stages:
 
 ```python
 from models.model import GroundingModel
@@ -92,31 +91,31 @@ model_last_only = GroundingModel(detail_upsample_stages=(3,))
 ```
 
 #### CLI Flags
-- `--no-spatial-evidence`: Disable all cosine spatial interaction, including the bottleneck, while retaining the latent-answer token, skip conditioning, and detail path. Use this for the alignment + detail comparison; train a fresh run with the matched alignment/stable/frozen-text settings.
-- `--spatial-detail` / `--no-spatial-detail`: Enable/disable detail fusion (default: enabled).
+- `--no-spatial-evidence`: Disable all cosine spatial interaction, including the bottleneck, while keeping the latent-answer token, skip conditioning, and detail path. Use this for the alignment + detail comparison on a fresh run with the matched alignment, `stable` loss, and frozen-text settings.
+- `--spatial-detail` / `--no-spatial-detail`: Enable or disable detail fusion (default: enabled).
 - `--detail-upsample-stages 2 3`: Upsampling stages for detail fusion (default: `2 3`).
-- `--detail-dim 16`: Channel dimension for pixel detail stem; a positive multiple of 4 (fresh-run default: `16`).
-- `--spatial-upsample-stages 0 1`: Spatial evidence interaction stages from Hướng 1 (default: `0 1`).
+- `--detail-dim 16`: Channel dimension for the pixel detail stem; must be a positive multiple of 4 (default: `16`).
+- `--spatial-upsample-stages 0 1`: Spatial evidence interaction stages (default: `0 1`).
 
 ---
 
 ### 4. Checkpoint Compatibility & Auto-Detection
 
-- **Inference/resume**: Existing entry points reconstruct the saved architecture, including detail width. Omitted architecture flags restore checkpoint settings; conflicting explicit resume flags raise an error.
-- **Weight initialization**: `initialize_weights(path_or_saved, model)` can add complete new modules to compatible compact checkpoints from the latent/spatial-evidence branches. It starts a new experiment. The U-Net architecture on `main` is not interchangeable with this compact architecture.
-- **Automatic detection**: `checkpoint_model_kwargs(saved)` inspects checkpoint metadata and state dict keys to automatically instantiate matching architectures.
-- **Buffer serialization**: Active stage IDs are stored in persistent buffers (`decoder.detail_stage_ids`, `decoder.spatial_stage_ids`), ensuring exact architecture reconstruction without external config files.
-- **Feature ownership**: `encode_image` returns an `ImageFeatures` object that keeps detail features with their image pyramid. Existing four-feature iteration/indexing is preserved. Callers with a plain pyramid must pass matching `detail_features` explicitly when detail fusion is active.
+- **Inference and resume**: Entry points reconstruct the saved architecture, including the detail channel width, directly from the checkpoint. Omitted architecture flags restore checkpoint settings, while conflicting explicit flags on resume raise an error.
+- **Weight initialization**: `initialize_weights(path_or_saved, model)` can load compatible compact checkpoints from the latent or spatial-evidence branches while initializing newly added detail modules. The U-Net architecture on `main` uses a different backbone/decoder layout and is not compatible.
+- **Automatic detection**: `checkpoint_model_kwargs(saved)` inspects checkpoint metadata and state dict keys to instantiate the matching architecture.
+- **Buffer serialization**: Active stage IDs are stored in persistent buffers (`decoder.detail_stage_ids`, `decoder.spatial_stage_ids`) for exact architecture reconstruction without external config files.
+- **Feature ownership**: `encode_image` returns an `ImageFeatures` container that bundles detail features with the image pyramid while preserving standard 4-feature iteration and indexing. Callers passing a plain tuple/list pyramid must pass `detail_features` explicitly when detail fusion is enabled.
 
 ---
 
 ## Training
 
-The dataset root contains `train_grounding.json`, `val_grounding.json`, image folders `train/`, `val/`, and masks in `binary_masks_png/<split>/`.
+The dataset root expects `train_grounding.json`, `val_grounding.json`, image directories `train/` and `val/`, and ground-truth masks under `binary_masks_png/<split>/`.
 
 ### Matched Single-Stage Comparison (Detail Decoder Enabled)
 
-Keep the alignment/stable recipe and frozen text encoder used by the spatial-evidence comparison. Checkpoints below are written directly to `outputs/`.
+This command matches the alignment recipe, `stable` loss version, and frozen text encoder used in the spatial-evidence comparison. Checkpoints are saved directly to `outputs/`.
 
 ```bash
 mkdir -p outputs/configs
@@ -135,7 +134,7 @@ uv run torchrun --nproc_per_node=2 train.py \
     --output-dir outputs
 ```
 
-### Training with Custom Detail Stages (e.g. all 4 stages)
+### Training with Custom Detail Stages (e.g., all 4 stages)
 
 ```bash
 uv run torchrun --nproc_per_node=2 train.py \
@@ -150,8 +149,8 @@ uv run torchrun --nproc_per_node=2 train.py \
     --output-dir outputs/spatial_detail_4stages
 ```
 
-Batch size is **global across GPUs**: 4 on two GPUs means 2 per GPU. Training chooses CUDA automatically, uses AMP on CUDA, and does not run validation.
-The historical CLI defaults remain `full` and `legacy`; the matched comparison above selects its recipe explicitly. Architecture flags omitted on a fresh run enable detail stages `(2, 3)` with 16 channels.
+`--batch-size` is **global across GPUs** (batch size 4 across 2 GPUs gives 2 images per GPU). Training selects CUDA automatically, enables AMP on CUDA, and runs without per-epoch validation.
+The default CLI values for `--training-recipe` and `--loss-version` remain `full` and `legacy` for backward compatibility, so pass `--training-recipe alignment --loss-version stable` explicitly for matched comparisons. When architecture flags are omitted on a fresh run, detail stages `(2, 3)` with 16 channels are enabled by default.
 
 | `--training-recipe` | Objective |
 |---|---|
@@ -160,13 +159,13 @@ The historical CLI defaults remain `full` and `legacy`; the matched comparison a
 | `alignment` | Predicted-answer mask supervision + answer-vector alignment |
 | `warmup` | Answer alignment throughout; mask supervision transitions from real A to predicted A' |
 
-For new matched comparisons, explicitly select `--loss-version stable`. This uses audited KL calculations and valid-answer reductions.
+Passing `--loss-version stable` uses the updated KL calculation and valid-answer reductions.
 
 ---
 
 ## Checkpoints and Evaluation
 
-`--save-every 10` writes resumable `checkpoint_epoch10.pt`, etc. Training also writes final raw weights as `model_final_epoch<N>.pt`.
+`--save-every 10` saves resumable checkpoints (`checkpoint_epoch10.pt`, `checkpoint_epoch20.pt`, etc.), and training also writes final weights to `model_final_epoch<N>.pt`.
 
 ```bash
 uv run python eval.py \
@@ -178,24 +177,21 @@ uv run python eval.py \
     --output-dir outputs/eval_val_detail_ep20
 ```
 
-Evaluation scores and exports masks at native resolution by default. Student predictions do not use ground-truth answers.
+Evaluation scores and exports masks at native image resolution using only the image and question.
 
 ---
 
 ## Diagnostics & Probes
 
-All diagnostic tools seamlessly support the detail decoder:
+All diagnostic scripts support the detail decoder:
 - `diagnose.py`: Compares Q-only, predicted-answer, and real-answer masks.
-- `probe_latent_conditioning.py`: Interventions, embedding retrieval, and conditioning traces.
-- `probe_predicted_answer.py`: Caches predicted vectors and runs answer swaps/zeroing.
-- `predict_save.py` & `visualize_predictions.py`: Single-image inference and mask overlay generation.
+- `probe_latent_conditioning.py`: Runs interventions, embedding retrieval, and conditioning traces.
+- `probe_predicted_answer.py`: Caches predicted vectors and runs answer swaps or zeroing.
+- `predict_save.py` & `visualize_predictions.py`: Single-image inference and mask overlay visualization.
 
 ## Encoder freezing and optimization
 
-Omitting the options below preserves this branch's existing training behavior:
-Adam, LR `1e-5`, zero weight decay, no LR schedule, and the branch's original
-encoder freezing policy. Freezing is opt-in; the detail CNN and decoder remain
-trainable. No model/state-dict keys or evaluation preprocessing change.
+Omitting the options below keeps the branch's default training configuration: Adam with LR `1e-5`, zero weight decay, constant LR, and the default encoder freezing policy. Encoder freezing is opt-in, while the detail stem and decoder always remain trainable. Model state-dict keys and evaluation preprocessing are unchanged.
 
 | Option | Values / default |
 | --- | --- |
@@ -212,15 +208,9 @@ trainable. No model/state-dict keys or evaluation preprocessing change.
 | `--poly-power` | Positive exponent for `poly`; default `0.9` |
 | `--config` | Flat JSON with training options; optional |
 
-`BOOL` accepts `True` or `False`; a freeze flag without a value means `True`.
-The aliases `--no-freeze-backbone`, `--no-freeze-vision-encoder`, and
-`--no-freeze-text-encoder` mean `False`. An explicit component setting overrides
-`freeze_backbone` within the same source. **JSON config > explicit CLI > branch
-defaults**: a config shorthand also overrides component flags on the CLI.
-Existing recipe/loss settings can share the same JSON; unsupported keys fail
-early. Existing branch-specific flags remain available through `train.py --help`.
+`BOOL` accepts `True` or `False`; passing a freeze flag without a value sets it to `True`. The negative aliases `--no-freeze-backbone`, `--no-freeze-vision-encoder`, and `--no-freeze-text-encoder` set the corresponding flag to `False`. Within the same configuration source, a specific encoder flag overrides `freeze_backbone`. Precedence follows **JSON config > explicit CLI > branch defaults**, so a JSON shorthand also overrides component flags passed on the CLI. Recipe and loss settings can share the same JSON file, and unrecognized keys raise an error immediately. Run `train.py --help` to see all branch-specific flags.
 
-Append, for example, to this branch's existing training command:
+Example CLI flags to freeze the backbone and use AdamW with a cosine schedule:
 
 ```bash
 --freeze-backbone True \
@@ -232,14 +222,9 @@ Append, for example, to this branch's existing training command:
 --min-lr-ratio 0.1
 ```
 
-This is a configurable experiment example, not a validated best hyperparameter
-setting. To freeze only vision while retaining the text policy, append
-`--freeze-vision-encoder True`. To explicitly train both encoders, use
-`--freeze-backbone False`. Models with a deliberately fixed reference stage
-(gain-guided refinement) reject encoder unfreezing to preserve that algorithm.
-Unused CLIP/SigLIP pooled-output parameters stay frozen when unfreezing token encoders.
+To freeze only the vision encoder while keeping the default text policy, pass `--freeze-vision-encoder True`. To train both encoders explicitly, pass `--freeze-backbone False`. Branches that rely on a fixed reference stage (such as gain-guided refinement) reject encoder unfreezing. Unused CLIP/SigLIP pooled-output parameters remain frozen when token encoders are unfrozen.
 
-Equivalent JSON (`--config path/to/train.json`):
+Equivalent JSON configuration (`--config path/to/train.json`):
 
 ```json
 {
@@ -253,19 +238,6 @@ Equivalent JSON (`--config path/to/train.json`):
 }
 ```
 
-Frozen encoders stay in eval mode during training and are excluded from the
-optimizer when a freezing option is set. LR schedules advance after successful
-optimizer updates, including gradient accumulation; AMP overflow skips do not
-advance them. Checkpoints save the resolved optimization settings, trainable
-parameter layout and schedule progress. Resume restores these settings and
-rejects conflicting options. For scheduled runs, keep the original total
-`--num-epochs`, loader length and accumulation so the LR trajectory is unchanged.
+Frozen encoders stay in `eval` mode during training and are excluded from the optimizer. Learning-rate schedules step once per completed optimizer update (accounting for gradient accumulation) and do not advance when AMP skips an update due to gradient overflow. Checkpoints record the resolved optimization config, trainable parameter layout, and scheduler state; resuming restores those settings and rejects conflicting overrides. When resuming a scheduled run, keep `--num-epochs`, dataloader length, and gradient accumulation unchanged so the LR schedule trajectory stays consistent.
 
-Old checkpoints still load for evaluation with the same architecture and
-weights. Full legacy resume keeps its original optimizer layout and constant
-LR behavior; changing freezing, optimizer, decay or enabling a new LR schedule
-requires a new run (or an explicit weights-only initialization where supported).
-Resume retains each branch's existing RNG/data-order policy; legacy branches
-that do not save or reconstruct RNG state do not guarantee bitwise replay.
-No freezing/optimization change retroactively changes a previously trained
-checkpoint or its reported results.
+Existing checkpoints remain compatible with evaluation and legacy constant-LR resume. Changing encoder freezing, optimizer type, weight decay, or LR scheduling requires starting a new run (or using weights-only initialization where supported).
