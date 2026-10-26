@@ -1,15 +1,12 @@
-# affinity-transport-pyramid
+# Affinity-transport pyramid (`exp/affinity-transport-pyramid`)
 
-Branch `exp/affinity-transport-pyramid`; parent pyramid `ddfdce1`. Fresh training, 20 epochs, I+Q only. Both pretrained encoders come from CLIP; vision fine-tunes and text stays frozen. The new spatial module is small; the full pyramid/backbones remain large. There is no teacher/reader and no answer loss.
+Branch: `exp/affinity-transport-pyramid`, based on `exp/question-guided-detail-pyramid` (`ddfdce1`). This experiment trains fresh for 20 epochs from pretrained CLIP using only the image and question (vision encoder fine-tuned, text encoder frozen, with no auxiliary answer head or external teacher).
 
 ## Design and limits
 
-A lightweight local head reads decoder semantics, high-resolution CNN features and Q. It predicts eight directional affinities plus a gate. The module forms a normalized weighted transport of the existing logit differences to eight adjacent pixels. A bounded residual changes logits by at most 2.0. Constant-logit interiors remain unchanged, and a coarse logit with absolute value greater than 2 cannot change binary sign at the model grid. This is not a guarantee of native-mask IoU preservation.
+A lightweight local head reads 384-scale decoder semantics, 768-scale high-resolution detail features, and the projected question vector to predict 8 directional neighbor affinities plus a spatial gate. Using these weights, the module computes a normalized local transport of coarse logit differences across the 8-connected neighborhood and adds a bounded residual correction (capped at `[-2.0, +2.0]` in logit space). Uniform interior regions with zero local logit differences remain unchanged, and coarse logits with magnitude above `2.0` cannot flip sign on the 768 model grid. Because this transport operates only on local logit differences around existing boundaries, it refines boundary alignment without synthesizing new disconnected regions or clearing large, confident false-positive interiors.
 
-GT masks supervise whether each neighboring pixel has the same grounding label. Positive and negative pair losses are balanced per image so rare boundary-crossing pairs are not drowned out by interiors. A same-label affinity does not prove a neighbor's prediction is correct; final segmentation loss also supervises the actual transport. No GT mask, boundary map, external detector, new image encoder or answer is used at inference. The correction can add or remove boundary pixels but cannot fix a confident, uniformly wrong object interior.
-
-Related work: [SegFix, ECCV 2020](https://www.ecva.net/papers/eccv_2020/papers_ECCV/papers/123570477.pdf) learns boundary-to-interior directions. This implementation instead reuses existing Q-conditioned features, learns soft local affinities, and trains bounded logit transport jointly with the grounder. It is not a reproduction of SegFix or a claim that local affinity learning is novel.
-
+Ground-truth masks supervise whether adjacent pixels share the same binary label, using per-image class balancing between same-label and cross-boundary neighbor pairs so interior pixels do not dominate the loss. Simultaneously, the main segmentation loss supervises the post-transport mask logits. While [SegFix (ECCV 2020)](https://www.ecva.net/papers/eccv_2020/papers_ECCV/papers/123570477.pdf) predicts boundary-to-interior offset fields from an independent boundary network, this module reuses the grounder's question-conditioned features to learn soft 8-neighbor logit transport end-to-end.
 
 ```text
 Image + Q -> pyramid -> raw final logits -----------------------+
@@ -23,13 +20,13 @@ Image + Q -> pyramid -> raw final logits -----------------------+
                                                final mask
 ```
 
-The added module has **1,153 parameters** in this pyramid adapter. The module constructor takes feature-channel/question dimensions and accepts rectangular spatial grids. It has no CLIP-specific imports, patch count or fixed image size. The experiment adapter is currently wired to the existing 336/768 CLIP pyramid. Trying a different backbone still requires its feature/preprocessing adapter; multiple trained backbones are not validated.
+The affinity-transport module adds **1,153 trainable parameters**. Its constructor is parameterized by feature channel width and question dimension and supports arbitrary rectangular spatial grids without CLIP-specific imports or fixed patch counts; on this branch it is wired to the 336/768 CLIP detail pyramid.
 
-Training uses the original final/auxiliary segmentation losses plus coarse segmentation (weight 0.2) and class-balanced affinity loss (weight 0.05). The coarse loss protects the uncorrected predictor during joint training; it does not ensure no regression. Compare both final-vs-coarse within this run and final-vs-independent parent. These are different comparisons.
+Training combines the standard final and auxiliary pyramid segmentation losses with an explicit coarse pre-transport segmentation loss (`coarse_weight=0.2`) and the class-balanced neighbor affinity loss (`affinity_weight=0.05`). Supervising both coarse and final logits allows direct paired comparison between pre-transport and post-transport predictions within the same model, in addition to comparing against the standalone parent pyramid run.
 
 ## Kaggle setup
 
-Enable Internet and two GPUs. Use fresh `outputs`. No notebook is generated. CPU checks do not establish T4 VRAM fit, runtime or accuracy; preflight must pass.
+Enable Internet and two GPUs, and use a clean `outputs` directory.
 
 Python cell:
 
@@ -57,7 +54,7 @@ config = {'overlap_loss': 'dice', 'overlap_weight': 0.5, 'fp_weight': 0.7, 'aux9
 (root / "configs/spatial.json").write_text(json.dumps(config, indent=2))
 ```
 
-Config overrides explicit flags, then defaults. Loss weights are JSON controls. `fp_weight` affects Tversky only, not the default Dice. Optimizer/freeze controls remain available as flags and JSON.
+Precedence follows **JSON config > explicit CLI flags > defaults**. Loss weights are configured in JSON (`fp_weight` applies only when `overlap_loss="tversky"`), while optimizer and encoder-freezing settings can be passed via CLI flags or JSON.
 
 ## Preflight
 
@@ -72,11 +69,11 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
     --config "$RUN_ROOT/configs/spatial.json"
 ```
 
-Both ranks must pass. Preflight exercises real backbone forward/backward; updates are discarded, no checkpoint is written.
+Both ranks must pass preflight, which runs 3 real forward/backward steps under AMP and DDP and discards parameter updates without writing checkpoints.
 
 ## Train
 
-Global microbatch 2 / accumulation 2 gives effective batch 4 over two GPUs. If memory permits, preflight with batch 4 and use batch 4 / accumulation 1. No internal per-epoch validation.
+A global microbatch of 2 with `--gradient-accumulation-steps 2` gives an effective batch size of 4 across two GPUs (if memory permits, verify `--batch-size 4` in preflight and run with `--batch-size 4 --gradient-accumulation-steps 1`).
 
 ```bash
 %%bash
@@ -95,7 +92,7 @@ uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
 
 ## Four evaluations
 
-Select checkpoints/settings by validation, not test. Local test IoU requires test GT. Evaluation uses native-resolution masks and reports mean IoU separately from global foreground IoU.
+Select checkpoints and hyperparameters on the validation split only (scoring the test split requires local test ground-truth masks). `eval.py` evaluates native-resolution masks and reports per-image `mean_iou` alongside dataset-wide `global_iou`.
 
 ```bash
 %%bash
@@ -113,7 +110,7 @@ done
 
 ## Diagnostics
 
-The standard mask diagnostic is CPU-only. The paired diagnostic runs the model once per image, then compares raw and corrected predictions on native validation masks. GT is used only for metrics after predictions. It reports size-group IoU, added foreground hits and destroyed true positives. Coarse is from this same trained model, not the old parent checkpoint.
+`diagnose.py` runs standard CPU mask diagnostics on the exported PNG predictions. `diagnose_spatial.py` runs a single forward pass per validation image to compare the model's pre-transport coarse logits and post-transport final logits at native resolution, reporting IoU by ground-truth size bucket, newly added foreground hits, and removed true-positive pixels.
 
 ```bash
 %%bash
@@ -130,8 +127,6 @@ for epoch in 10 20; do
 done
 ```
 
-Inspect small/medium/large IoU, precision/recall, predicted area and paired damage. `affinity_loss` describes local label agreement, not guaranteed improvement; inspect actual pre/post IoU and destroyed true positives.
-
 ## Download ZIP without checkpoints
 
 ```python
@@ -146,10 +141,8 @@ with ZipFile(archive, "w", compression=ZIP_DEFLATED) as bundle:
 print(archive)
 ```
 
-Download `.pt` checkpoints separately. Total session time is not measured; training plus diagnostics might exceed the available runtime.
+Download `.pt` checkpoints separately from Kaggle Outputs.
 
 ## Checkpoints and experimental controls
 
-Only this branch's full checkpoints are valid resumes. Use `--resume-checkpoint` with original settings; `--num-epochs` specifies the final total. Parent and answer-experiment checkpoints remain valid on their own branches, not as resumes here. No old run is modified.
-
-The first useful result is the default fresh run. Do not change backbone/optimizer simultaneously. The two spatial experiments should first be evaluated separately, not combined. A favorable single-seed result motivates a matched control and more seeds; it does not establish novelty or a reliable improvement.
+Use `--resume-checkpoint` only with full checkpoints generated by this branch, keeping the original training settings while setting `--num-epochs` to the final target epoch count. Checkpoints from the parent pyramid or answer-supervision branches are not interchangeable with this branch.
