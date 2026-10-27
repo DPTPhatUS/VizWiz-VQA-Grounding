@@ -11,14 +11,17 @@ from PIL import Image
 from dataset import make_loader
 from evidence_selection import selection_metric_samples
 from metrics import global_iou_summary, metric_samples
+from models.ocr_pointer_model import EXPERIMENT as POINTER_EXPERIMENT
 from models.ocr_routing_model import EXPERIMENT as ROUTING_EXPERIMENT
 from models.ocr_scope_model import EXPERIMENT as SCOPE_EXPERIMENT
 from models.ocr_selection_model import EXPERIMENT as SELECTION_EXPERIMENT
 from ocr_cache import atomic_json
 from ocr_data import OCRGroundingDataset
+from ocr_pointer_data import OCRPointerDataset
 from ocr_routing_data import OCRRoutingDataset
 from ocr_selection_data import OCRSelectionDataset, selection_targets
 from training.ocr_checkpoint import load_ocr_model
+from training.ocr_pointer_objective import pointer_targets
 from utils import to_device
 
 
@@ -28,7 +31,7 @@ def main(argv=None):
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--data-root", required=True)
     p.add_argument("--cache-root", required=True)
-    p.add_argument("--dataset", choices=("val", "test"), default="val")
+    p.add_argument("--dataset", choices=("val", "test", "train-holdout"), default="val")
     p.add_argument(
         "--view",
         choices=("full", "base", "missing", "geometry", "shuffled_text", "evidence"),
@@ -49,11 +52,17 @@ def main(argv=None):
     selection = model.experiment_config["experiment"] in {
         SELECTION_EXPERIMENT,
         SCOPE_EXPERIMENT,
+        POINTER_EXPERIMENT,
     }
+    pointer = model.experiment_config["experiment"] == POINTER_EXPERIMENT
+    if args.dataset == "train-holdout" and not pointer:
+        raise ValueError("train-holdout is defined only for the sufficiency pointer")
     if args.view == "evidence" and not (routing or selection):
         raise ValueError("Independent evidence view requires a routing checkpoint")
     dataset_class = (
-        OCRSelectionDataset
+        OCRPointerDataset
+        if pointer
+        else OCRSelectionDataset
         if selection
         else OCRRoutingDataset
         if routing
@@ -61,12 +70,29 @@ def main(argv=None):
     )
     data = dataset_class(
         args.data_root,
-        args.dataset,
+        "train" if args.dataset == "train-holdout" else args.dataset,
         args.cache_root,
         model.image_size,
         detail_size=model.detail_size,
         max_candidates=config["max_candidates"],
+        **(
+            {"partition": "holdout", "split_seed": config["seed"]}
+            if args.dataset == "train-holdout"
+            else {}
+        ),
     )
+    if args.dataset == "train-holdout":
+        if (
+            data.cache_digest != config["cache_digest"]
+            or data.source_supervision_digest
+            != config["target_protocol"]["source_supervision_digest"]
+        ):
+            raise ValueError(
+                "Scorer holdout cache or supervision differs from training"
+            )
+        trained = config["target_protocol"]["split_protocol"]
+        if data.split_protocol["holdout"] != trained["holdout"]:
+            raise ValueError("Scorer holdout split differs from training")
     if data.cache_protocol != config["cache_protocol"]:
         raise ValueError(
             "OCR provider/protocol differs from training; export a separate transfer experiment"
@@ -145,7 +171,9 @@ def main(argv=None):
                         boxes=batch["ocr_boxes"][i].cpu().tolist(),
                         candidate_valid=output["candidate_valid"][i].cpu().tolist(),
                     )
-            if selection and "quality_logits" in output:
+            if selection and (
+                "quality_logits" in output or "selection_logits" in output
+            ):
                 for i, name in enumerate(batch["filename"]):
                     sample = {
                         key: batch[key][i]
@@ -159,9 +187,10 @@ def main(argv=None):
                     truth = Image.fromarray(
                         batch["original_mask"][i][0].cpu().numpy().astype("uint8") * 255
                     )
-                    target = selection_targets(truth, sample)[
-                        "hypothesis_quality"
-                    ].tolist()
+                    native_targets = selection_targets(
+                        truth, sample, include_word_purity=pointer
+                    )
+                    target = native_targets["hypothesis_quality"].tolist()
                     target[0] = base_scores[name]
                     valid = output["hypothesis_valid"][i].cpu().tolist()
                     selected = int(output["selected_index"][i])
@@ -171,14 +200,50 @@ def main(argv=None):
                         .nonzero()
                         .flatten()
                         .tolist(),
-                        "predicted_quality": output["predicted_quality"][i]
-                        .cpu()
-                        .tolist(),
+                        **(
+                            {
+                                "predicted_probability": output[
+                                    "selection_probability"
+                                ][i]
+                                .cpu()
+                                .tolist(),
+                                "token_probability": output["token_logits"][i]
+                                .float()
+                                .sigmoid()
+                                .cpu()
+                                .tolist(),
+                            }
+                            if pointer
+                            else {
+                                "predicted_quality": output["predicted_quality"][i]
+                                .cpu()
+                                .tolist()
+                            }
+                        ),
                         "actual_quality": target,
                         "valid": valid,
                         "members": sample["hypothesis_members"].cpu().tolist(),
                         "oracle_iou": max(q for q, v in zip(target, valid) if v),
                     }
+                    if pointer:
+                        qualities = torch.tensor([target], device=args.device)
+                        available = output["hypothesis_valid"][i : i + 1]
+                        labels, _, _, _ = pointer_targets(qualities, available)
+                        hypothesis_diagnostics[name].update(
+                            actual_word_purity=native_targets[
+                                "ocr_word_purity"
+                            ].tolist(),
+                            word_valid=output["candidate_valid"][i].cpu().tolist(),
+                            sufficiency_target=labels[0].cpu().tolist(),
+                            choice_ce=float(
+                                -(
+                                    labels
+                                    * output["selection_logits"][i : i + 1]
+                                    .float()
+                                    .log_softmax(1)
+                                ).sum()
+                            ),
+                        )
     summary = dict(
         num_samples=len(scores),
         mean_iou=sum(scores.values()) / len(scores),
@@ -227,6 +292,16 @@ def main(argv=None):
             summary["groups"][group]["evidence_mean_iou"] = sum(
                 evidence_scores[k] for k in names
             ) / len(names)
+    if pointer and hypothesis_diagnostics:
+        summary["pointer_choice_ce"] = sum(
+            d["choice_ce"] for d in hypothesis_diagnostics.values()
+        ) / len(scores)
+        summary["score_semantics"] = (
+            "categorical probability over OCR masks and defer; not predicted IoU"
+        )
+        summary["scorer_split"] = (
+            data.split_protocol if args.dataset == "train-holdout" else None
+        )
     if hypothesis_diagnostics:
         summary["hypothesis_oracle_mean_iou"] = sum(
             d["oracle_iou"] for d in hypothesis_diagnostics.values()

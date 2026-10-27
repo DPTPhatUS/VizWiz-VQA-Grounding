@@ -10,6 +10,7 @@ from torch.nn import functional as F
 
 from dataset import collate_samples
 from evidence_selection import selected_native_mask
+from models.ocr_pointer_model import EXPERIMENT as POINTER_EXPERIMENT
 from models.ocr_routing_model import EXPERIMENT as ROUTING_EXPERIMENT
 from models.ocr_scope_model import EXPERIMENT as SCOPE_EXPERIMENT
 from models.ocr_selection_model import EXPERIMENT as SELECTION_EXPERIMENT
@@ -72,6 +73,7 @@ def main(argv=None):
     selection = model.experiment_config["experiment"] in {
         SELECTION_EXPERIMENT,
         SCOPE_EXPERIMENT,
+        POINTER_EXPERIMENT,
     }
     if selection:
         sample.update(

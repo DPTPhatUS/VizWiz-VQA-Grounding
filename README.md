@@ -1,141 +1,141 @@
-# OCR scope ranking
+# OCR sufficiency pointer
 
-Branch: `exp/ocr-scope-ranking`.
+Branch: `exp/ocr-sufficiency-pointer`.
 
-The previous selector nearly always retained B+5 and overrated its mask on small
-targets. Its candidate scores tracked agreement with the parent more than agreement
-with GT. This experiment removes that explicit reference shortcut and tests a
-training recipe focused on wrong mask scope and harmful top choices.
+The previous scope scorer still predicted about 80% quality for small-region parent
+masks whose true mean IoU was about 20%. Removing explicit reference cues did not
+solve the deployment failure. This experiment changes the learning problem:
+**select an adequate OCR mask, or defer**. It never learns the parent's quality.
 
-| Run | `--architecture` | `--selector-recipe` | Change |
-|---|---|---|---|
-| A | independent | ranking | Shared scorer without reference/type/confidence shortcuts; previous quality+pairwise loss |
-| B | independent | scope | Same scorer; scope counterexamples and decision-regret losses |
+| Run | `--pointer-recipe` | Hypothesis |
+|---|---|---|
+| A | categorical | Direct phrase selection + a supervised defer class avoids parent-quality overestimation |
+| B | structured | Native word-purity supervision and a token-set score help reject irrelevant words in an otherwise plausible group |
 
-Both have **281,793 trainable parameters** and identical initialization. The frozen
-parent has 433,217,037 parameters and is stored separately. A/B use the same parent,
-data, seed, optimizer, global batch and matched dropout draws. B changes a training
-bundle (augmentation AND ranking objective); it is not an isolated loss ablation.
-Compared with the old selector, A changes the representation/context bundle; it
-is not a one-feature causal ablation. These changes address observed failures;
-accuracy gains are not established yet.
+Both start fresh, use the same initialization, image split, parent, cache and
+optimizer. B adds a training/score bundle, not an isolated loss ablation. A also
+changes representation and training data relative to older selectors; comparisons
+with those runs do not isolate one causal change. Accuracy gains remain unmeasured.
 
-## Architecture and invariants
+## Architecture
 
 ```text
 image + question
     |
-    +-- frozen B+5, one forward
-    |       Q tokens [B,L,768]
-    |       semantic features [B,16,384,384]
-    |       detail features [B,16,768,768]
-    |       base logits [B,1,768,768]
+    +-- frozen B+5 parent, one forward
+    |      Q tokens [B,L,768]
+    |      semantic [B,16,384,384], detail [B,16,768,768]
+    |      original base logits [B,1,768,768] ----------- fallback only
     |
     +-- existing frozen mobile OCR cache
-            polygons / text / confidence / native RGB crops
+           native polygons, crops, recognized strings, confidence
                     |
-            shared word encoder + Q attention + OCR context
+           crop CNN + local image features + geometry + frozen text encoding
                     |
-            unchanged, GT-free mask bank (max N=24 OCR regions)
-              base mask; individual polygons; nearby word groups; all-word union
+           Q-token attention -> OCR-set context -> word features [B,N,128]
                     |
-            EACH mask uses the SAME representation:
-              own region + surrounding ring + scene features
-              OCR content covered by that mask + ALL Q tokens
-              own geometry; no source ID or agreement with another mask
+           unchanged native mask bank: singles / local groups / all words
                     |
-            shared quality head -> compare estimated qualities
+           own-mask visual features + Q-token attention
                     |
-            use OCR only if predicted gain over base >0.02
+           masked attention to each phrase's MEMBER WORDS
                     |
-            native selected polygon union OR original base output
+           shared phrase pointer + learned defer query
+                    |
+           B only: word-purity logits -> token-set score -> add to OCR scores
+                    |
+           categorical softmax over [defer, OCR mask 1, ..., OCR mask K]
+                    |
+           OCR total mass > defer? best OCR mask : original base
 ```
 
-A small CNN combines reused semantic/detail features with RGB at 96x96. Native
-OCR appearance remains available through the crop encoder. Quality descriptors
-use binary-mask geometry, supersampled at 192 and pooled to 96. Parent sigmoid
-confidence is not an input cue. The final base still uses the original logits
-and native interpolation; only its descriptor is binarized.
+The head works at 96x96, while OCR crops retain native-region appearance at
+48x128 before the small crop encoder. Native output rasterization is unchanged.
+There is no trainable detector, duplicated text encoder, answer generator or extra
+large backbone. The parent and its vision/text encoders stay frozen and in eval
+mode. Adapter checkpoints exclude the parent.
 
-The scorer has no base token, source ID, reference IoU, intersection fraction or
-candidate/base disagreement feature. It still reuses parent features, which can
-carry the parent's learned biases. Reference-free means no DIRECT comparison
-features; it does not mean independence from the frozen feature extractor.
+The learned defer query sees Q, global image features and OCR context. It never
+sees base-mask geometry, confidence, overlap or a parent IoU target. Changing only
+base logits cannot change ANY pointer score. Parent features are reused, so this
+is not independence from the parent's feature distribution or a transfer result.
 
-Tested contracts:
-- Changing only base-mask geometry cannot change OCR hypothesis scores.
-- Increasing base-logit magnitude without changing the mask cannot change scores.
-- Identical mask descriptors receive identical scores regardless of bank slot.
-- Reordering hypotheses only reorders their scores.
+Each phrase attends to its member-word features rather than averaging every word.
+All Q tokens remain available in attention. Learned attention can still ignore
+useful content; the intervention views below test this rather than assuming it.
 
-The candidate bank and native output protocol are unchanged from the previous
-selection experiment. With N=24 there are at most 50 slots; invalid/duplicate padding
-is ignored. A hypothesis may contain several words. OCR polygons are rasterized
-at native resolution after selection; there is no 768px output detour for them.
-The base uses its original bilinear-logit resize and zero threshold. Missing OCR
-returns the exact base output. The 0.02 margin is fixed, not a calibrated safety
-guarantee. Wrong switches can still damage large targets.
+## Targets and objectives
 
-## Training recipes
+Let `u_i` be exact native IoU between OCR hypothesis i and the training GT mask.
+The base is NOT one of these training alternatives.
 
-Both use native GT mask IoU as detached quality targets, with train-only mask
-perturbations applied before recomputing the base-slot target. They never use GT
-or answers to choose a hypothesis at inference.
-
-**A: ranking control**
+- If at least one valid OCR mask has `u_i >= 0.5`, supervise masks within 0.05 of
+  the best IoU, also requiring `u_i >= 0.5`. Their target masses are proportional
+  to their IoUs; near ties are not arbitrarily assigned to one bank position.
+- Otherwise, the target is defer. Missing/dropped OCR always targets defer.
+- A shared OCR-only retrieval loss also trains the best available phrase when
+  its IoU is at least 0.1, even if the correct deployment decision is defer.
+- Targets are recomputed against the words actually available after OCR dropout.
+  No parent prediction, GT answer, validation mask or test label defines training.
 
 ```text
-L_A = quality BCE + gap-weighted pairwise ranking
+A: L = categorical CE + 0.25 * OCR retrieval CE
+B: L = categorical CE + 0.25 * OCR retrieval CE + 0.25 * word-purity BCE
 ```
 
-This matches the previous selector's loss mathematically (answer weight 0).
-Half the base-slot masks receive shifts or morphology, as a training-quality
-augmentation. The other half retain the original parent mask.
+The word target in B is native `intersection(OCR polygon, GT) / polygon area`.
+This is purity, not whole-mask IoU: a relevant word in a multiword answer can have
+high purity while low individual IoU. Positive/negative word groups are balanced
+within each image, then losses average over original images for correct DDP and
+accumulation behavior.
 
-**B: scope-focused training**
+For B, the score correction of OCR hypothesis i is
+`sum_j member[i,j] * word_logit[j] / sqrt(number_of_valid_words)`.
+Within OCR hypotheses this is a scaled Bernoulli set log likelihood up to a common
+constant. Including an irrelevant word lowers the correction; including several
+relevant words can help a true phrase. The defer score does not receive this term.
+The token head starts at zero, giving A/B identical initial scores and parameters.
 
-```text
-L_B = quality BCE + decision regret +2 * OCR retrieval regret
-```
+No margin or post-hoc threshold is tuned on validation/test. Normal inference
+uses OCR when its TOTAL probability mass exceeds defer probability (fixed 0.5),
+then selects the highest-scored OCR mask. This avoids a group of near-tied valid
+phrases splitting their probability and incorrectly losing to defer.
+Probabilities are NOT estimated IoUs.
+`actual_quality[0]` in exported metrics is the fallback's measured IoU for auditing;
+it never becomes the defer label. A sufficient OCR mask can still be worse than
+a good parent mask. This method therefore does not guarantee preservation of
+large-region scores; harmful switches are a required outcome measure.
 
-Half the base slots retain the original prediction. The other half, when OCR
-exists, are replaced with a randomly sampled tight OCR region, its expanded
-context rectangle (2--4x), or a union with another OCR region. Sampling uses only
-OCR geometry/availability, not GT. An added region is not automatically labelled
-wrong: the resulting native IoU determines its quality. These counterexamples
-model confusion between a local answer word and broader context.
+### Why a scorer holdout, and what it does not establish
 
-Decision regret focuses on the mask ACTUALLY chosen by the deployment policy,
-including the margin. If it loses more than 0.05 IoU against a better available
-hypothesis, a gap-weighted softplus pushes the better score above the wrong one.
-Adding many easy low-quality masks does not dilute this term. The OCR-only term
-trains retrieval even when the original parent is best; it is active only when
-there is OCR evidence with native IoU >= 0.1. Ties and small quality differences are
-not forced into an arbitrary winner.
+A fixed hash of image name + seed splits TRAIN into 85% fit / 15% scorer holdout.
+The same images are used by A/B, recorded explicitly in `run_config.json` and
+checked on resume/evaluation. The scorer never fits its holdout. No additional
+annotation or CPU caching session is needed.
 
-Quality BCE balances overlapping/disjoint hypotheses inside each image. All
-terms then average over ORIGINAL images, preserving DDP/accumulation when one
-rank has no OCR. Recipe-specific augmentation uses the same RNG budget so A/B
-OCR/text-dropout patterns remain matched. Constants and recipe are recorded in
-checkpoints. Both runs disable the old answer auxiliary loss: it did not improve
-held-out mask selection in the previous experiment.
+The parent has already seen these images. This is **not an unseen-parent split or
+out-of-fold experiment**. The new targets do not depend on parent correctness, so
+we can check the scorer's own generalization without fitting a parent-quality
+regressor. Shared parent features can still bias it. An actual out-of-fold parent
+comparison would require retraining parents; this guide does not pretend to do it.
 
-The parent, its CLIP text/vision encoders and OCR remain frozen. Only the scorer
-trains. No teacher checkpoint, new OCR cache, additional annotations or backbone
-is needed. This is not out-of-fold calibration: parent training-distribution bias
-can persist despite removing explicit shortcuts. It must be assessed from results.
+Choose among epochs 5/10/15/20 by the LOWEST scorer-holdout categorical CE, with
+earlier epoch breaking exact ties. Validation and test then report final native
+mIoU/global IoU and small/medium/large behavior. Do not choose a different checkpoint
+or threshold after inspecting test. This pilot's selection rule differs from the
+older validation-mIoU rule and is recorded in `selection.json`.
 
 ## Kaggle: two fresh GPU sessions, 20 epochs each
 
-Enable Internet and 2xT4. Attach VizWiz, the exact B+5 parent and the existing OCR
-cache. Use these cells in each session, changing only `RUN_VARIANT` to A or B.
-B starts independently; do not resume any A/B selector from the previous branch.
+Enable Internet and 2xT4. Attach the same VizWiz dataset, B+5 parent and OCR cache.
+Run these cells once with A, then in a fresh session with B. Only the small head
+trains for 20 epochs; neither run resumes the previous selector or the other run.
 
 ### Cell 1: setup
 
 ```python
 !pip install -q uv
-!git clone --single-branch --branch exp/ocr-scope-ranking https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+!git clone --single-branch --branch exp/ocr-sufficiency-pointer https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
 %cd /kaggle/working/VizWiz-VQA-Grounding
 !uv sync --frozen
 
@@ -143,7 +143,7 @@ import os
 from pathlib import Path
 
 os.environ["RUN_VARIANT"] = "A"  # Fresh second session: "B"
-os.environ["SELECTOR_RECIPE"] = "ranking" if os.environ["RUN_VARIANT"] == "A" else "scope"
+os.environ["POINTER_RECIPE"] = "categorical" if os.environ["RUN_VARIANT"] == "A" else "structured"
 os.environ["DATA_ROOT"] = "/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz"
 os.environ["PARENT_CKPT"] = "/kaggle/input/datasets/khoahoang0512/vizwiz-size-weighted-pyramid-cp/mild_focus/checkpoint_epoch5.pt"
 os.environ["OCR_CACHE"] = "/kaggle/input/datasets/khoahoang0512/vizwiz-ocr-cache/ocr_cache"
@@ -156,9 +156,10 @@ assert Path(os.environ["PARENT_CKPT"]).is_file()
 assert (Path(os.environ["OCR_CACHE"]) / "manifest.json").is_file()
 ```
 
-The parent is **mild_focus/checkpoint_epoch5.pt (B+5)**. Do not substitute the raw
-pyramid epoch20, natural/A, interpolation/crop model or any old OCR adapter.
-Parent SHA256, OCR protocol and native training-supervision digest are checked.
+Use the exact **mild_focus/checkpoint_epoch5.pt (B+5)**, SHA256
+`d0058ab5d7ae4c9470b98f0728c15f20df4c32e68cbfa1a9d7bdf1960ac8953e`.
+The parent is pyramid20 + mild-focus5, not an OCR adapter. Its training cost still
+counts when comparing complete systems. No new cache upload is required.
 
 ### Cell 2: train
 
@@ -170,11 +171,10 @@ uv run torchrun --standalone --nproc_per_node=2 train_ocr.py \
     --data-root "$DATA_ROOT" \
     --cache-root "$OCR_CACHE" \
     --output-dir "$RUN_ROOT" \
-    --architecture independent \
-    --selector-recipe "$SELECTOR_RECIPE" \
+    --architecture pointer \
+    --pointer-recipe "$POINTER_RECIPE" \
     --evidence-mode full \
     --answer-weight 0 \
-    --min-gain 0.02 \
     --num-epochs 20 \
     --batch-size 4 \
     --gradient-accumulation-steps 1 \
@@ -190,13 +190,14 @@ uv run torchrun --standalone --nproc_per_node=2 train_ocr.py \
     --amp
 ```
 
-Batch 4 is GLOBAL:2 per GPU. Batch 2 with accumulation 2 preserves effective global
-batch 4 if needed. LR is constant; the parent is frozen. No validation runs inside
-training. `--save-every 5` saves 5/10/15/20. Each production scorer checkpoint with
-AdamW state is approximately 3.25 MiB; all four require about 13 MiB, excluding results
-and dependency caches. The large parent is NOT saved in these files.
+Batch 4 is GLOBAL, 2 per GPU. If necessary, batch 2 + accumulation 2 keeps the same
+effective global batch. No validation runs inside training. Checkpoints at
+5/10/15/20 contain only the adapter + optimizer/scaler, not the large frozen parent.
+Both heads have **347,970 parameters**. Head + AdamW state is about 4 MiB per
+checkpoint before small protocol metadata; all four require only a few tens of
+MiB. The frozen parent still has 433,217,037 parameters stored separately.
 
-### Cell 3: evaluate every saved checkpoint and diagnose selection
+### Cell 3: evaluate the scorer holdout at each checkpoint
 
 ```bash
 %%bash
@@ -206,32 +207,39 @@ for EPOCH in 5 10 15 20; do
         --parent-checkpoint "$PARENT_CKPT" \
         --checkpoint "$RUN_ROOT/checkpoint_epoch$EPOCH.pt" \
         --data-root "$DATA_ROOT" --cache-root "$OCR_CACHE" \
-        --dataset val --view full --batch-size 4 --num-workers 2 \
-        --output-dir "$RUN_ROOT/eval_val_ep$EPOCH"
-    uv run diagnose_evidence_selection.py \
-        --predictions "$RUN_ROOT/eval_val_ep$EPOCH" \
-        --output-dir "$RUN_ROOT/selection_diagnostic_ep$EPOCH"
+        --dataset train-holdout --view full --batch-size 4 --num-workers 2 \
+        --output-dir "$RUN_ROOT/eval_holdout_ep$EPOCH"
+    uv run diagnose_ocr_pointer.py \
+        --predictions "$RUN_ROOT/eval_holdout_ep$EPOCH" \
+        --output-dir "$RUN_ROOT/pointer_holdout_ep$EPOCH"
 done
 ```
 
-Evaluation includes native mean/global IoU, size groups, all predicted/actual
-hypothesis qualities and native PNGs. Diagnostics report base-quality bias,
-quality MAE, OCR ranking mistakes, missed retrieved gains and harmful switches.
-GT-based oracle/regret values are diagnostic only. No GT enters the selection
-policy. Use `eval_ocr.py`, not the parent's `eval.py`, for scorer checkpoints.
+`train-holdout` is available only for pointer checkpoints. It uses the saved split
+seed and checks the held-out image list. `pointer_choice_ce` uses OCR/GT sufficiency
+labels and ignores the parent IoU. Holdout grounding IoU is exported for context;
+it is not a claim about unseen-parent performance.
 
-### Cell 4: select by validation, evaluate test and robustness
+### Cell 4: select, evaluate validation/test and run interventions
 
 ```python
 import json
 import subprocess
 
 root = Path(os.environ["RUN_ROOT"])
-best = max((5, 10, 15, 20), key=lambda epoch: (
-    json.loads((root / f"eval_val_ep{epoch}/metrics.json").read_text())["summary"]["mean_iou"],
-    -epoch,
+best = min((5, 10, 15, 20), key=lambda epoch: (
+    json.loads((root / f"eval_holdout_ep{epoch}/metrics.json").read_text())["summary"]["pointer_choice_ce"],
+    epoch,
 ))
+(root / "selection.json").write_text(json.dumps({
+    "variant": os.environ["RUN_VARIANT"],
+    "pointer_recipe": os.environ["POINTER_RECIPE"],
+    "selected_epoch": best,
+    "selection_metric": "train_scorer_holdout_choice_ce", "direction": "min",
+    "tie_break": "earlier_epoch", "parent_unseen_holdout": False,
+}, indent=2))
 for split, view in [
+    ("val", "full"),
     ("test", "full"),
     ("val", "base"),
     ("val", "missing"),
@@ -249,33 +257,37 @@ for split, view in [
         "--batch-size", "4", "--num-workers", "2",
         "--output-dir", str(root / f"eval_{split}_{view}_ep{best}"),
     ], check=True)
+for split in ("val", "test"):
+    subprocess.run([
+        "uv", "run", "diagnose_ocr_pointer.py",
+        "--predictions", str(root / f"eval_{split}_full_ep{best}"),
+        "--output-dir", str(root / f"pointer_{split}"),
+    ], check=True)
 subprocess.run([
     "uv", "run", "diagnose.py", "--data-root", os.environ["DATA_ROOT"],
-    "--predictions", str(root / f"eval_val_ep{best}"),
+    "--predictions", str(root / f"eval_val_full_ep{best}"),
     "--output-dir", str(root / "mask_diagnostic"),
 ], check=True)
-(root / "selection.json").write_text(json.dumps({
-    "variant": os.environ["RUN_VARIANT"],
-    "selector_recipe": os.environ["SELECTOR_RECIPE"],
-    "selected_epoch": best,
-    "selection_metric": "validation_mean_iou", "tie_break": "earlier_epoch",
-}, indent=2))
-print(f"Selected epoch {best}, recipe {os.environ['SELECTOR_RECIPE']}")
+print(f"Selected epoch {best}, recipe {os.environ['POINTER_RECIPE']}")
 ```
 
-Only validation chooses the checkpoint; test never chooses the margin or recipe.
-`base`/`missing` must match. `geometry` removes recognized-string embeddings but
-keeps crop RGB and polygons; `shuffled_text` permutes strings across images.
-`evidence` forces the highest-scored OCR hypothesis, with base fallback only when
-OCR is absent. It is an ablation, not normal inference. Unchanged final scores
-under an intervention do not prove internal OCR scores are unchanged.
+Use `eval_ocr.py`, not the parent's `eval.py`. Metrics include original-resolution
+mean/global IoU, size groups, candidate probabilities, true IoUs and native PNGs.
+The pointer diagnostic reports sufficiency recall, retrieval success, switches,
+helpful/harmful changes and missed gains. Oracle bounds use GT and are diagnostic
+only. A high sufficiency probability is not a safety guarantee or predicted IoU.
 
-### Cell 5: download results without checkpoint files
+`base`/`missing` must match exactly. `geometry` removes string embeddings, keeping
+RGB/polygons. `shuffled_text` changes recognized strings across images. `evidence`
+forces the best OCR candidate except when OCR is absent; it is not deployment.
+Use `diagnose_ocr_pointer.py` for this branch, not the quality-regression diagnostic.
+
+### Cell 5: download results, excluding checkpoints
 
 ```python
 import zipfile
 
-archive = Path(f"ocr_scope_{os.environ['RUN_VARIANT']}_ep20_seed42.zip")
+archive = Path(f"ocr_pointer_{os.environ['RUN_VARIANT']}_ep20_seed42.zip")
 with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
     for path in sorted(root.rglob("*")):
         if path.is_file() and path.suffix.lower() not in (".pt", ".tmp", ".zip"):
@@ -283,53 +295,43 @@ with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
 print(archive.resolve())
 ```
 
-Download `ocr_scope_A_ep20_seed42.zip` / `ocr_scope_B_ep20_seed42.zip` and keep the
-four small `.pt` checkpoints separately. The ZIP contains histories, configs,
-metrics, native masks, selection and diagnostics; all `.pt`, `.tmp` and ZIP files
-are excluded. Output stays directly under `outputs/`.
+Download `ocr_pointer_A_ep20_seed42.zip` / `ocr_pointer_B_ep20_seed42.zip`. Keep the
+four small `.pt` files separately. All outputs stay directly under `outputs/`.
+The ZIP includes configs, split membership, history, selection, metrics, masks and
+diagnostics; `.pt`, `.tmp` and ZIP files are excluded.
 
-## Resume and configuration
+## Flags, configuration and resume
 
-For the SAME recipe, add `--resume-checkpoint /kaggle/input/YOUR_DATASET/checkpoint_epoch10.pt`
-to Cell 2 in a fresh session, with a new empty output directory. Keep total
-`--num-epochs 20`, the exact parent, cache, training annotations, recipe and training
-settings. Do not copy previous files into the output directory before training.
-After training, bring earlier checkpoints/evaluation folders back only if needed
-for Cell 3, or adjust its epoch list to the checkpoints present.
+The only new training flag is `--pointer-recipe categorical|structured`, default
+`categorical`. Explicitly set `--architecture pointer` (the legacy default remains
+`proposal`). Standard optimizer/LR/batch/AMP/save flags are unchanged. Optional flat
+JSON uses **config > CLI > default**, with paths on CLI. Normal training needs no
+JSON. `min-gain`, `selector-recipe` and legacy loss weights do not control pointer
+training; `answer-weight` must remain zero.
 
-`--config path.json` supports flat overrides: **config > explicit CLI > default**;
-paths remain on CLI. Normal commands need no JSON. Relevant defaults:
+Resume the SAME recipe in a new empty output directory with
+`--resume-checkpoint /kaggle/input/YOUR_DATASET/checkpoint_epoch10.pt` and total
+`--num-epochs 20`. Keep parent/cache/annotations/seed/split/recipe/optimizer/batch
+settings unchanged. For Cell 3, include only epochs present, or attach earlier
+small checkpoints. Old OCR scope/selection/routing/residual checkpoints continue
+to load as their original architectures; they are not converted to pointer heads.
 
-| Option | Default | Purpose |
-|---|---|---|
-| `--architecture` | proposal | Explicitly set independent for these runs |
-| `--selector-recipe` | ranking | ranking control or scope training bundle |
-| `--min-gain` | 0.02 | Fixed predicted-quality gain required to replace base |
-| `--max-candidates` | 24 | OCR cap, before deterministic grouping |
-| `--batch-size`, `--gradient-accumulation-steps` |4,1| Global microbatch and accumulation |
-| `--lr`, `--optimizer`, `--weight-decay` |1e-4,adamw,0.01| Scorer optimization |
-| `--ocr-dropout`, `--text-dropout` |0.2,0.2| Train-only dropout |
-| `--num-epochs`, `--save-every`, `--seed` |20,5,42| Total epochs, checkpoint interval, seed |
-| `--amp` / `--no-amp`, `--num-workers` |on,2| CUDA precision, workers per rank |
+## Scientific boundaries and attribution
 
-Independent scorers do not use answer_weight or the legacy selection/local/route/
-evidence loss weights. A nonzero answer_weight is rejected for this architecture.
-The old residual/proposal/pyramid/hypotheses models, defaults and checkpoint
-versions remain supported. New scorers use a separate version; recipe changes
-cannot be silently resumed into an existing run.
+The explicit no-match category follows the established idea used in
+[DETR](https://www.ecva.net/papers/eccv_2020/papers_ECCV/papers/123460205.pdf).
+This is an adaptation to cached OCR mask sufficiency, not DETR, Hungarian matching,
+or a claim that no-match classification is new. Native GT overlap provides all
+new labels; GT answers are not needed, including at inference.
 
-## Verification and limits
+The backbone interfaces accept different text/feature widths, normalized boxes
+and native polygons. Another backbone/dataset still needs an appropriate wrapper
+and real experiments. The OCR provider remains external/frozen; cached timing
+excludes running OCR. This pilot adds no OCR model to the trainable backbone.
 
-Local checks cover source-independent scoring, identical-mask/permutation
-contracts, confidence invariance, regret-loss gradients, native output, no GT or
-answer leakage, empty-OCR ranks, strict checkpoint round trips, DDP training,
-accumulation, resume, all evaluation views and old-checkpoint compatibility.
-Production-shape CPU BF16 forward/backward and checkpoint storage are checked.
-These do not establish CUDA/T4 throughput, VRAM headroom or segmentation gains.
-
-The adapter accepts different feature/text dimensions; another backbone still
-needs an appropriate wrapper and actual experiments. Raw OCR cannot recover
-regions missing from its proposals. Grouping can miss long/multiline answers.
-Shared scoring can still learn visual or area priors; scope counterexamples are
-synthetic and may not match real failures. Evaluate small and medium gains together
-with large-region damage, calibration and final mIoU before expanding the model.
+Important limitations: categorical scores can still overfit, rare sufficient cases
+can be missed, OCR polygons/grouping can omit the correct answer scope, and defer
+can choose a bad parent or OCR can replace a better one. The 0.5 label threshold
+is fixed before running, not optimized on validation. A/B test the hypothesis;
+they do not establish gains until measured. Do not increase width/epochs solely
+because the training loss decreases.

@@ -17,6 +17,8 @@ from checkpointing import io_process_group, run_primary_io
 from dataset import make_loader
 from ocr_cache import atomic_json, file_hash
 from ocr_data import OCRGroundingDataset
+from ocr_pointer_data import TARGET_VERSION as POINTER_TARGET_VERSION
+from ocr_pointer_data import OCRPointerDataset
 from ocr_routing_data import (
     ROUTE_COVERAGE,
     TARGET_VERSION,
@@ -27,6 +29,7 @@ from ocr_selection_data import HYPOTHESIS_VERSION, OCRSelectionDataset
 from train import seed_everything
 from training.ocr_checkpoint import checkpoint_version, load_ocr_model
 from training.ocr_objective import OCREvidenceObjective
+from training.ocr_pointer_objective import PointerObjective
 from training.ocr_routing_objective import RoutingObjective
 from training.ocr_scope_objective import SCOPE_TARGET_VERSION, ScopeObjective
 from training.ocr_selection_objective import SelectionObjective
@@ -46,7 +49,14 @@ def parser():
     )
     p.add_argument(
         "--architecture",
-        choices=("proposal", "pyramid", "residual", "hypotheses", "independent"),
+        choices=(
+            "proposal",
+            "pyramid",
+            "residual",
+            "hypotheses",
+            "independent",
+            "pointer",
+        ),
         default="proposal",
     )
     p.add_argument(
@@ -54,6 +64,12 @@ def parser():
         choices=("ranking", "scope"),
         default="ranking",
         help="Independent scorer: pairwise control or scope-focused training",
+    )
+    p.add_argument(
+        "--pointer-recipe",
+        choices=("categorical", "structured"),
+        default="categorical",
+        help="Native OCR sufficiency pointer: plain or token-set supervised",
     )
     p.add_argument(
         "--answer-weight",
@@ -151,6 +167,8 @@ def arguments(argv=None):
         p.error("answer-weight is only supported by hypotheses")
     if args.selector_recipe != "ranking" and args.architecture != "independent":
         p.error("selector-recipe applies only to independent architecture")
+    if args.pointer_recipe != "categorical" and args.architecture != "pointer":
+        p.error("pointer-recipe applies only to pointer architecture")
     return args
 
 
@@ -198,6 +216,11 @@ def train(args, rank, world, device, group):
             else {}
         ),
         **(
+            {"pointer_recipe": args.pointer_recipe}
+            if args.architecture == "pointer"
+            else {}
+        ),
+        **(
             {"selector_recipe": args.selector_recipe}
             if args.architecture == "independent"
             else {}
@@ -215,6 +238,7 @@ def train(args, rank, world, device, group):
         "pyramid": OCRRoutingDataset,
         "hypotheses": OCRSelectionDataset,
         "independent": OCRSelectionDataset,
+        "pointer": OCRPointerDataset,
     }[args.architecture]
     data = dataset_class(
         args.data_root,
@@ -223,9 +247,27 @@ def train(args, rank, world, device, group):
         model.image_size,
         detail_size=model.detail_size,
         max_candidates=args.max_candidates,
+        **(
+            {"partition": "fit", "split_seed": args.seed}
+            if args.architecture == "pointer"
+            else {}
+        ),
     )
     target_protocol = None
-    if args.architecture == "independent":
+    if args.architecture == "pointer":
+        target_protocol = {
+            "version": POINTER_TARGET_VERSION,
+            "source_supervision_digest": data.source_supervision_digest,
+            "sufficient_iou": 0.5,
+            "tolerance": 0.05,
+            "retrieval_weight": 0.25,
+            "token_weight": 0.25,
+            "retrieval_min_iou": 0.1,
+            "parent_quality_target": False,
+            "pointer_recipe": args.pointer_recipe,
+            "split_protocol": data.split_protocol,
+        }
+    elif args.architecture == "independent":
         target_protocol = {
             "version": SCOPE_TARGET_VERSION,
             "hypotheses": HYPOTHESIS_VERSION,
@@ -296,6 +338,13 @@ def train(args, rank, world, device, group):
             "models/ocr_scope.py",
             "models/ocr_scope_model.py",
             "training/ocr_scope_objective.py",
+            "models/ocr_pointer.py",
+            "models/ocr_pointer_model.py",
+            "ocr_pointer_data.py",
+            "training/ocr_pointer_objective.py",
+            "eval_ocr.py",
+            "predict_ocr.py",
+            "diagnose_ocr_pointer.py",
         )
     }
     out = Path(args.output_dir)
@@ -326,6 +375,8 @@ def train(args, rank, world, device, group):
             required += ("answer_weight", "min_gain", "supervision_digest")
         if args.architecture == "independent":
             required += ("selector_recipe",)
+        if args.architecture == "pointer":
+            required += ("pointer_recipe", "supervision_digest")
         if (
             args.architecture == "residual"
             and "architecture" not in saved["run_config"]
@@ -395,7 +446,9 @@ def train(args, rank, world, device, group):
     loader = make_loader(
         data, args, args.batch_size // world, sampler, sampler is None, generator
     )
-    if args.architecture == "independent":
+    if args.architecture == "pointer":
+        objective = PointerObjective(args.pointer_recipe)
+    elif args.architecture == "independent":
         objective = ScopeObjective(args.selector_recipe)
     elif args.architecture == "hypotheses":
         objective = SelectionObjective(args.answer_weight)

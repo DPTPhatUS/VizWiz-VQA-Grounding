@@ -4,6 +4,8 @@ import torch
 
 from models.ocr_model import EXPERIMENT as RESIDUAL_EXPERIMENT
 from models.ocr_model import OCRGroundingModel
+from models.ocr_pointer_model import EXPERIMENT as POINTER_EXPERIMENT
+from models.ocr_pointer_model import OCRPointerModel
 from models.ocr_routing_model import EXPERIMENT as ROUTING_EXPERIMENT
 from models.ocr_routing_model import OCRRoutingModel
 from models.ocr_scope_model import EXPERIMENT as SCOPE_EXPERIMENT
@@ -17,6 +19,7 @@ VERSION = "ocr-adapter-checkpoint-v1"
 ROUTING_VERSION = "ocr-routing-checkpoint-v1"
 SELECTION_VERSION = "ocr-selection-checkpoint-v1"
 SCOPE_VERSION = "ocr-scope-checkpoint-v1"
+POINTER_VERSION = "ocr-pointer-checkpoint-v1"
 
 
 def checkpoint_version(model):
@@ -25,6 +28,7 @@ def checkpoint_version(model):
         ROUTING_EXPERIMENT: ROUTING_VERSION,
         SELECTION_EXPERIMENT: SELECTION_VERSION,
         SCOPE_EXPERIMENT: SCOPE_VERSION,
+        POINTER_EXPERIMENT: POINTER_VERSION,
     }
     return versions[model.experiment_config["experiment"]]
 
@@ -43,6 +47,7 @@ def load_ocr_model(parent_path, adapter_path=None, **options):
         "pyramid": OCRRoutingModel,
         "hypotheses": OCRSelectionModel,
         "independent": OCRScopeModel,
+        "pointer": OCRPointerModel,
     }[architecture]
     if saved:
         config = saved["experiment_config"]
@@ -58,6 +63,9 @@ def load_ocr_model(parent_path, adapter_path=None, **options):
         elif pair == (SCOPE_VERSION, SCOPE_EXPERIMENT):
             model_class = OCRScopeModel
             architecture = "independent"
+        elif pair == (POINTER_VERSION, POINTER_EXPERIMENT):
+            model_class = OCRPointerModel
+            architecture = "pointer"
         else:
             raise ValueError("Unsupported OCR adapter checkpoint/version")
         if saved["parent_sha256"] != digest:
@@ -69,6 +77,8 @@ def load_ocr_model(parent_path, adapter_path=None, **options):
             options["min_gain"] = config["min_gain"]
         if model_class is OCRScopeModel:
             options["selector_recipe"] = config["selector_recipe"]
+        if model_class is OCRPointerModel:
+            options["pointer_recipe"] = config["pointer_recipe"]
     if model_class is OCRRoutingModel:
         options["architecture"] = architecture
     parent = read_checkpoint(parent_path)

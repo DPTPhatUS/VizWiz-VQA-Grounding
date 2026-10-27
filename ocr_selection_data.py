@@ -98,13 +98,14 @@ def native_hypothesis(size, polygons, members):
     return np.asarray(draw_hypothesis(polygons, members, size)) > 0
 
 
-def selection_targets(mask, inputs):
+def selection_targets(mask, inputs, *, include_word_purity=False):
     truth = np.asarray(mask) > 127
     height, width = truth.shape
     total = int(truth.sum())
     polygons = inputs["evidence_polygons"]
     members = inputs["hypothesis_members"]
     quality = torch.zeros(len(members))
+    purity = torch.zeros(members.shape[1]) if include_word_purity else None
     for k in range(1, len(members)):
         ids = members[k].nonzero().flatten().tolist()
         if not ids:
@@ -129,9 +130,12 @@ def selection_targets(mask, inputs):
         intersection = int((local & truth[top:bottom, left:right]).sum())
         area = int(local.sum())
         quality[k] = intersection / max(1, area + total - intersection)
+        if include_word_purity and len(ids) == 1:
+            purity[ids[0]] = intersection / max(1, area)
     return {
         "hypothesis_quality": quality,
         "original_mask": torch.from_numpy(truth.copy())[None],
+        **({"ocr_word_purity": purity} if include_word_purity else {}),
     }
 
 
