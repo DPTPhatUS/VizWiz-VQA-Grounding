@@ -28,6 +28,7 @@ from train import seed_everything
 from training.ocr_checkpoint import checkpoint_version, load_ocr_model
 from training.ocr_objective import OCREvidenceObjective
 from training.ocr_routing_objective import RoutingObjective
+from training.ocr_scope_objective import SCOPE_TARGET_VERSION, ScopeObjective
 from training.ocr_selection_objective import SelectionObjective
 from utils import save_checkpoint, to_device
 
@@ -45,8 +46,14 @@ def parser():
     )
     p.add_argument(
         "--architecture",
-        choices=("proposal", "pyramid", "residual", "hypotheses"),
+        choices=("proposal", "pyramid", "residual", "hypotheses", "independent"),
         default="proposal",
+    )
+    p.add_argument(
+        "--selector-recipe",
+        choices=("ranking", "scope"),
+        default="ranking",
+        help="Independent scorer: pairwise control or scope-focused training",
     )
     p.add_argument(
         "--answer-weight",
@@ -58,7 +65,7 @@ def parser():
         "--min-gain",
         type=float,
         default=0.02,
-        help="Predicted IoU gain required to replace base; hypotheses only",
+        help="Predicted IoU gain required to replace base; mask selectors only",
     )
     p.add_argument("--route-weight", type=float, default=0.2)
     p.add_argument("--evidence-weight", type=float, default=0.5)
@@ -142,6 +149,8 @@ def arguments(argv=None):
         p.error("Gain/dropout probabilities must be below one")
     if args.answer_weight and args.architecture != "hypotheses":
         p.error("answer-weight is only supported by hypotheses")
+    if args.selector_recipe != "ranking" and args.architecture != "independent":
+        p.error("selector-recipe applies only to independent architecture")
     return args
 
 
@@ -183,7 +192,16 @@ def train(args, rank, world, device, group):
         evidence_mode=args.evidence_mode,
         ocr_dropout=args.ocr_dropout,
         text_dropout=args.text_dropout,
-        **({"min_gain": args.min_gain} if args.architecture == "hypotheses" else {}),
+        **(
+            {"min_gain": args.min_gain}
+            if args.architecture in {"hypotheses", "independent"}
+            else {}
+        ),
+        **(
+            {"selector_recipe": args.selector_recipe}
+            if args.architecture == "independent"
+            else {}
+        ),
     )
     if saved and args.architecture != model.experiment_config.get(
         "architecture", "residual"
@@ -196,6 +214,7 @@ def train(args, rank, world, device, group):
         "proposal": OCRRoutingDataset,
         "pyramid": OCRRoutingDataset,
         "hypotheses": OCRSelectionDataset,
+        "independent": OCRSelectionDataset,
     }[args.architecture]
     data = dataset_class(
         args.data_root,
@@ -205,6 +224,33 @@ def train(args, rank, world, device, group):
         detail_size=model.detail_size,
         max_candidates=args.max_candidates,
     )
+    target_protocol = None
+    if args.architecture == "independent":
+        target_protocol = {
+            "version": SCOPE_TARGET_VERSION,
+            "hypotheses": HYPOTHESIS_VERSION,
+            "quality": "native-hard-IoU",
+            "selector_recipe": args.selector_recipe,
+            "ranking_gap": 0.05,
+            "minimum_ocr_quality": 0.1,
+            "ocr_choice_weight": 2.0,
+            "choice_score_margin": 0.1,
+            "quality_augmentation": model.experiment_config["quality_augmentation"],
+        }
+    elif args.architecture == "hypotheses":
+        target_protocol = {
+            "version": HYPOTHESIS_VERSION,
+            "answer_match": "normalized-phrase-and-single-IoU-ge-0.5",
+            "quality": "native-hard-IoU",
+            "ranking_gap": 0.05,
+            "quality_augmentation": "half-base-shift-or-morphology-v1",
+        }
+    elif args.architecture != "residual":
+        target_protocol = {
+            "version": TARGET_VERSION,
+            "token_purity": TOKEN_PURITY,
+            "route_coverage": ROUTE_COVERAGE,
+        }
     config = dict(
         vars(args),
         cache_digest=data.cache_digest,
@@ -215,21 +261,7 @@ def train(args, rank, world, device, group):
         schedule="constant",
         parent_frozen=True,
         supervision_digest=getattr(data, "supervision_digest", None),
-        target_protocol={
-            "version": HYPOTHESIS_VERSION,
-            "answer_match": "normalized-phrase-and-single-IoU-ge-0.5",
-            "quality": "native-hard-IoU",
-            "ranking_gap": 0.05,
-            "quality_augmentation": "half-base-shift-or-morphology-v1",
-        }
-        if args.architecture == "hypotheses"
-        else {
-            "version": TARGET_VERSION,
-            "token_purity": TOKEN_PURITY,
-            "route_coverage": ROUTE_COVERAGE,
-        }
-        if args.architecture != "residual"
-        else None,
+        target_protocol=target_protocol,
     )
     config["source_sha256"] = {
         name: file_hash(Path(__file__).parent / name)
@@ -261,6 +293,9 @@ def train(args, rank, world, device, group):
             "ocr_selection_data.py",
             "training/ocr_selection_objective.py",
             "evidence_selection.py",
+            "models/ocr_scope.py",
+            "models/ocr_scope_model.py",
+            "training/ocr_scope_objective.py",
         )
     }
     out = Path(args.output_dir)
@@ -287,8 +322,10 @@ def train(args, rank, world, device, group):
             "local_weight",
             "amp",
         )
-        if args.architecture == "hypotheses":
+        if args.architecture in {"hypotheses", "independent"}:
             required += ("answer_weight", "min_gain", "supervision_digest")
+        if args.architecture == "independent":
+            required += ("selector_recipe",)
         if (
             args.architecture == "residual"
             and "architecture" not in saved["run_config"]
@@ -358,7 +395,9 @@ def train(args, rank, world, device, group):
     loader = make_loader(
         data, args, args.batch_size // world, sampler, sampler is None, generator
     )
-    if args.architecture == "hypotheses":
+    if args.architecture == "independent":
+        objective = ScopeObjective(args.selector_recipe)
+    elif args.architecture == "hypotheses":
         objective = SelectionObjective(args.answer_weight)
     elif args.architecture == "residual":
         objective = OCREvidenceObjective(args.selection_weight, args.local_weight)

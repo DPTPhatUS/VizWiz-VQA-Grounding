@@ -11,6 +11,7 @@ from torch.nn import functional as F
 from dataset import collate_samples
 from evidence_selection import selected_native_mask
 from models.ocr_routing_model import EXPERIMENT as ROUTING_EXPERIMENT
+from models.ocr_scope_model import EXPERIMENT as SCOPE_EXPERIMENT
 from models.ocr_selection_model import EXPERIMENT as SELECTION_EXPERIMENT
 from ocr_cache import CACHE_VERSION, pixel_hash, read_json
 from ocr_data import inference_sample
@@ -68,7 +69,10 @@ def main(argv=None):
         sample.update(
             routing_inputs(image, record, saved["run_config"]["max_candidates"])
         )
-    selection = model.experiment_config["experiment"] == SELECTION_EXPERIMENT
+    selection = model.experiment_config["experiment"] in {
+        SELECTION_EXPERIMENT,
+        SCOPE_EXPERIMENT,
+    }
     if selection:
         sample.update(
             selection_inputs(image, record, saved["run_config"]["max_candidates"])

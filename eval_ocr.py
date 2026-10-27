@@ -12,6 +12,7 @@ from dataset import make_loader
 from evidence_selection import selection_metric_samples
 from metrics import global_iou_summary, metric_samples
 from models.ocr_routing_model import EXPERIMENT as ROUTING_EXPERIMENT
+from models.ocr_scope_model import EXPERIMENT as SCOPE_EXPERIMENT
 from models.ocr_selection_model import EXPERIMENT as SELECTION_EXPERIMENT
 from ocr_cache import atomic_json
 from ocr_data import OCRGroundingDataset
@@ -45,7 +46,10 @@ def main(argv=None):
     model.inference_view = args.view
     model.to(args.device).eval()
     routing = model.experiment_config["experiment"] == ROUTING_EXPERIMENT
-    selection = model.experiment_config["experiment"] == SELECTION_EXPERIMENT
+    selection = model.experiment_config["experiment"] in {
+        SELECTION_EXPERIMENT,
+        SCOPE_EXPERIMENT,
+    }
     if args.view == "evidence" and not (routing or selection):
         raise ValueError("Independent evidence view requires a routing checkpoint")
     dataset_class = (
