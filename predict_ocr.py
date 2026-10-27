@@ -9,10 +9,13 @@ from PIL import Image, ImageOps
 from torch.nn import functional as F
 
 from dataset import collate_samples
+from evidence_selection import selected_native_mask
 from models.ocr_routing_model import EXPERIMENT as ROUTING_EXPERIMENT
+from models.ocr_selection_model import EXPERIMENT as SELECTION_EXPERIMENT
 from ocr_cache import CACHE_VERSION, pixel_hash, read_json
 from ocr_data import inference_sample
 from ocr_routing_data import routing_inputs
+from ocr_selection_data import selection_inputs
 from training.ocr_checkpoint import load_ocr_model
 from utils import to_device
 
@@ -65,22 +68,32 @@ def main(argv=None):
         sample.update(
             routing_inputs(image, record, saved["run_config"]["max_candidates"])
         )
+    selection = model.experiment_config["experiment"] == SELECTION_EXPERIMENT
+    if selection:
+        sample.update(
+            selection_inputs(image, record, saved["run_config"]["max_candidates"])
+        )
+        sample["original_size"] = (image.height, image.width)
     model.to(args.device).eval()
     with torch.inference_mode():
-        output = model(to_device(collate_samples([sample]), args.device))["logits"]
-        native = F.interpolate(
-            output.float(),
-            (image.height, image.width),
-            mode="bilinear",
-            align_corners=False,
-        )
+        batch = to_device(collate_samples([sample]), args.device)
+        output = model(batch)
+        if selection:
+            prediction = selected_native_mask(output, batch, 0).cpu().numpy()
+        else:
+            native = F.interpolate(
+                output["logits"].float(),
+                (image.height, image.width),
+                mode="bilinear",
+                align_corners=False,
+            )
+            prediction = native[0, 0].cpu().numpy() > 0
+
     target = Path(args.output)
     if target.exists():
         raise ValueError("Prediction output already exists")
     target.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray((native[0, 0].cpu().numpy() > 0).astype(np.uint8) * 255).save(
-        target
-    )
+    Image.fromarray(prediction.astype(np.uint8) * 255).save(target)
 
 
 if __name__ == "__main__":

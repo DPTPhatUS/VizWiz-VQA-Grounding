@@ -9,11 +9,14 @@ import torch
 from PIL import Image
 
 from dataset import make_loader
+from evidence_selection import selection_metric_samples
 from metrics import global_iou_summary, metric_samples
 from models.ocr_routing_model import EXPERIMENT as ROUTING_EXPERIMENT
+from models.ocr_selection_model import EXPERIMENT as SELECTION_EXPERIMENT
 from ocr_cache import atomic_json
 from ocr_data import OCRGroundingDataset
 from ocr_routing_data import OCRRoutingDataset
+from ocr_selection_data import OCRSelectionDataset, selection_targets
 from training.ocr_checkpoint import load_ocr_model
 from utils import to_device
 
@@ -42,9 +45,16 @@ def main(argv=None):
     model.inference_view = args.view
     model.to(args.device).eval()
     routing = model.experiment_config["experiment"] == ROUTING_EXPERIMENT
-    if args.view == "evidence" and not routing:
+    selection = model.experiment_config["experiment"] == SELECTION_EXPERIMENT
+    if args.view == "evidence" and not (routing or selection):
         raise ValueError("Independent evidence view requires a routing checkpoint")
-    dataset_class = OCRRoutingDataset if routing else OCRGroundingDataset
+    dataset_class = (
+        OCRSelectionDataset
+        if selection
+        else OCRRoutingDataset
+        if routing
+        else OCRGroundingDataset
+    )
     data = dataset_class(
         args.data_root,
         args.dataset,
@@ -70,6 +80,7 @@ def main(argv=None):
     scores, totals, base_scores, base_totals, groups, evidence = {}, {}, {}, {}, {}, {}
     elapsed, measured_images = 0.0, 0
     evidence_scores = {}
+    hypothesis_diagnostics = {}
     with torch.inference_mode():
         for step, batch in enumerate(loader):
             batch = to_device(batch, args.device)
@@ -84,9 +95,12 @@ def main(argv=None):
             ):  # Exclude first batch warmup, report separately from OCR cache timing.
                 elapsed += time.perf_counter() - start
                 measured_images += len(batch["filename"])
-            for name, score, prediction in metric_samples(
-                output["logits"], batch, pixel_totals=totals
-            ):
+            predictions = (
+                selection_metric_samples(output, batch, pixel_totals=totals)
+                if selection
+                else metric_samples(output["logits"], batch, pixel_totals=totals)
+            )
+            for name, score, prediction in predictions:
                 scores[name] = score
                 Image.fromarray(prediction.cpu().numpy().astype("uint8") * 255).save(
                     out / Path(name).with_suffix(".png")
@@ -94,7 +108,9 @@ def main(argv=None):
             if "evidence_logits" in output:
                 for name, score, _ in metric_samples(output["evidence_logits"], batch):
                     evidence_scores[name] = score
-            baseline = output.get("base_logits", output["logits"])
+            baseline = (
+                output["base_logits"] if "base_logits" in output else output["logits"]
+            )
             for i, (name, score, _) in enumerate(
                 metric_samples(baseline, batch, pixel_totals=base_totals)
             ):
@@ -125,6 +141,40 @@ def main(argv=None):
                         boxes=batch["ocr_boxes"][i].cpu().tolist(),
                         candidate_valid=output["candidate_valid"][i].cpu().tolist(),
                     )
+            if selection and "quality_logits" in output:
+                for i, name in enumerate(batch["filename"]):
+                    sample = {
+                        key: batch[key][i]
+                        for key in (
+                            "hypothesis_members",
+                            "ocr_valid",
+                            "ocr_texts",
+                            "evidence_polygons",
+                        )
+                    }
+                    truth = Image.fromarray(
+                        batch["original_mask"][i][0].cpu().numpy().astype("uint8") * 255
+                    )
+                    target = selection_targets(truth, sample)[
+                        "hypothesis_quality"
+                    ].tolist()
+                    target[0] = base_scores[name]
+                    valid = output["hypothesis_valid"][i].cpu().tolist()
+                    selected = int(output["selected_index"][i])
+                    hypothesis_diagnostics[name] = {
+                        "selected_index": selected,
+                        "selected_members": sample["hypothesis_members"][selected]
+                        .nonzero()
+                        .flatten()
+                        .tolist(),
+                        "predicted_quality": output["predicted_quality"][i]
+                        .cpu()
+                        .tolist(),
+                        "actual_quality": target,
+                        "valid": valid,
+                        "members": sample["hypothesis_members"].cpu().tolist(),
+                        "oracle_iou": max(q for q, v in zip(target, valid) if v),
+                    }
     summary = dict(
         num_samples=len(scores),
         mean_iou=sum(scores.values()) / len(scores),
@@ -173,6 +223,19 @@ def main(argv=None):
             summary["groups"][group]["evidence_mean_iou"] = sum(
                 evidence_scores[k] for k in names
             ) / len(names)
+    if hypothesis_diagnostics:
+        summary["hypothesis_oracle_mean_iou"] = sum(
+            d["oracle_iou"] for d in hypothesis_diagnostics.values()
+        ) / len(scores)
+        summary["hypothesis_oracle_warning"] = (
+            "GT-assisted diagnostic only; never used for inference or selection"
+        )
+        summary["ocr_selected_images"] = sum(
+            d["selected_index"] > 0 for d in hypothesis_diagnostics.values()
+        )
+        summary["harmful_switches_5pp"] = sum(
+            scores[k] < base_scores[k] - 0.05 for k in scores
+        )
     atomic_json(
         {
             "summary": summary,
@@ -180,6 +243,16 @@ def main(argv=None):
             "base_per_sample": base_scores,
             "evidence": evidence,
             "evidence_per_sample": evidence_scores,
+            **(
+                {
+                    "hypotheses": hypothesis_diagnostics,
+                    "sample_groups": {
+                        name: group for group, names in groups.items() for name in names
+                    },
+                }
+                if selection
+                else {}
+            ),
         },
         out / "metrics.json",
     )

@@ -23,10 +23,12 @@ from ocr_routing_data import (
     TOKEN_PURITY,
     OCRRoutingDataset,
 )
+from ocr_selection_data import HYPOTHESIS_VERSION, OCRSelectionDataset
 from train import seed_everything
 from training.ocr_checkpoint import checkpoint_version, load_ocr_model
 from training.ocr_objective import OCREvidenceObjective
 from training.ocr_routing_objective import RoutingObjective
+from training.ocr_selection_objective import SelectionObjective
 from utils import save_checkpoint, to_device
 
 
@@ -43,8 +45,20 @@ def parser():
     )
     p.add_argument(
         "--architecture",
-        choices=("proposal", "pyramid", "residual"),
+        choices=("proposal", "pyramid", "residual", "hypotheses"),
         default="proposal",
+    )
+    p.add_argument(
+        "--answer-weight",
+        type=float,
+        default=0.0,
+        help="Train-only supported answer retrieval; hypotheses only",
+    )
+    p.add_argument(
+        "--min-gain",
+        type=float,
+        default=0.02,
+        help="Predicted IoU gain required to replace base; hypotheses only",
     )
     p.add_argument("--route-weight", type=float, default=0.2)
     p.add_argument("--evidence-weight", type=float, default=0.5)
@@ -118,10 +132,16 @@ def arguments(argv=None):
         "local_weight",
         "route_weight",
         "evidence_weight",
+        "answer_weight",
+        "min_gain",
     ):
         value = getattr(args, key)
         if not math.isfinite(value) or value < 0 or (key == "lr" and value == 0):
             p.error(f"Invalid {key}")
+    if args.min_gain >= 1 or args.ocr_dropout >= 1 or args.text_dropout >= 1:
+        p.error("Gain/dropout probabilities must be below one")
+    if args.answer_weight and args.architecture != "hypotheses":
+        p.error("answer-weight is only supported by hypotheses")
     return args
 
 
@@ -163,6 +183,7 @@ def train(args, rank, world, device, group):
         evidence_mode=args.evidence_mode,
         ocr_dropout=args.ocr_dropout,
         text_dropout=args.text_dropout,
+        **({"min_gain": args.min_gain} if args.architecture == "hypotheses" else {}),
     )
     if saved and args.architecture != model.experiment_config.get(
         "architecture", "residual"
@@ -170,9 +191,12 @@ def train(args, rank, world, device, group):
         raise ValueError(
             "Resume architecture differs; explicitly select the saved architecture"
         )
-    dataset_class = (
-        OCRGroundingDataset if args.architecture == "residual" else OCRRoutingDataset
-    )
+    dataset_class = {
+        "residual": OCRGroundingDataset,
+        "proposal": OCRRoutingDataset,
+        "pyramid": OCRRoutingDataset,
+        "hypotheses": OCRSelectionDataset,
+    }[args.architecture]
     data = dataset_class(
         args.data_root,
         "train",
@@ -190,7 +214,16 @@ def train(args, rank, world, device, group):
         parent_sha256=digest,
         schedule="constant",
         parent_frozen=True,
+        supervision_digest=getattr(data, "supervision_digest", None),
         target_protocol={
+            "version": HYPOTHESIS_VERSION,
+            "answer_match": "normalized-phrase-and-single-IoU-ge-0.5",
+            "quality": "native-hard-IoU",
+            "ranking_gap": 0.05,
+            "quality_augmentation": "half-base-shift-or-morphology-v1",
+        }
+        if args.architecture == "hypotheses"
+        else {
             "version": TARGET_VERSION,
             "token_purity": TOKEN_PURITY,
             "route_coverage": ROUTE_COVERAGE,
@@ -223,6 +256,11 @@ def train(args, rank, world, device, group):
             "models/ocr_routing_model.py",
             "ocr_routing_data.py",
             "training/ocr_routing_objective.py",
+            "models/ocr_selection.py",
+            "models/ocr_selection_model.py",
+            "ocr_selection_data.py",
+            "training/ocr_selection_objective.py",
+            "evidence_selection.py",
         )
     }
     out = Path(args.output_dir)
@@ -249,6 +287,8 @@ def train(args, rank, world, device, group):
             "local_weight",
             "amp",
         )
+        if args.architecture == "hypotheses":
+            required += ("answer_weight", "min_gain", "supervision_digest")
         if (
             args.architecture == "residual"
             and "architecture" not in saved["run_config"]
@@ -318,16 +358,17 @@ def train(args, rank, world, device, group):
     loader = make_loader(
         data, args, args.batch_size // world, sampler, sampler is None, generator
     )
-    objective = (
-        OCREvidenceObjective(args.selection_weight, args.local_weight)
-        if args.architecture == "residual"
-        else RoutingObjective(
+    if args.architecture == "hypotheses":
+        objective = SelectionObjective(args.answer_weight)
+    elif args.architecture == "residual":
+        objective = OCREvidenceObjective(args.selection_weight, args.local_weight)
+    else:
+        objective = RoutingObjective(
             args.selection_weight,
             args.local_weight,
             args.route_weight,
             args.evidence_weight,
         )
-    )
     for epoch in range(start, args.num_epochs):
         seed_everything(args.seed + epoch * world + rank)
         generator.manual_seed(args.seed + epoch * world + rank)

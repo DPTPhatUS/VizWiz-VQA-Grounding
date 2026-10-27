@@ -6,19 +6,23 @@ from models.ocr_model import EXPERIMENT as RESIDUAL_EXPERIMENT
 from models.ocr_model import OCRGroundingModel
 from models.ocr_routing_model import EXPERIMENT as ROUTING_EXPERIMENT
 from models.ocr_routing_model import OCRRoutingModel
+from models.ocr_selection_model import EXPERIMENT as SELECTION_EXPERIMENT
+from models.ocr_selection_model import OCRSelectionModel
 from ocr_cache import file_hash
 from utils import read_checkpoint
 
 VERSION = "ocr-adapter-checkpoint-v1"
 ROUTING_VERSION = "ocr-routing-checkpoint-v1"
+SELECTION_VERSION = "ocr-selection-checkpoint-v1"
 
 
 def checkpoint_version(model):
-    return (
-        ROUTING_VERSION
-        if model.experiment_config["experiment"] == ROUTING_EXPERIMENT
-        else VERSION
-    )
+    versions = {
+        RESIDUAL_EXPERIMENT: VERSION,
+        ROUTING_EXPERIMENT: ROUTING_VERSION,
+        SELECTION_EXPERIMENT: SELECTION_VERSION,
+    }
+    return versions[model.experiment_config["experiment"]]
 
 
 def load_ocr_model(parent_path, adapter_path=None, **options):
@@ -29,7 +33,12 @@ def load_ocr_model(parent_path, adapter_path=None, **options):
         else None
     )
     architecture = options.pop("architecture", "residual")
-    model_class = OCRGroundingModel if architecture == "residual" else OCRRoutingModel
+    model_class = {
+        "residual": OCRGroundingModel,
+        "proposal": OCRRoutingModel,
+        "pyramid": OCRRoutingModel,
+        "hypotheses": OCRSelectionModel,
+    }[architecture]
     if saved:
         config = saved["experiment_config"]
         pair = (saved.get("version"), config.get("experiment"))
@@ -38,6 +47,9 @@ def load_ocr_model(parent_path, adapter_path=None, **options):
         elif pair == (ROUTING_VERSION, ROUTING_EXPERIMENT):
             model_class = OCRRoutingModel
             architecture = config["architecture"]
+        elif pair == (SELECTION_VERSION, SELECTION_EXPERIMENT):
+            model_class = OCRSelectionModel
+            architecture = "hypotheses"
         else:
             raise ValueError("Unsupported OCR adapter checkpoint/version")
         if saved["parent_sha256"] != digest:
@@ -45,6 +57,8 @@ def load_ocr_model(parent_path, adapter_path=None, **options):
         options = {
             key: config[key] for key in ("evidence_mode", "ocr_dropout", "text_dropout")
         }
+        if model_class is OCRSelectionModel:
+            options["min_gain"] = config["min_gain"]
     if model_class is OCRRoutingModel:
         options["architecture"] = architecture
     parent = read_checkpoint(parent_path)
