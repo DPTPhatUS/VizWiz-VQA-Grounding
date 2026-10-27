@@ -15,6 +15,8 @@ from tqdm.auto import tqdm
 
 from checkpointing import io_process_group, run_primary_io
 from dataset import make_loader
+from native_refinement_data import TARGET_VERSION as NATIVE_TARGET_VERSION
+from native_refinement_data import NativeRefinementDataset, check_parent_exposure
 from ocr_cache import atomic_json, file_hash
 from ocr_data import OCRGroundingDataset
 from ocr_pointer_data import TARGET_VERSION as POINTER_TARGET_VERSION
@@ -27,6 +29,7 @@ from ocr_routing_data import (
 )
 from ocr_selection_data import HYPOTHESIS_VERSION, OCRSelectionDataset
 from train import seed_everything
+from training.native_refinement_objective import NativeRefinementObjective
 from training.ocr_checkpoint import checkpoint_version, load_ocr_model
 from training.ocr_objective import OCREvidenceObjective
 from training.ocr_pointer_objective import PointerObjective
@@ -44,6 +47,12 @@ def parser():
     p.add_argument("--output-dir", required=True)
     p.add_argument("--resume-checkpoint")
     p.add_argument(
+        "--train-image-list", help="Optional JSON image-name list; paths stay on CLI"
+    )
+    p.add_argument(
+        "--require-unseen-parent", action=argparse.BooleanOptionalAction, default=False
+    )
+    p.add_argument(
         "--config",
         help="Flat JSON overrides CLI; architecture and training options only",
     )
@@ -56,6 +65,8 @@ def parser():
             "hypotheses",
             "independent",
             "pointer",
+            "native_crop",
+            "native_point",
         ),
         default="proposal",
     )
@@ -120,12 +131,15 @@ def arguments(argv=None):
             "cache_root",
             "output_dir",
             "resume_checkpoint",
+            "train_image_list",
         }
         if not isinstance(requested, dict) or set(requested) - allowed:
             p.error("Unknown config key or path override; paths stay on CLI")
         for key, value in requested.items():
             action = actions[key]
-            typ = bool if key == "amp" else action.type or str
+            typ = (
+                bool if key in {"amp", "require_unseen_parent"} else action.type or str
+            )
             if (
                 type(value) not in (int, float)
                 if typ is float
@@ -169,6 +183,8 @@ def arguments(argv=None):
         p.error("selector-recipe applies only to independent architecture")
     if args.pointer_recipe != "categorical" and args.architecture != "pointer":
         p.error("pointer-recipe applies only to pointer architecture")
+    if args.require_unseen_parent and not args.architecture.startswith("native_"):
+        p.error("require-unseen-parent applies only to native refiners")
     return args
 
 
@@ -239,6 +255,8 @@ def train(args, rank, world, device, group):
         "hypotheses": OCRSelectionDataset,
         "independent": OCRSelectionDataset,
         "pointer": OCRPointerDataset,
+        "native_crop": NativeRefinementDataset,
+        "native_point": NativeRefinementDataset,
     }[args.architecture]
     data = dataset_class(
         args.data_root,
@@ -248,13 +266,52 @@ def train(args, rank, world, device, group):
         detail_size=model.detail_size,
         max_candidates=args.max_candidates,
         **(
+            {"mode": args.architecture}
+            if args.architecture.startswith("native_")
+            else {}
+        ),
+        **(
             {"partition": "fit", "split_seed": args.seed}
             if args.architecture == "pointer"
             else {}
         ),
     )
+    if args.train_image_list:
+        requested = json.loads(Path(args.train_image_list).read_text())
+        if (
+            not isinstance(requested, list)
+            or not requested
+            or any(not isinstance(n, str) for n in requested)
+            or len(set(requested)) != len(requested)
+            or set(requested) - set(data.names)
+        ):
+            raise ValueError("Invalid training image list")
+        if not args.architecture.startswith("native_"):
+            raise ValueError(
+                "train-image-list is supported here only for native refiners"
+            )
+        data.names = sorted(requested)
     target_protocol = None
-    if args.architecture == "pointer":
+    if args.architecture.startswith("native_"):
+        target_protocol = {
+            "version": NATIVE_TARGET_VERSION,
+            "training_images": sorted(data.names),
+            "exposure": check_parent_exposure(
+                model, data.names, args.require_unseen_parent
+            ),
+            "require_unseen_parent": args.require_unseen_parent,
+            "objective": "native-refinement-v1",
+            "pixel_bce": "importance-corrected-for-point",
+            "reduction": "image-mean-float64-sums",
+            "geometry": "half-open-pixel-centres",
+            "crop_aux_weight": 0.25,
+            "point_global_weight": 0.5,
+            "point_balanced_weight": 0.25,
+            "dice_smoothing": 1e-6,
+            "sampling_proposal": [0.5, 0.25, 0.25],
+            "query_chunk": 65536,
+        }
+    elif args.architecture == "pointer":
         target_protocol = {
             "version": POINTER_TARGET_VERSION,
             "source_supervision_digest": data.source_supervision_digest,
@@ -345,6 +402,13 @@ def train(args, rank, world, device, group):
             "eval_ocr.py",
             "predict_ocr.py",
             "diagnose_ocr_pointer.py",
+            "native_refinement_ops.py",
+            "native_refinement_data.py",
+            "models/native_refiner.py",
+            "models/native_refinement_model.py",
+            "training/native_refinement_objective.py",
+            "training_image_protocol.py",
+            "prepare_parent_split.py",
         )
     }
     out = Path(args.output_dir)
@@ -377,6 +441,8 @@ def train(args, rank, world, device, group):
             required += ("selector_recipe",)
         if args.architecture == "pointer":
             required += ("pointer_recipe", "supervision_digest")
+        if args.architecture.startswith("native_"):
+            required += ("supervision_digest",)
         if (
             args.architecture == "residual"
             and "architecture" not in saved["run_config"]
@@ -446,7 +512,9 @@ def train(args, rank, world, device, group):
     loader = make_loader(
         data, args, args.batch_size // world, sampler, sampler is None, generator
     )
-    if args.architecture == "pointer":
+    if args.architecture.startswith("native_"):
+        objective = NativeRefinementObjective(args.architecture)
+    elif args.architecture == "pointer":
         objective = PointerObjective(args.pointer_recipe)
     elif args.architecture == "independent":
         objective = ScopeObjective(args.selector_recipe)

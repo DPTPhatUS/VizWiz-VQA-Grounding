@@ -2,6 +2,8 @@
 
 import torch
 
+from models.native_refinement_model import EXPERIMENT as NATIVE_EXPERIMENT
+from models.native_refinement_model import NativeRefinementModel
 from models.ocr_model import EXPERIMENT as RESIDUAL_EXPERIMENT
 from models.ocr_model import OCRGroundingModel
 from models.ocr_pointer_model import EXPERIMENT as POINTER_EXPERIMENT
@@ -20,6 +22,7 @@ ROUTING_VERSION = "ocr-routing-checkpoint-v1"
 SELECTION_VERSION = "ocr-selection-checkpoint-v1"
 SCOPE_VERSION = "ocr-scope-checkpoint-v1"
 POINTER_VERSION = "ocr-pointer-checkpoint-v1"
+NATIVE_VERSION = "ocr-native-refinement-checkpoint-v1"
 
 
 def checkpoint_version(model):
@@ -29,6 +32,7 @@ def checkpoint_version(model):
         SELECTION_EXPERIMENT: SELECTION_VERSION,
         SCOPE_EXPERIMENT: SCOPE_VERSION,
         POINTER_EXPERIMENT: POINTER_VERSION,
+        NATIVE_EXPERIMENT: NATIVE_VERSION,
     }
     return versions[model.experiment_config["experiment"]]
 
@@ -48,6 +52,8 @@ def load_ocr_model(parent_path, adapter_path=None, **options):
         "hypotheses": OCRSelectionModel,
         "independent": OCRScopeModel,
         "pointer": OCRPointerModel,
+        "native_crop": NativeRefinementModel,
+        "native_point": NativeRefinementModel,
     }[architecture]
     if saved:
         config = saved["experiment_config"]
@@ -66,6 +72,9 @@ def load_ocr_model(parent_path, adapter_path=None, **options):
         elif pair == (POINTER_VERSION, POINTER_EXPERIMENT):
             model_class = OCRPointerModel
             architecture = "pointer"
+        elif pair == (NATIVE_VERSION, NATIVE_EXPERIMENT):
+            model_class = NativeRefinementModel
+            architecture = config["architecture"]
         else:
             raise ValueError("Unsupported OCR adapter checkpoint/version")
         if saved["parent_sha256"] != digest:
@@ -79,7 +88,7 @@ def load_ocr_model(parent_path, adapter_path=None, **options):
             options["selector_recipe"] = config["selector_recipe"]
         if model_class is OCRPointerModel:
             options["pointer_recipe"] = config["pointer_recipe"]
-    if model_class is OCRRoutingModel:
+    if model_class in (OCRRoutingModel, NativeRefinementModel):
         options["architecture"] = architecture
     parent = read_checkpoint(parent_path)
     model = model_class.from_parent(parent, **options)

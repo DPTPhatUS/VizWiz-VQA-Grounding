@@ -10,10 +10,12 @@ from torch.nn import functional as F
 
 from dataset import collate_samples
 from evidence_selection import selected_native_mask
+from models.native_refinement_model import EXPERIMENT as NATIVE_EXPERIMENT
 from models.ocr_pointer_model import EXPERIMENT as POINTER_EXPERIMENT
 from models.ocr_routing_model import EXPERIMENT as ROUTING_EXPERIMENT
 from models.ocr_scope_model import EXPERIMENT as SCOPE_EXPERIMENT
 from models.ocr_selection_model import EXPERIMENT as SELECTION_EXPERIMENT
+from native_refinement_data import refinement_inputs
 from ocr_cache import CACHE_VERSION, pixel_hash, read_json
 from ocr_data import inference_sample
 from ocr_routing_data import routing_inputs
@@ -66,6 +68,16 @@ def main(argv=None):
         model.detail_size,
         saved["run_config"]["max_candidates"],
     )
+    native = model.experiment_config["experiment"] == NATIVE_EXPERIMENT
+    if native:
+        sample.update(
+            refinement_inputs(
+                image,
+                record,
+                saved["run_config"]["max_candidates"],
+                model.experiment_config["architecture"],
+            )
+        )
     if model.experiment_config["experiment"] == ROUTING_EXPERIMENT:
         sample.update(
             routing_inputs(image, record, saved["run_config"]["max_candidates"])
@@ -84,7 +96,9 @@ def main(argv=None):
     with torch.inference_mode():
         batch = to_device(collate_samples([sample]), args.device)
         output = model(batch)
-        if selection:
+        if native:
+            prediction = (output["native_logits"][0][0] > 0).cpu().numpy()
+        elif selection:
             prediction = selected_native_mask(output, batch, 0).cpu().numpy()
         else:
             native = F.interpolate(

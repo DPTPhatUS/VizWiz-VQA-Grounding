@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 from dataset import VizWizGroundingDataset, make_loader
 from losses import OBJECTIVE_VERSION, TRAINING_DEFAULTS, SegmentationObjective
 from models.model import GroundingModel
+from training_image_protocol import image_names, parent_provenance
 from training_options import (
     TrainingArgumentParser,
     TrainingControls,
@@ -38,6 +39,9 @@ from utils import (
 def training_parser():
     parser = TrainingArgumentParser(recipe_keys=TRAINING_DEFAULTS, description=__doc__)
     parser.add_argument("--data-root", default="data/vizwiz")
+    parser.add_argument(
+        "--train-image-list", help="Optional JSON list of train image names"
+    )
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--num-epochs", type=int, default=20)
     parser.add_argument(
@@ -188,6 +192,10 @@ def _train(args, rank, world, distributed, device):
     train_set = VizWizGroundingDataset(
         args.data_root, "train", model.image_size, detail_size=model.detail_size
     )
+    train_set.names = image_names(args.train_image_list, train_set.names)
+    provenance = parent_provenance(
+        train_set.names, checkpoint.get("run_config", {}) if checkpoint else None
+    )
     objective = SegmentationObjective(**settings)
     controls = TrainingControls(model, args, checkpoint)
     parameters = controls.parameters
@@ -238,6 +246,7 @@ def _train(args, rank, world, distributed, device):
         torch_version=str(torch.__version__),
         tiny=unwrap(model).experiment_config["tiny"],
     )
+    run_config.update(provenance)
     run_config["optimization_config"] = controls.config
     run_config.update(
         gradient_clip_norm=1.0,
@@ -249,6 +258,7 @@ def _train(args, rank, world, distributed, device):
         name: hashlib.sha256((source_root / name).read_bytes()).hexdigest()
         for name in (
             "train.py",
+            "training_image_protocol.py",
             "training_options.py",
             "models/model.py",
             "models/image_encoder.py",

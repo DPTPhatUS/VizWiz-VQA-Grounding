@@ -11,10 +11,13 @@ from PIL import Image
 from dataset import make_loader
 from evidence_selection import selection_metric_samples
 from metrics import global_iou_summary, metric_samples
+from models.native_refinement_model import EXPERIMENT as NATIVE_EXPERIMENT
 from models.ocr_pointer_model import EXPERIMENT as POINTER_EXPERIMENT
 from models.ocr_routing_model import EXPERIMENT as ROUTING_EXPERIMENT
 from models.ocr_scope_model import EXPERIMENT as SCOPE_EXPERIMENT
 from models.ocr_selection_model import EXPERIMENT as SELECTION_EXPERIMENT
+from native_refinement_data import NativeRefinementDataset
+from native_refinement_ops import native_base_output, native_metric_samples
 from ocr_cache import atomic_json
 from ocr_data import OCRGroundingDataset
 from ocr_pointer_data import OCRPointerDataset
@@ -34,7 +37,15 @@ def main(argv=None):
     p.add_argument("--dataset", choices=("val", "test", "train-holdout"), default="val")
     p.add_argument(
         "--view",
-        choices=("full", "base", "missing", "geometry", "shuffled_text", "evidence"),
+        choices=(
+            "full",
+            "base",
+            "missing",
+            "geometry",
+            "shuffled_text",
+            "evidence",
+            "global",
+        ),
         default="full",
     )
     p.add_argument("--output-dir", required=True)
@@ -48,6 +59,9 @@ def main(argv=None):
     config = saved["run_config"]
     model.inference_view = args.view
     model.to(args.device).eval()
+    native = model.experiment_config["experiment"] == NATIVE_EXPERIMENT
+    if args.view == "global" and not native:
+        raise ValueError("global view requires a native refiner")
     routing = model.experiment_config["experiment"] == ROUTING_EXPERIMENT
     selection = model.experiment_config["experiment"] in {
         SELECTION_EXPERIMENT,
@@ -60,7 +74,9 @@ def main(argv=None):
     if args.view == "evidence" and not (routing or selection):
         raise ValueError("Independent evidence view requires a routing checkpoint")
     dataset_class = (
-        OCRPointerDataset
+        NativeRefinementDataset
+        if native
+        else OCRPointerDataset
         if pointer
         else OCRSelectionDataset
         if selection
@@ -75,6 +91,7 @@ def main(argv=None):
         model.image_size,
         detail_size=model.detail_size,
         max_candidates=config["max_candidates"],
+        **({"mode": model.experiment_config["architecture"]} if native else {}),
         **(
             {"partition": "holdout", "split_seed": config["seed"]}
             if args.dataset == "train-holdout"
@@ -126,7 +143,9 @@ def main(argv=None):
                 elapsed += time.perf_counter() - start
                 measured_images += len(batch["filename"])
             predictions = (
-                selection_metric_samples(output, batch, pixel_totals=totals)
+                native_metric_samples(output, batch, pixel_totals=totals)
+                if native
+                else selection_metric_samples(output, batch, pixel_totals=totals)
                 if selection
                 else metric_samples(output["logits"], batch, pixel_totals=totals)
             )
@@ -141,9 +160,14 @@ def main(argv=None):
             baseline = (
                 output["base_logits"] if "base_logits" in output else output["logits"]
             )
-            for i, (name, score, _) in enumerate(
-                metric_samples(baseline, batch, pixel_totals=base_totals)
-            ):
+            base_predictions = (
+                native_metric_samples(
+                    native_base_output(baseline, batch), batch, pixel_totals=base_totals
+                )
+                if native
+                else metric_samples(baseline, batch, pixel_totals=base_totals)
+            )
+            for i, (name, score, _) in enumerate(base_predictions):
                 base_scores[name] = score
                 area = batch["original_mask"][i].float().mean().item()
                 group = (
@@ -265,7 +289,11 @@ def main(argv=None):
         cached_grounding_seconds_per_image=elapsed / measured_images
         if measured_images
         else None,
-        timing_note="Excludes OCR, data decode/transfer, metric calculation and first batch; not end-to-end latency",
+        timing_note=(
+            "Includes native-RGB transfers performed inside the refiner; excludes OCR, data loading, external batch transfer, metrics and first batch; not end-to-end latency"
+            if native
+            else "Excludes OCR, data decode/transfer, metric calculation and first batch; not end-to-end latency"
+        ),
         inference_precision="float32",
         threshold_logit=0,
         empty_union_iou=1,
