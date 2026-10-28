@@ -44,7 +44,9 @@ def main(argv=None):
         model.image_size,
         detail_size=model.detail_size,
         max_candidates=config["max_candidates"],
-        mode="native_crop" if model.variant == "joint-crop" else "native_point",
+        mode="native_crop"
+        if model.variant == "joint-crop" and args.view != "pyramid"
+        else "native_point",
     )
     if data.cache_protocol != config["protocol"]["cache_protocol"]:
         raise ValueError("OCR provider/protocol differs from training")

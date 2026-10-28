@@ -99,10 +99,11 @@ def local_window(patch, box, size):
     return (left, top, right, bottom), torch.cat(chunks, -1).reshape(1, height, width)
 
 
-def crop_canvas(patches, boxes, valid, size):
+def crop_canvas(patches, boxes, valid, size, *, return_windows=False):
     """Average overlapping absolute mask logits; deterministic geometry, no learned gate."""
     total = patches.new_zeros(1, *size, dtype=torch.float32)
     count = torch.zeros_like(total)
+    windows = {}
     available = valid.detach().cpu().tolist()
     for j, box in enumerate(boxes.detach().cpu().tolist()):
         if not available[j]:
@@ -111,10 +112,14 @@ def crop_canvas(patches, boxes, valid, size):
         if sample is None:
             continue
         (l, t, r, b), values = sample
-        # Out-of-place padding keeps overlap gradients independent of assignment order.
-        total = total + F.pad(values, (l, size[1] - r, t, size[0] - b))
+        # Add only the occupied window, avoiding an HxW padded allocation per ROI.
+        # AddBackward does not save total; CopySlices preserves overlap gradients.
+        total[:, t:b, l:r] = total[:, t:b, l:r] + values
+        if return_windows:
+            windows[j] = sample
         count[:, t:b, l:r] += 1
-    return total / count.clamp_min(1), count
+    result = (total / count.clamp_min(1), count)
+    return (*result, windows) if return_windows else result
 
 
 def global_native(base, delta, size):
@@ -125,11 +130,13 @@ def global_native(base, delta, size):
         )[0]
 
 
-def compose_native(base, delta, patches, boxes, valid, size):
+def compose_native(base, delta, patches, boxes, valid, size, *, return_windows=False):
     global_logits = global_native(base, delta, size)
-    local, count = crop_canvas(patches, boxes, valid, size)
+    rendered = crop_canvas(patches, boxes, valid, size, return_windows=return_windows)
+    local, count = rendered[:2]
     alpha = (count > 0).float()
-    return global_logits * (1 - alpha) + local * alpha
+    result = global_logits * (1 - alpha) + local * alpha
+    return (result, rendered[2]) if return_windows else result
 
 
 def native_loss(logits, truth):

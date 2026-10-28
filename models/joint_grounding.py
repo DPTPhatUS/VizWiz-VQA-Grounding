@@ -1,5 +1,7 @@
 """Matched pyramid control and end-to-end native crop grounding."""
 
+from collections import OrderedDict
+
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
@@ -7,7 +9,7 @@ from torch.utils.checkpoint import checkpoint
 from models.model import GroundingModel
 from models.native_refiner import NativeRefiner
 from models.text_encoder import masked_mean
-from native_refinement_ops import global_native
+from native_refinement_ops import global_native, sample_native_regions
 
 EXPERIMENT = "joint-native-crop-v1"
 
@@ -17,12 +19,59 @@ class CheckpointedCrop(NativeRefiner):
         super().__init__(*args, **kwargs)
         self.activation_checkpointing = activation_checkpointing
 
-    def _crops(self, crops, semantic, boxes, tokens):
+    def _packed_crops(self, crops, semantic, boxes, tokens, valid):
+        ids = valid.flatten().nonzero().flatten()
+        b, n = valid.shape
+        # Sample each image's valid semantic regions without replicating its full map.
+        semantics = []
+        for i in range(b):
+            selected = boxes[i, valid[i]]
+            if len(selected):
+                semantics.append(
+                    sample_native_regions(
+                        semantic[i : i + 1],
+                        selected[None],
+                        ((crops.shape[-2] + 3) // 4, (crops.shape[-1] + 3) // 4),
+                    )[0]
+                )
+        condition = self.condition(tokens[:, :n].flatten(0, 1)[ids])
+        decoded = self._decode_crops(
+            crops.flatten(0, 1)[ids], torch.cat(semantics), condition
+        )
+        full = decoded.new_zeros(b * n, 1, *decoded.shape[-2:]).index_copy(
+            0, ids, decoded
+        )
+        return full.reshape(b, n, 1, *decoded.shape[-2:])
+
+    def _crops(self, crops, semantic, boxes, tokens, valid=None):
+        if valid is None:
+            return super()._crops(crops, semantic, boxes, tokens)
+        if not valid.any():
+            # Keep skipped CNN parameters in the DDP graph, without executing it.
+            anchor = sum(
+                p.flatten()[0].float() * 0
+                for module in (
+                    self.encoder1,
+                    self.encoder2,
+                    self.encoder3,
+                    self.middle,
+                    self.decode2,
+                    self.decode1,
+                )
+                for p in module.parameters()
+            )
+            return crops.new_zeros(*crops.shape[:2], 1, *crops.shape[-2:]) + anchor
         if self.training and self.activation_checkpointing:
             return checkpoint(
-                super()._crops, crops, semantic, boxes, tokens, use_reentrant=False
+                self._packed_crops,
+                crops,
+                semantic,
+                boxes,
+                tokens,
+                valid,
+                use_reentrant=False,
             )
-        return super()._crops(crops, semantic, boxes, tokens)
+        return self._packed_crops(crops, semantic, boxes, tokens, valid)
 
 
 class JointGroundingModel(nn.Module):
@@ -63,6 +112,8 @@ class JointGroundingModel(nn.Module):
                 tiny,
                 activation_checkpointing=gradient_checkpointing,
             )
+        self._ocr_embeddings = OrderedDict()
+        self._text_cache_version = None
         self.inference_view = "full"
         self.experiment_config = {
             "experiment": EXPERIMENT,
@@ -116,7 +167,9 @@ class JointGroundingModel(nn.Module):
             "candidate_valid": valid,
             "refine_boxes": batch["refine_boxes"],
         }
-        if self.variant == "pyramid":
+        if self.variant == "pyramid" or (
+            not self.training and self.inference_view == "pyramid"
+        ):
             return output
         recognized = question.tokens.new_zeros(b * n, question.tokens.shape[-1])
         ids = text_keep.flatten().nonzero().flatten()
@@ -125,10 +178,7 @@ class JointGroundingModel(nn.Module):
             active = [texts[i] for i in ids.tolist()]
             # Frozen text parameters naturally avoid an autograd graph; an optional
             # unfrozen encoder follows the caller's normal gradient context.
-            encoded = self.pyramid.text_encoder(active)
-            recognized[ids] = masked_mean(encoded.tokens, encoded.valid_mask).to(
-                recognized.dtype
-            )
+            recognized[ids] = self._recognized_embeddings(active).to(recognized.dtype)
         refined = self.crop(
             detail=base["detail_features"],
             semantic=base["semantic_features"],
@@ -144,8 +194,40 @@ class JointGroundingModel(nn.Module):
             native_rgb=batch["native_rgb"],
             native_crops=batch["native_crops"],
             global_only=not self.training and self.inference_view == "global",
+            reuse_native_windows=self.training,
         )
         output.update(refined)
         if not self.training and self.inference_view == "pyramid":
             output["native_logits"] = raw_native
         return output
+
+    def _recognized_embeddings(self, texts):
+        encoder = self.pyramid.text_encoder
+        if any(p.requires_grad for p in encoder.parameters()):
+            self._ocr_embeddings.clear()
+            encoded = encoder(texts)
+            return masked_mean(encoded.tokens, encoded.valid_mask)
+        device = next(encoder.parameters()).device
+        # Invalidate on load_state_dict, device/precision change or encoder mode change.
+        version = (
+            tuple(p._version for p in encoder.parameters()),
+            str(device),
+            encoder.training,
+            torch.is_autocast_enabled(device.type),
+            torch.get_autocast_dtype(device.type),
+        )
+        if version != self._text_cache_version:
+            self._ocr_embeddings.clear()
+            self._text_cache_version = version
+        missing = list(dict.fromkeys(t for t in texts if t not in self._ocr_embeddings))
+        if missing:
+            encoded = encoder(missing)
+            pooled = masked_mean(encoded.tokens, encoded.valid_mask).detach().cpu()
+            for text, value in zip(missing, pooled):
+                self._ocr_embeddings[text] = value
+        result = torch.stack([self._ocr_embeddings[t] for t in texts]).to(device)
+        for text in texts:
+            self._ocr_embeddings.move_to_end(text)
+        while len(self._ocr_embeddings) > 16384:
+            self._ocr_embeddings.popitem(last=False)
+        return result

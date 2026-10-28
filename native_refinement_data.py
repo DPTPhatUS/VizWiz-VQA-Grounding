@@ -38,9 +38,13 @@ def refinement_inputs(image, record, max_candidates=24, mode="native_crop"):
     rgb = torch.from_numpy(np.asarray(image).copy()).permute(2, 0, 1)
     result.update(native_rgb=(rgb,), refine_boxes=boxes)
     if mode == "native_crop":
-        result["native_crops"] = sample_native_regions(
-            rgb[None].float() / 255, boxes[None], CROP_SIZE
-        )[0]
+        count = int(result["ocr_valid"].sum())
+        crops = torch.zeros(max_candidates, 3, *CROP_SIZE)
+        if count:
+            crops[:count] = sample_native_regions(
+                rgb[None].float() / 255, boxes[None, :count], CROP_SIZE
+            )[0]
+        result["native_crops"] = crops
     return result
 
 

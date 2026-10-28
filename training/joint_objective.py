@@ -39,8 +39,13 @@ class JointObjective:
             # Share one native target across global, auxiliary and crop losses.
             # Repeated CPU->GPU copies would also retain duplicate full-size masks.
             truth = truth.to(raw.device, dtype=torch.float32, non_blocking=True)
-            final.append(native_loss(output["native_logits"][i], truth))
-            pyramid.append(native_loss(raw, truth))
+            raw_loss = native_loss(raw, truth)
+            final.append(
+                raw_loss
+                if output["native_logits"][i] is raw
+                else native_loss(output["native_logits"][i], truth)
+            )
+            pyramid.append(raw_loss)
             parts = []
             available = output["candidate_valid"][i].detach().cpu().tolist()
             for j, box in enumerate(output["refine_boxes"][i].detach().cpu().tolist()):
@@ -49,7 +54,9 @@ class JointObjective:
                 l, t, r, b = pixel_window(box, size)
                 if r <= l or b <= t:
                     continue
-                if "local_logits" in output:
+                if "native_crop_windows" in output:
+                    _, predicted = output["native_crop_windows"][i][j]
+                elif "local_logits" in output:
                     _, predicted = local_window(output["local_logits"][i, j], box, size)
                 else:
                     predicted = raw[:, t:b, l:r]

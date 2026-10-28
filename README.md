@@ -321,3 +321,44 @@ empty OCR, strict checkpoint loading, two-rank CPU/Gloo accumulation and exact
 epoch-boundary resume, all inference views, native mean/global IoU, diagnostics
 and GT-free prediction. Mixed-precision checks exercise CPU fp16/bfloat16 paths.
 They do not establish real GPU accuracy, speed, VRAM usage or transfer performance.
+
+
+## Optimized execution and existing checkpoints
+
+The packed-native runtime keeps the same learned tensors, architecture metadata,
+loss weights, precision policy and checkpoint format. It packs only candidates
+that remain valid after OCR dropout into the CNN, then scatters masks back to
+the original slots. Padding/dropped slots produce zeros and do not enter the
+objective. Entirely empty OCR batches skip the crop CNN with a zero-gradient DDP
+anchor; the global correction still runs. GroupNorm normalizes each sample, so
+removing padded samples does not change valid-sample normalization.
+
+Dataset workers generate RGB context crops only for real candidates. Native
+composition accumulates occupied windows instead of allocating a padded full-image
+tensor per candidate. Training reuses those exact native crop-logit windows for
+ROI loss, and avoids a redundant global-logit interpolation. The raw-pyramid
+inference view bypasses the unused crop head and RGB crop preparation.
+
+Frozen OCR text descriptors are cached in a bounded CPU LRU of16,384 strings per
+process (about48 MiB for768-dimensional FP32 vectors). The cache is nonpersistent,
+rebuilds after resume, separates autocast/device/mode settings and invalidates when
+encoder parameters are loaded. Trainable text bypasses caching. This is internal
+runtime caching; the existing OCR dataset cache remains unchanged.
+
+Keep the same train command and all settings. To continue an interrupted old
+joint-crop run, add `--resume-checkpoint /kaggle/input/YOUR_RUN/latest_resume.pt`
+and use a fresh empty output directory. Keep `--num-epochs 20`: it denotes the
+total target, not20 more epochs. A weights-only snapshot cannot recover Adam state.
+No retraining from epoch0 is required for compatibility. Existing inference
+checkpoints remain loadable. Runtime changes are recorded in run_config.json;
+history now includes epoch_seconds, excluding checkpoint I/O. Do not combine
+old/new timing segments as though execution were unchanged.
+
+Output/loss/gradient equivalence was checked against the preceding implementation
+on CPU fixtures, including empty OCR and overlapping native windows. Small
+floating-point differences from packed convolution batches or accumulation order
+can occur; identical GPU trajectories are not promised. A CPU fixture benchmark
+with batch2,8 slots/image and only1 valid crop total measured about1.78s versus
+0.14s per forward+backward. This sparse synthetic workload does not predict T4
+speedup, real candidate density, or Kaggle session duration. Measure the new
+GPU epoch_seconds before estimating remaining training time.

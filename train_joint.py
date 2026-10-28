@@ -5,6 +5,7 @@ import json
 import math
 import os
 import shutil
+import time
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -213,6 +214,12 @@ def train(args, rank, world, device, group):
         public_arguments(args),
         experiment_config=model.experiment_config,
         protocol=protocol,
+        runtime_optimizations={
+            "version": "packed-native-v1",
+            "valid_crops_only": True,
+            "reuse_native_windows": True,
+            "frozen_text_cpu_cache_limit": 16384,
+        },
         optimization=controls.config,
         storage_estimate=storage_estimate(model, parameters, omitted, snapshots),
         omitted_frozen_encoders=omitted,
@@ -298,6 +305,7 @@ def train(args, rank, world, device, group):
             model, device_ids=[device.index] if device.type == "cuda" else None
         )
     for epoch in range(start, args.num_epochs):
+        epoch_started = time.perf_counter()
         seed_everything(args.seed + epoch * world + rank)
         generator.manual_seed(args.seed + epoch * world + rank)
         if sampler is not None:
@@ -355,6 +363,7 @@ def train(args, rank, world, device, group):
             **dict(zip(parts, stats[1:])),
             optimizer_steps=controls.completed_steps,
             skipped_updates_local=skipped,
+            epoch_seconds=time.perf_counter() - epoch_started,
         )
         history.append(record)
 

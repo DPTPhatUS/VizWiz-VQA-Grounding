@@ -183,18 +183,21 @@ class NativeRefiner(nn.Module):
         )
         return self.norm2(tokens + attended)
 
-    def _crops(self, crops, semantic, boxes, tokens):
+    def _crops(self, crops, semantic, boxes, tokens, valid=None):
         b, n = crops.shape[:2]
-        rgb = crops.flatten(0, 1) * 2 - 1
-        a = self.encoder1(rgb)
+        sem = sample_native_regions(
+            semantic, boxes, ((crops.shape[-2] + 3) // 4, (crops.shape[-1] + 3) // 4)
+        ).flatten(0, 1)
+        condition = self.condition(tokens[:, :n]).flatten(0, 1)
+        c = self._decode_crops(crops.flatten(0, 1), sem, condition)
+        return c.reshape(b, n, 1, *c.shape[-2:])
+
+    def _decode_crops(self, crops, sem, condition):
+        """Decode independent RGB/semantic crops; GroupNorm is per sample."""
+        a = self.encoder1(crops * 2 - 1)
         b2 = self.encoder2(a)
         c = self.encoder3(b2)
-        sem = sample_native_regions(semantic, boxes, c.shape[-2:]).flatten(0, 1)
-        condition = (
-            self.condition(tokens[:, :n])
-            .flatten(0, 1)[..., None, None]
-            .expand(-1, -1, *c.shape[-2:])
-        )
+        condition = condition[..., None, None].expand(-1, -1, *c.shape[-2:])
         c = self.middle(torch.cat((c, sem, condition), 1))
         c = self.decode2(
             torch.cat(
@@ -218,7 +221,7 @@ class NativeRefiner(nn.Module):
                 1,
             )
         )
-        return c.reshape(b, n, 1, *c.shape[-2:])
+        return c
 
     def _points(self, features, global_logits, rgb, indices):
         xy = pixel_coordinates(indices, global_logits.shape[-2:])
@@ -255,6 +258,7 @@ class NativeRefiner(nn.Module):
         native_crops=None,
         truths=None,
         global_only=False,
+        reuse_native_windows=False,
     ):
         tokens = self._context(
             detail,
@@ -268,7 +272,9 @@ class NativeRefiner(nn.Module):
         )
         shape = (96, 96) if not self.tiny else (16, 16)
         if self.mode == "native_crop":
-            local = self._crops(native_crops, semantic, refine_boxes, tokens)
+            local = self._crops(
+                native_crops, semantic, refine_boxes, tokens, valid=valid
+            )
         else:
             local = self.word_support(tokens[:, : valid.shape[1]])[
                 ..., None, None
@@ -306,6 +312,7 @@ class NativeRefiner(nn.Module):
             )
         native = []
         sampled = []
+        native_windows = []
         for i, (wrapped,) in enumerate(native_rgb):
             rgb = (
                 wrapped.to(base_logits.device, non_blocking=True)
@@ -313,22 +320,28 @@ class NativeRefiner(nn.Module):
                 else wrapped
             )
             size = tuple(rgb.shape[-2:])
-            global_logits = global_native(
-                base_logits[i : i + 1], delta[i : i + 1], size
+            global_logits = (
+                global_native(base_logits[i : i + 1], delta[i : i + 1], size)
+                if self.mode != "native_crop" or global_only
+                else None
             )
             if self.mode == "native_crop":
-                native.append(
-                    global_logits
-                    if global_only
-                    else compose_native(
+                if global_only:
+                    native.append(global_logits)
+                else:
+                    composed = compose_native(
                         base_logits[i : i + 1],
                         delta[i : i + 1],
                         local[i],
                         refine_boxes[i],
                         valid[i],
                         size,
+                        return_windows=reuse_native_windows,
                     )
-                )
+                    if reuse_native_windows:
+                        composed, windows = composed
+                        native_windows.append(windows)
+                    native.append(composed)
             elif self.training:
                 ids, pixel, balanced = point_samples(
                     global_logits,
@@ -362,5 +375,7 @@ class NativeRefiner(nn.Module):
                         self._points(features[i : i + 1], global_logits, rgb, ids)
                     )
                 native.append(torch.cat(values).reshape(1, *size))
+        if reuse_native_windows:
+            output["native_crop_windows"] = native_windows
         output.update(native_logits=native, point_samples=sampled)
         return output
