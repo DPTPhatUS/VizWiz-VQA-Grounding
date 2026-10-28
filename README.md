@@ -291,7 +291,7 @@ original total step budget; constant-LR runs can extend their total epochs.
 
 ### Kaggle: resume an interrupted run
 
-Download `latest_resume.pt` separately from the previous session (the analysis
+Download `latest_resume.pt` and all existing `checkpoint_epoch*.pt` files from the previous session (the analysis
 ZIP excludes `.pt` files). Upload it as a Kaggle Dataset and attach it to the new
 GPU notebook. Run **Cell 1** first, keeping the original `RUN_VARIANT` (`joint-crop`
 for Session B). Replace Cell 2 with these cells; do not also run fresh training.
@@ -325,10 +325,84 @@ uv run torchrun --standalone --nproc_per_node=2 train_joint.py \
 
 A file saved after epoch 10 continues at epoch 11 and stops at epoch 20; it does
 not train 20 additional epochs. Work since the last completed epoch is repeated.
-Preserve any custom settings from the original run. Earlier snapshots are not
-copied into the new `outputs/`: keep them separately and evaluate only checkpoint
-files actually present. The new session writes an updated `latest_resume.pt` and
-its scheduled snapshots.
+Preserve any custom settings from the original run. The new session writes an
+updated `latest_resume.pt` and its scheduled snapshots.
+
+### Resume: evaluate all four epochs across Input and Output
+
+Upload the old snapshots together with `latest_resume.pt`, keeping them from the
+**same run/variant/seed**. The example below assumes a flat input folder. Set
+`PREVIOUS_CHECKPOINT_DIR` to the directory containing the old snapshots. Nothing
+is copied into `outputs/`, so the old weights do not consume working-disk space.
+
+After resumed training finishes, run the following cells **instead of Cells 3
+and 4** from the fresh-training guide. All four epochs are required: missing
+files cause a clear error before evaluation starts. New output files take
+precedence when the same epoch exists in both locations.
+
+```python
+os.environ["PREVIOUS_CHECKPOINT_DIR"] = "/kaggle/input/datasets/YOUR_USERNAME/YOUR_DATASET"
+```
+
+```python
+import json
+import subprocess
+
+root = Path(os.environ["RUN_ROOT"])
+previous = Path(os.environ["PREVIOUS_CHECKPOINT_DIR"])
+epochs = (5, 10, 15, 20)
+checkpoints = {}
+for epoch in epochs:
+    name = f"checkpoint_epoch{epoch}.pt"
+    candidates = (root / name, previous / name)
+    checkpoints[epoch] = next((path for path in candidates if path.is_file()), None)
+missing = [epoch for epoch, path in checkpoints.items() if path is None]
+if missing:
+    raise FileNotFoundError(f"Missing checkpoint epochs {missing}; check PREVIOUS_CHECKPOINT_DIR and resumed outputs")
+
+(root / "evaluation_checkpoints.json").write_text(json.dumps(
+    {str(epoch): str(path) for epoch, path in checkpoints.items()}, indent=2))
+
+def evaluate(split, view, epoch, folder):
+    subprocess.run([
+        "uv", "run", "eval_joint.py", "--checkpoint", str(checkpoints[epoch]),
+        "--data-root", os.environ["DATA_ROOT"], "--cache-root", os.environ["OCR_CACHE"],
+        "--dataset", split, "--view", view, "--batch-size", "1", "--num-workers", "2",
+        "--output-dir", str(root / folder),
+    ], check=True)
+
+for epoch in epochs:
+    evaluate("val", "full", epoch, f"eval_val_ep{epoch}")
+
+best = max(epochs, key=lambda epoch: (
+    json.loads((root / f"eval_val_ep{epoch}/metrics.json").read_text())["summary"]["mean_iou"],
+    -epoch,
+))
+(root / "selection.json").write_text(json.dumps({
+    "variant": os.environ["RUN_VARIANT"], "selected_epoch": best,
+    "selection_metric": "validation_mean_iou", "tie_break": "earlier_epoch",
+    "checkpoint": str(checkpoints[best]),
+}, indent=2))
+
+for epoch in sorted({best, 20}):
+    evaluate("test", "full", epoch, f"eval_test_full_ep{epoch}")
+if os.environ["RUN_VARIANT"] == "joint-crop":
+    for view in ("pyramid", "global", "missing", "geometry", "shuffled_text"):
+        evaluate("val", view, best, f"eval_val_{view}_ep{best}")
+for view, folder in [("full", f"eval_val_ep{best}")] + (
+    [("pyramid", f"eval_val_pyramid_ep{best}"), ("global", f"eval_val_global_ep{best}")]
+    if os.environ["RUN_VARIANT"] == "joint-crop" else []
+):
+    subprocess.run([
+        "uv", "run", "diagnose.py", "--data-root", os.environ["DATA_ROOT"],
+        "--predictions", str(root / folder), "--output-dir", str(root / f"diagnostic_{view}"),
+    ], check=True)
+print(f"Selected epoch {best}: {os.environ['RUN_VARIANT']}")
+```
+
+Then run **Cell 5** unchanged to ZIP the combined results from all four epochs,
+including selection, diagnostics and checkpoint-path provenance, excluding `.pt`
+files. Download the newly saved weights/resume file separately as before.
 
 Optional `--config path.json` follows **config > explicit CLI > defaults**.
 Paths remain on CLI. Available optimizer/schedule/freezing options are shared
