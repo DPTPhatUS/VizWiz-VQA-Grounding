@@ -289,6 +289,47 @@ Data order and RNG are reseeded by epoch/rank, and optimizer/scaler/control stat
 are restored. No mid-epoch resume is claimed. With an active LR schedule, keep the
 original total step budget; constant-LR runs can extend their total epochs.
 
+### Kaggle: resume an interrupted run
+
+Download `latest_resume.pt` separately from the previous session (the analysis
+ZIP excludes `.pt` files). Upload it as a Kaggle Dataset and attach it to the new
+GPU notebook. Run **Cell 1** first, keeping the original `RUN_VARIANT` (`joint-crop`
+for Session B). Replace Cell 2 with these cells; do not also run fresh training.
+
+```python
+os.environ["RESUME_CHECKPOINT"] = "/kaggle/input/datasets/YOUR_USERNAME/YOUR_DATASET/latest_resume.pt"
+assert Path(os.environ["RESUME_CHECKPOINT"]).is_file()
+assert not Path(os.environ["RUN_ROOT"]).exists() or not any(Path(os.environ["RUN_ROOT"]).iterdir())
+```
+
+Replace the checkpoint path with the actual attached input path. Keep `RUN_ROOT`
+as `outputs`, empty in this new session.
+
+```bash
+%%bash
+set -euo pipefail
+uv run torchrun --standalone --nproc_per_node=2 train_joint.py \
+    --data-root "$DATA_ROOT" --cache-root "$OCR_CACHE" \
+    --output-dir "$RUN_ROOT" --variant "$RUN_VARIANT" \
+    --resume-checkpoint "$RESUME_CHECKPOINT" \
+    --num-epochs 20 \
+    --batch-size 2 --gradient-accumulation-steps 2 \
+    --num-workers 2 \
+    --lr 0.00001 --optimizer adam --weight-decay 0 \
+    --lr-scheduler none --warmup-ratio 0 \
+    --freeze-vision-encoder False --freeze-text-encoder True \
+    --max-candidates 24 --ocr-dropout 0.2 --text-dropout 0.2 \
+    --gradient-checkpointing --amp \
+    --save-every 5 --seed 42
+```
+
+A file saved after epoch 10 continues at epoch 11 and stops at epoch 20; it does
+not train 20 additional epochs. Work since the last completed epoch is repeated.
+Preserve any custom settings from the original run. Earlier snapshots are not
+copied into the new `outputs/`: keep them separately and evaluate only checkpoint
+files actually present. The new session writes an updated `latest_resume.pt` and
+its scheduled snapshots.
+
 Optional `--config path.json` follows **config > explicit CLI > defaults**.
 Paths remain on CLI. Available optimizer/schedule/freezing options are shared
 with the project: `--optimizer adam|adamw`, `--lr`, `--weight-decay`,
