@@ -224,12 +224,27 @@ with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as bundle:
 print(archive.resolve())
 ```
 
-Download this ZIP for analysis. Download desired small adapter checkpoints
+Download this ZIP for analysis. Stop here for the ordinary training session;
+the optional cache export below is not needed to analyze either run. Download desired small adapter checkpoints
 separately. For a reusable cache, ZIP **the feature cache only**, separately:
 
 ```python
 import shutil
-print(shutil.make_archive('evidence_transport_feature_cache', 'zip', os.environ['FEATURE_CACHE']))
+
+cache = Path(os.environ['FEATURE_CACHE']).resolve()
+archive = Path('evidence_transport_feature_cache.zip').resolve()
+if cache == archive.parent or cache in archive.parents:
+    raise ValueError('Write the ZIP outside the feature cache')
+if archive.exists():
+    raise FileExistsError(archive)
+files = [p for p in cache.rglob('*') if p.is_file()]
+# Conservative incompressible-data estimate, headers and 2 GiB notebook reserve.
+required = int(sum(p.stat().st_size for p in files) * 1.01) + len(files) * 4096 + 2 * 1024**3
+free = shutil.disk_usage(archive.parent).free
+if free < required:
+    print(f'SKIP cache ZIP: need {required / 1024**3:.2f} GiB free; have {free / 1024**3:.2f} GiB. Analysis ZIP is sufficient.')
+else:
+    print(shutil.make_archive(str(archive.with_suffix('')), 'zip', str(cache)))
 ```
 
 **Only run the optional cache ZIP in a separate cache-export session with enough
