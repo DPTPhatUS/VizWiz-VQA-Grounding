@@ -1,479 +1,311 @@
-# Joint native crop grounding
+# Evidence Transport: selection and evidence use
 
-Branch: `exp/joint-native-crop`.
+Branch: `exp/evidence-transport`.
 
-Two fresh 20-epoch runs test whether native OCR-context crops help when their
-loss can adapt the grounding features from the start. This follows the frozen
-native-refinement pilot, whose measured gains were negligible. Improvement is a
-hypothesis; this implementation does not establish an accuracy gain.
+Two independent **20-epoch adapter** experiments share one frozen-pyramid feature
+cache. This is a new training protocol, not a continuation of joint-crop.
+The parent is the **matched pyramid control from `exp/joint-native-crop`, epoch
+20**. Do not substitute a joint-crop checkpoint, B+5, or an older pyramid
+checkpoint: the extractor checks the checkpoint family and variant.
 
-| Session | `--variant` | Inference |
+The previous joint-crop's selected validation checkpoint barely changed when OCR
+was removed or its strings shuffled. These experiments remove the semantic-mask
+bypass from the evidence branch and explicitly supervise which evidence matters.
+They do not guarantee improvement or resolve an intrinsically ambiguous question.
+
+## Experiments
+
+| Recipe | What is trained | Question tested |
 |---|---|---|
-| A | `pyramid` | Question-guided detail pyramid control |
-| B | `joint-crop` | Same pyramid + native context crop decoder + global cleanup |
+| `transport` | word selection + local masks + evidence segmentation + scope gate | Can a separately grounded evidence mask improve the frozen parent? |
+| `intervention` | identical architecture and initialization, plus leave-one-evidence-out contribution loss | Does supervising actual evidence contribution improve selection/use? |
 
-Both initialize CLIP encoders from pretrained weights and initialize grounding
-layers afresh. Both train vision, freeze text, and use question-only input.
-There is **no B+5 checkpoint, teacher, answer input, or frozen trained parent**.
-The extra crop module has 183,514 parameters with the current CLIP/pyramid sizes;
-the frozen CLIP text encoder is reused for Q and OCR strings, not duplicated.
-The existing `train.py`, `train_ocr.py` and their checkpoint loaders stay unchanged.
+The adapter adds **169,891 parameters** at CLIP dimensions (about 0.68 MB of FP32 weights).
+Both parent encoders **and the entire parent decoder are frozen**. OCR remains
+external/frozen and uses the existing PP-OCR cache. No answer is needed for
+training or inference. GT masks provide training labels only. The scope target
+never depends on parent accuracy, avoiding the old train-seen parent-quality
+calibration shortcut. This does not eliminate all possible overfitting.
 
-## Architecture and controlled comparison
-
-```text
-Original RGB image + question
-  |
-  +-- 336x336 view -> pretrained CLIP vision (TRAINABLE) -> 4 feature maps
-  +-- Q -> pretrained CLIP text (FROZEN) -> full question token sequence
-  +-- 768x768 view -> trainable detail CNN pyramid
-                      |
-           question-guided detail decoder / refiner
-                      |
-             raw pyramid logits [B,1,768,768]
-                      |
-           interpolate logits to native image size
-                      |
-        A: native pyramid mask
-
-B additionally:
-  Cached frozen OCR -> polygons + recognized strings + confidence
-    -> context boxes: 2x OCR bounds, minimum 32 native pixels per axis
-    -> original RGB sampled as [B,N,3,192,192], N <= 24
-    -> small U-Net-like crop decoder + trainable pyramid semantic crops
-       + question-token/OCR-set attention
-    -> absolute crop logits [B,N,1,192,192]
-       |
-       +-- crop field + pyramid detail/semantic/Q -> global signed correction
-       +-- inverse crop rendering at original image pixel centres
-                      |
-     inside context boxes: average overlapping local logits
-     outside context boxes: pyramid logits + global correction
-                      |
-               B: native final mask
-
-Final, pyramid, crop and auxiliary losses all backpropagate into the pyramid.
-```
-
-The global correction may change pixels anywhere; final crop masks are not
-restricted to OCR polygons. There is no learned selector or parent-preservation
-loss. Missing OCR removes local overwrite, while the learned global correction
-remains. Crops still resize RGB to 192x192; this is not lossless image processing.
-
-To isolate architecture from extra local supervision, **A and B both receive the
-same native GT supervision within the same OCR context boxes**. In A the local
-prediction is a slice of the native pyramid mask; in B it is the native rendering
-of the crop decoder. Consequently A is a new matched control, not an exact
-reproduction of the historical pyramid training recipe. Compare B against A;
-compare historical B+5 separately and count its full 25-epoch training cost.
-
-For a native logit mask `z` and binary GT `y`, `S(z,y)` is mean pixel BCE plus
-soft Dice loss, with smoothing `1e-6`. The common objective is:
+### Architecture
 
 ```text
-S(final_native, GT)
-+ 0.25 * S(raw_pyramid_native, GT)
-+ 0.25 * mean_valid_crops S(local_native, GT_inside_context_box)
-+ 0.10 * S(aux96_native, GT)
-+ 0.20 * S(aux192_native, GT)
-+ 0.30 * S(aux384_native, GT)
+Image + Q -- frozen parent encoder --> region visual descriptors, scene, full Q tokens
+OCR strings -- same frozen text encoder --> word descriptors
+OCR boxes --> 2x context boxes (minimum 32 native pixels) --> RGB crops 64 x 64
+                         |
+word + region visual + geometry -- Q attention -- set attention --> 64-dim tokens
+                         |                                      |
+                    selection logits                     scope gate g
+                         |
+RGB crop --> 16/24-channel CNN + token conditioning --> 64 x 64 local probabilities
+                         |
+    inverse warp into image + competition with explicit background
+                         |
+                  evidence-only probability E
+                         |
+Final P = (1-g) * sigmoid(native parent logits) + g * E
 ```
 
-A's final and raw pyramid predictions coincide, so their two terms explicitly
-sum to `1.25 * S(pyramid_native, GT)`. Crop losses average within each original
-image, then all terms average over original images. Images with no retained OCR
-have zero crop loss. All three auxiliary heads remain supervised. The `.25`
-weights are declared pilot settings, not coefficients established by the data.
+The evidence branch cannot read parent logits, decoder semantic features, or GT.
+It uses pre-fusion region features, full Q tokens, recognized text, geometry and
+RGB. Empty OCR gives `g=0` and exactly the parent's prediction. Multiple words
+can contribute simultaneously; there is no hard top-one OCR selection.
+Outside all context boxes, `E=0`, so an evidence route can suppress excess
+foreground outside OCR, unlike a correction restricted to OCR support.
 
-No GT mask is resized for these losses. Geometry uses float64 pixel centres and
-half-open supports; native crop-logit interpolation uses float64 before returning
-float32. BCE/sigmoid run in float32 and loss reductions in float64. This reuses
-the verified native geometry implementation. Floating-point error and CUDA
-interpolation nondeterminism still exist; bitwise GPU reproducibility is not claimed.
+The head accepts arbitrary text/visual dimensions from the cache manifest and
+has no CLIP-specific hidden width. A different backbone/data adapter must produce
+the same feature schema and a **new cache**; cached features are not portable
+between checkpoints. OCR is not appropriate for every non-text grounding task.
 
-Pyramid initialization, data order, encoder policy, dropout draws, batch and
-optimizer settings match across A/B. Crop-specific operations can still change
-numerical execution; equal seeds are not a claim of identical GPU trajectories.
-OCR cache generation is fixed, question/answer independent, and outside the
-trainable model. GT is used only for training losses or evaluation metrics.
+### Targets and losses
 
-## Kaggle: two separate GPU sessions
+Native GT polygon purity is `intersection / polygon area`. Selection learns this
+soft target, balancing present positive/negative candidate groups within each
+image. The scope target is 1 only when the union of polygons with purity >=0.5
+covers >=80% of GT and has precision >=50%; otherwise it is 0. Scope BCE remains
+unweighted to avoid silently changing its probability calibration.
 
-Use Internet and 2xT4. Attach VizWiz and the **existing OCR cache**. No new CPU
-cache run or trained parent input is needed. Session A and B each train 20 epochs.
-Only change `RUN_VARIANT` in cell 1 for the second fresh session.
+The evidence-only segmentation loss is applied on scope-positive images. All
+valid local masks receive BCE supervision. The parent/final mask's training
+accuracy is **not** used to choose the gate target. No validation/test labels are
+stored in the feature records or consumed by the head.
 
-### Cell 1: setup
+```text
+L_transport = L_selection + L_scope + L_local + L_evidence
+L_intervention = L_transport + 0.5 * L_leave_one_out
+```
+
+`L_evidence` is BCE + soft Dice. Global training targets use area-resampled
+192 x 192 masks; local targets use supersampled pixel-centre sampling followed
+by averaging to 64 x 64. These are explicit training surrogates, **not the old
+full-native-resolution objective**. Native polygon purity and scope use original
+GT resolution. All final masks/mean IoU/global IoU use original image resolution.
+
+For intervention, analytically remove each candidate from the probability
+competition. On unique GT mass of a positive polygon, its foreground contribution
+is encouraged towards 1; on a negative polygon's background pixels it is
+encouraged towards 0. Overlapping positive polygons are not falsely required to
+be independently indispensable. Prefix/suffix log-sum-exp computes all removals
+in O(B*N*H*W), with no extra CNN/attention forwards and no unstable `1-weight`
+subtraction. This tests spatial evidence use; it does not guarantee semantic
+understanding of recognized strings. The shuffled-text diagnostic tests that.
+
+## Kaggle: one GPU session for cache + both runs
+
+Use a GPU notebook, internet enabled, and attach:
+
+1. VizWiz grounding data.
+2. The existing OCR cache (no new OCR generation session).
+3. The **matched pyramid control epoch-20 checkpoint** downloaded from the recent
+   `joint_native_pyramid` run. Its `latest_resume.pt` is also accepted by the
+   extractor, but a weights-only snapshot is smaller.
+
+One GPU is sufficient: **do not use torchrun**. Both recipes run sequentially
+with fresh model/optimizer/scaler and identical seed/order. Each result has a
+20-epoch parent history plus 20 adapter epochs; it is not a fresh 20-epoch
+end-to-end model. This is 40 lightweight
+head epochs, not 40 full-backbone epochs. Actual Kaggle duration is unmeasured;
+the history records seconds per epoch. Keep the effective batch unchanged when
+comparing the two recipes.
+
+### 1. Setup
 
 ```python
 !pip install -q uv
-!git clone --single-branch --branch exp/joint-native-crop https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+!git clone --single-branch --branch exp/evidence-transport https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
 %cd /kaggle/working/VizWiz-VQA-Grounding
 !uv sync --frozen
 
 import os
 from pathlib import Path
 
-os.environ["RUN_VARIANT"] = "pyramid"  # Session B: "joint-crop"
-os.environ["DATA_ROOT"] = "/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz"
-os.environ["OCR_CACHE"] = "/kaggle/input/datasets/khoahoang0512/vizwiz-ocr-cache/ocr_cache"
-os.environ["RUN_ROOT"] = "outputs"
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MPLBACKEND"] = "Agg"
-assert os.environ["RUN_VARIANT"] in ("pyramid", "joint-crop")
-assert (Path(os.environ["OCR_CACHE"]) / "manifest.json").is_file()
+os.environ['DATA_ROOT'] = '/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz'
+os.environ['OCR_CACHE'] = '/kaggle/input/datasets/khoahoang0512/vizwiz-ocr-cache/ocr_cache'
+os.environ['PYRAMID_CKPT'] = '/kaggle/input/YOUR_PYRAMID_DATASET/checkpoint_epoch20.pt'
+os.environ['RUN_ROOT'] = 'outputs'
+os.environ['FEATURE_CACHE'] = 'outputs/feature_cache'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MPLBACKEND'] = 'Agg'
+Path(os.environ['RUN_ROOT']).mkdir(exist_ok=True)
+assert Path(os.environ['PYRAMID_CKPT']).is_file()
+assert (Path(os.environ['OCR_CACHE']) / 'manifest.json').is_file()
 ```
 
-Adjust only the cache path if the attached input has a different folder name.
-Each fresh session writes directly into `outputs/`.
+Change `PYRAMID_CKPT` to the actual Kaggle Input path. Do not copy it to working
+disk. The two run folders will be `outputs/transport` and `outputs/intervention`.
 
-### Cell 2: train
+### 2. Build the shared feature cache once
 
 ```bash
 %%bash
 set -euo pipefail
-uv run torchrun --standalone --nproc_per_node=2 train_joint.py \
+uv run cache_evidence_transport.py \
+    --checkpoint "$PYRAMID_CKPT" \
     --data-root "$DATA_ROOT" --cache-root "$OCR_CACHE" \
-    --output-dir "$RUN_ROOT" --variant "$RUN_VARIANT" \
-    --num-epochs 20 \
-    --batch-size 2 --gradient-accumulation-steps 2 \
-    --num-workers 2 \
-    --lr 0.00001 --optimizer adam --weight-decay 0 \
-    --lr-scheduler none --warmup-ratio 0 \
-    --freeze-vision-encoder False --freeze-text-encoder True \
-    --max-candidates 24 --ocr-dropout 0.2 --text-dropout 0.2 \
-    --gradient-checkpointing --amp \
-    --save-every 5 --seed 42
+    --output-dir "$FEATURE_CACHE" \
+    --max-candidates 24 --batch-size 2 --num-workers 2
 ```
 
-`--batch-size` is the GLOBAL microbatch: 2 means 1/GPU. Accumulation2 gives
-an effective global batch4. Both variants use the same setting. Native crop
-activations are checkpointed along with the pyramid/vision backbone. Larger
-microbatches are optional only after checking actual GPU memory; no T4 throughput
-or full-model GPU memory measurement has been made locally.
+The cache is GT-free on val/test; only train has a separate target payload.
+Training extraction skips the high-resolution parent decoder entirely. Region
+and full-token descriptors are stored FP16; context RGB is uint8; losses run at
+FP32 with FP64 Dice reductions. Area targets stay floating point so subpixel
+GT mass is not rounded away to uint8; contribution normalization also preserves
+fractional pixel mass. The same rounded cached inputs are used by both
+recipes. Parent evaluation logits retain FP32 at their original grid size so
+cache compression does not change the reference mask. Sparse polygon targets
+avoid storing 24 dense 192 x 192 planes per training image.
 
-There is no validation inside the trainer. Evaluate the four saved checkpoints
-below, then select the checkpoint by validation mean IoU, with earlier epoch
-breaking ties. Never select using test scores.
+For the full dataset, FP32 parent grids on val/test alone take about **8.27 GB**
+(decimal); other features/targets add storage. Startup checks a projected cache
+budget plus 2 GiB reserve, and every atomic write checks free space. The estimate
+is not an absolute bound on image/candidate-dependent cache sizes. If it fails,
+use a separate GPU cache session, ZIP its feature folder, download/upload it as
+Kaggle Input, and set `FEATURE_CACHE` to that input folder in the training session.
+Do not delete or duplicate existing user checkpoints to make space.
 
-### Checkpoints and disk budget
+A completed feature cache can be reused for additional head runs. Check
+`manifest.json` for `complete: true`, the parent SHA256 and the count
+`training_scope_positives`. Cache generation requires a new/empty destination;
+an interrupted extraction must be rerun into a new/empty cache directory.
 
-The trainer writes:
-
-- `checkpoint_epoch5.pt`, `checkpoint_epoch10.pt`, `checkpoint_epoch15.pt`,
-  `checkpoint_epoch20.pt`: inference weights + architecture/protocol metadata.
-- **One** `latest_resume.pt`: model + Adam + scaler + training-control state and
-  history, atomically replaced at each save event.
-
-Fully frozen pretrained encoders are omitted from these files and recreated
-from Hugging Face on load. An exact tensor fingerprint is checked before use;
-missing/incompatible pretrained weights fail explicitly. Keep the HF cache or
-Internet access. Trainable vision and all trained grounding tensors are saved.
-Tiny contract models save everything and never omit random encoder tensors.
-
-With frozen text and trainable vision, expect roughly **1.24 GB per snapshot**
-and **3.72 GB for the resume file**, before small metadata/serialization overhead.
-Four snapshots + resume occupy about 8.7 GB; the old/new resume coexist during
-atomic replacement, bringing transient checkpoint storage to about **12.4 GB**.
-The exact tensor-byte estimate is printed and saved in `run_config.json`.
-Leave room for result masks, HF/uv caches and temporary files. If space is tight,
-use `--save-every 10` **in both runs** and evaluate only 10/20. Unfreezing text
-increases both VRAM and checkpoint storage; the estimates above no longer apply.
-Startup checks the projected checkpoint peak plus a 1 GiB result reserve.
-The save routine also checks free space, retains the old resume on failure, and never
-silently deletes checkpoints. Disk I/O synchronization uses a separate Gloo group.
-
-### Cell 3: validation at each checkpoint
+### 3. Train, validate, test and run interventions
 
 ```bash
 %%bash
 set -euo pipefail
-for EPOCH in 5 10 15 20; do
-    uv run eval_joint.py \
-        --checkpoint "$RUN_ROOT/checkpoint_epoch$EPOCH.pt" \
-        --data-root "$DATA_ROOT" --cache-root "$OCR_CACHE" \
-        --dataset val --view full --batch-size 1 --num-workers 2 \
-        --output-dir "$RUN_ROOT/eval_val_ep$EPOCH"
-done
+uv run run_evidence_transport.py \
+    --feature-cache "$FEATURE_CACHE" --data-root "$DATA_ROOT" \
+    --output-dir "$RUN_ROOT" --recipe both \
+    --num-epochs 20 --batch-size 8 --num-workers 2 \
+    --lr 0.0003 --weight-decay 0.01 --seed 42 --amp
 ```
 
-Evaluation is float32. Batch1 bounds native-output/crop memory; batch2/4 can be
-used if GPU memory allows. It does not change the requested metric definition.
-Mean IoU, global IoU, size groups, per-image scores and native PNG masks are saved.
-`base_*` in `metrics.json` refers to the raw pyramid **of this same checkpoint**,
-which has been jointly trained in B. It is not the independently trained run A.
+For each recipe the command automatically:
 
-### Cell 4: select, evaluate test and diagnose
+- trains a freshly initialized adapter for 20 epochs;
+- saves small weights-only snapshots at 5/10/15/20 and one replacing
+  `latest_resume.pt` **every epoch**;
+- evaluates all four on validation, selecting highest mean IoU (earlier epoch
+  breaks ties);
+- evaluates test at the validation-selected epoch and epoch 20 separately;
+- evaluates selected-checkpoint val with missing OCR, zero word descriptors and
+  globally shuffled recognized-word descriptors, independently of batch size;
+- saves native PNG masks, per-image metrics, size groups, global IoU, gate/word
+  scores, evidence-only IoU, rescue/harm counts and a GT oracle envelope.
 
-```python
-import json
-import subprocess
+The oracle envelope chooses between the **predicted** parent and evidence masks
+using GT, only to diagnose unused potential. It is never a deployable result or
+a checkpoint-selection metric. Compare oracle potential, actual gains, selection
+scores, missing/shuffled sensitivity and large-region losses together.
 
-root = Path(os.environ["RUN_ROOT"])
-epochs = (5, 10, 15, 20)
-best = max(epochs, key=lambda epoch: (
-    json.loads((root / f"eval_val_ep{epoch}/metrics.json").read_text())["summary"]["mean_iou"],
-    -epoch,
-))
-(root / "selection.json").write_text(json.dumps({
-    "variant": os.environ["RUN_VARIANT"], "selected_epoch": best,
-    "selection_metric": "validation_mean_iou", "tie_break": "earlier_epoch",
-}, indent=2))
+Keep batch 8 for the matched comparison; reduce it for **both** runs if needed.
+The code uses packed valid crops, shared CNN output for counterfactuals, batched
+inverse warps, persistent loader workers, pinned transfers, AMP and foreach
+AdamW on GPU. It avoids backbone backprop, per-candidate full-native losses and
+repeated full-model training. No compilation/recompilation overhead or OCR model
+is added to these head runs. None of these choices proves a measured GPU speedup.
 
-def evaluate(split, view, epoch):
-    subprocess.run([
-        "uv", "run", "eval_joint.py", "--checkpoint", str(root / f"checkpoint_epoch{epoch}.pt"),
-        "--data-root", os.environ["DATA_ROOT"], "--cache-root", os.environ["OCR_CACHE"],
-        "--dataset", split, "--view", view, "--batch-size", "1", "--num-workers", "2",
-        "--output-dir", str(root / f"eval_{split}_{view}_ep{epoch}"),
-    ], check=True)
-
-for epoch in sorted({best, 20}):
-    evaluate("test", "full", epoch)  # Compare validation-selected and fixed epoch20 separately.
-if os.environ["RUN_VARIANT"] == "joint-crop":
-    for view in ("pyramid", "global", "missing", "geometry", "shuffled_text"):
-        evaluate("val", view, best)
-for view, folder in [("full", f"eval_val_ep{best}")] + (
-    [("pyramid", f"eval_val_pyramid_ep{best}"), ("global", f"eval_val_global_ep{best}")]
-    if os.environ["RUN_VARIANT"] == "joint-crop" else []
-):
-    subprocess.run([
-        "uv", "run", "diagnose.py", "--data-root", os.environ["DATA_ROOT"],
-        "--predictions", str(root / folder), "--output-dir", str(root / f"diagnostic_{view}"),
-    ], check=True)
-print(f"Selected epoch {best}: {os.environ['RUN_VARIANT']}")
-```
-
-Views do not retrain or use GT as input:
-
-| View | Meaning |
-|---|---|
-| `full` | Final jointly trained output |
-| `pyramid` | Raw pyramid branch of the same checkpoint |
-| `global` | Keep crop evidence/global correction, disable final local overwrite |
-| `missing` | Disable all OCR candidates; global correction remains |
-| `geometry` | Zero recognized-string embeddings; Q, image, boxes and RGB remain |
-| `shuffled_text` | Permute recognized strings across images, preserving boxes/RGB |
-
-For A all views return the same pyramid prediction; the guide skips redundant
-interventions. For B, compare full/global/pyramid and missing/shuffled-text to
-separate crop replacement, global cleanup and recognized-string contributions.
-Compare A/B small (<1% area), medium (1-10%) and large (>=10%) performance, along
-with per-image wins/losses and global IoU. OCR only covers some failure cases;
-this experiment does not promise to fix tiny non-text objects or blurred evidence.
-
-### Cell 5: ZIP results, excluding checkpoints
+### 4. ZIP analysis results, excluding weights and the shared cache
 
 ```python
 import zipfile
 
-archive = Path(f"joint_native_{os.environ['RUN_VARIANT']}_ep20_seed42.zip")
-with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
-    for path in sorted(root.rglob("*")):
-        if path.is_file() and path.suffix.lower() not in (".pt", ".tmp", ".zip"):
-            bundle.write(path, path.relative_to(root))
+root = Path(os.environ['RUN_ROOT'])
+archive = Path('evidence_transport_two_runs_ep20_seed42.zip')
+with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as bundle:
+    for recipe in ('transport', 'intervention'):
+        for path in sorted((root / recipe).rglob('*')):
+            if path.is_file() and path.suffix.lower() not in ('.pt', '.tmp', '.zip'):
+                bundle.write(path, path.relative_to(root))
+    bundle.write(Path(os.environ['FEATURE_CACHE']) / 'manifest.json', 'feature_manifest.json')
 print(archive.resolve())
 ```
 
-Download the ZIP for analysis. Keep desired `.pt` files separately as Kaggle
-outputs/inputs. `latest_resume.pt` supports training recovery; weights-only
-snapshots support evaluation/deployment and deliberately reject exact resume.
-
-## Resume, configuration and deployment
-
-For epoch-boundary recovery, use the same training command with
-`--resume-checkpoint /kaggle/input/YOUR_RUN/latest_resume.pt` and a **new, empty**
-`--output-dir`. Keep variant, seed, batch/accumulation, cache, objective and encoder
-policy unchanged. `--num-epochs 20` is the total target, not 20 additional epochs.
-Data order and RNG are reseeded by epoch/rank, and optimizer/scaler/control state
-are restored. No mid-epoch resume is claimed. With an active LR schedule, keep the
-original total step budget; constant-LR runs can extend their total epochs.
-
-### Kaggle: resume an interrupted run
-
-Download `latest_resume.pt` and all existing `checkpoint_epoch*.pt` files from the previous session (the analysis
-ZIP excludes `.pt` files). Upload it as a Kaggle Dataset and attach it to the new
-GPU notebook. Run **Cell 1** first, keeping the original `RUN_VARIANT` (`joint-crop`
-for Session B). Replace Cell 2 with these cells; do not also run fresh training.
+Download this ZIP for analysis. Download desired small adapter checkpoints
+separately. For a reusable cache, ZIP **the feature cache only**, separately:
 
 ```python
-os.environ["RESUME_CHECKPOINT"] = "/kaggle/input/datasets/YOUR_USERNAME/YOUR_DATASET/latest_resume.pt"
-assert Path(os.environ["RESUME_CHECKPOINT"]).is_file()
-assert not Path(os.environ["RUN_ROOT"]).exists() or not any(Path(os.environ["RUN_ROOT"]).iterdir())
+import shutil
+print(shutil.make_archive('evidence_transport_feature_cache', 'zip', os.environ['FEATURE_CACHE']))
 ```
 
-Replace the checkpoint path with the actual attached input path. Keep `RUN_ROOT`
-as `outputs`, empty in this new session.
+**Only run the optional cache ZIP in a separate cache-export session with enough
+free disk for a second copy**; it is deliberately excluded from the ordinary
+single-session workflow. Keep the source parent checkpoint for future inference.
+Adapters are small: four snapshots plus one AdamW resume per recipe are only
+about 5 MB of tensor data (serialization adds overhead). The large shared
+grids/features are the main disk cost here. A previous notebook output can also
+be attached directly as Kaggle Input for reuse, without copying the cache.
+
+## Resume or evaluate existing adapter checkpoints
+
+Resume one recipe in a new session with a completed feature cache attached as
+Input, the same code/seed/batch/optimizer settings, and a new output directory:
 
 ```bash
-%%bash
-set -euo pipefail
-uv run torchrun --standalone --nproc_per_node=2 train_joint.py \
-    --data-root "$DATA_ROOT" --cache-root "$OCR_CACHE" \
-    --output-dir "$RUN_ROOT" --variant "$RUN_VARIANT" \
-    --resume-checkpoint "$RESUME_CHECKPOINT" \
-    --num-epochs 20 \
-    --batch-size 2 --gradient-accumulation-steps 2 \
-    --num-workers 2 \
-    --lr 0.00001 --optimizer adam --weight-decay 0 \
-    --lr-scheduler none --warmup-ratio 0 \
-    --freeze-vision-encoder False --freeze-text-encoder True \
-    --max-candidates 24 --ocr-dropout 0.2 --text-dropout 0.2 \
-    --gradient-checkpointing --amp \
-    --save-every 5 --seed 42
+uv run run_evidence_transport.py \
+    --feature-cache /kaggle/input/YOUR_FEATURE_CACHE \
+    --data-root "$DATA_ROOT" --output-dir outputs --recipe intervention \
+    --num-epochs 20 --batch-size 8 --num-workers 2 \
+    --lr 0.0003 --weight-decay 0.01 --seed 42 --amp \
+    --resume-checkpoint /kaggle/input/YOUR_RUN/latest_resume.pt \
+    --previous-checkpoint-dir /kaggle/input/YOUR_RUN
 ```
 
-A file saved after epoch 10 continues at epoch 11 and stops at epoch 20; it does
-not train 20 additional epochs. Work since the last completed epoch is repeated.
-Preserve any custom settings from the original run. The new session writes an
-updated `latest_resume.pt` and its scheduled snapshots.
+`num-epochs` is the **total** target. Old snapshots are read directly from Input,
+new ones from Output; all four participate in val selection. Upload the earlier
+snapshots alongside the resume file. Source/cache/training-control mismatch is
+rejected instead of silently resetting the optimizer. Recovery starts at the
+next epoch. Weights-only snapshots intentionally cannot exact-resume AdamW.
 
-### Resume: evaluate all four epochs across Input and Output
-
-Upload the old snapshots together with `latest_resume.pt`, keeping them from the
-**same run/variant/seed**. The example below assumes a flat input folder. Set
-`PREVIOUS_CHECKPOINT_DIR` to the directory containing the old snapshots. Nothing
-is copied into `outputs/`, so the old weights do not consume working-disk space.
-
-After resumed training finishes, run the following cells **instead of Cells 3
-and 4** from the fresh-training guide. All four epochs are required: missing
-files cause a clear error before evaluation starts. New output files take
-precedence when the same epoch exists in both locations.
-
-```python
-os.environ["PREVIOUS_CHECKPOINT_DIR"] = "/kaggle/input/datasets/YOUR_USERNAME/YOUR_DATASET"
-```
-
-```python
-import json
-import subprocess
-
-root = Path(os.environ["RUN_ROOT"])
-previous = Path(os.environ["PREVIOUS_CHECKPOINT_DIR"])
-epochs = (5, 10, 15, 20)
-checkpoints = {}
-for epoch in epochs:
-    name = f"checkpoint_epoch{epoch}.pt"
-    candidates = (root / name, previous / name)
-    checkpoints[epoch] = next((path for path in candidates if path.is_file()), None)
-missing = [epoch for epoch, path in checkpoints.items() if path is None]
-if missing:
-    raise FileNotFoundError(f"Missing checkpoint epochs {missing}; check PREVIOUS_CHECKPOINT_DIR and resumed outputs")
-
-(root / "evaluation_checkpoints.json").write_text(json.dumps(
-    {str(epoch): str(path) for epoch, path in checkpoints.items()}, indent=2))
-
-def evaluate(split, view, epoch, folder):
-    subprocess.run([
-        "uv", "run", "eval_joint.py", "--checkpoint", str(checkpoints[epoch]),
-        "--data-root", os.environ["DATA_ROOT"], "--cache-root", os.environ["OCR_CACHE"],
-        "--dataset", split, "--view", view, "--batch-size", "1", "--num-workers", "2",
-        "--output-dir", str(root / folder),
-    ], check=True)
-
-for epoch in epochs:
-    evaluate("val", "full", epoch, f"eval_val_ep{epoch}")
-
-best = max(epochs, key=lambda epoch: (
-    json.loads((root / f"eval_val_ep{epoch}/metrics.json").read_text())["summary"]["mean_iou"],
-    -epoch,
-))
-(root / "selection.json").write_text(json.dumps({
-    "variant": os.environ["RUN_VARIANT"], "selected_epoch": best,
-    "selection_metric": "validation_mean_iou", "tie_break": "earlier_epoch",
-    "checkpoint": str(checkpoints[best]),
-}, indent=2))
-
-for epoch in sorted({best, 20}):
-    evaluate("test", "full", epoch, f"eval_test_full_ep{epoch}")
-if os.environ["RUN_VARIANT"] == "joint-crop":
-    for view in ("pyramid", "global", "missing", "geometry", "shuffled_text"):
-        evaluate("val", view, best, f"eval_val_{view}_ep{best}")
-for view, folder in [("full", f"eval_val_ep{best}")] + (
-    [("pyramid", f"eval_val_pyramid_ep{best}"), ("global", f"eval_val_global_ep{best}")]
-    if os.environ["RUN_VARIANT"] == "joint-crop" else []
-):
-    subprocess.run([
-        "uv", "run", "diagnose.py", "--data-root", os.environ["DATA_ROOT"],
-        "--predictions", str(root / folder), "--output-dir", str(root / f"diagnostic_{view}"),
-    ], check=True)
-print(f"Selected epoch {best}: {os.environ['RUN_VARIANT']}")
-```
-
-Then run **Cell 5** unchanged to ZIP the combined results from all four epochs,
-including selection, diagnostics and checkpoint-path provenance, excluding `.pt`
-files. Download the newly saved weights/resume file separately as before.
-
-Optional `--config path.json` follows **config > explicit CLI > defaults**.
-Paths remain on CLI. Available optimizer/schedule/freezing options are shared
-with the project: `--optimizer adam|adamw`, `--lr`, `--weight-decay`,
-`--backbone-lr`, `--lr-scheduler none|cosine|linear|poly`, `--warmup-ratio`,
-`--min-lr-ratio`, `--poly-power`, `--freeze-backbone True|False`,
-`--freeze-vision-encoder True|False`, `--freeze-text-encoder True|False`.
-For example, `{"roi_weight": 0.25, "pyramid_weight": 0.25}` changes objective
-settings. Auxiliary keys are `aux96_weight`, `aux192_weight`, `aux384_weight`.
-The guide needs no JSON file. Do not tune these settings differently across A/B
-if interpreting their difference as an architecture comparison.
-
-GT-free deployment uses an OCR record under `CACHE/single/IMAGE_STEM.json`, with
-the same manifest/provider protocol as training, or `--no-ocr`:
+To evaluate existing snapshots without training, use a new output directory:
 
 ```bash
-uv run predict_joint.py --checkpoint outputs/checkpoint_epoch20.pt \
+uv run run_evidence_transport.py \
+    --feature-cache "$FEATURE_CACHE" --data-root "$DATA_ROOT" \
+    --output-dir outputs_eval --recipe transport --batch-size 8 \
+    --evaluate-checkpoints /kaggle/input/YOUR_RUN/checkpoint_epoch5.pt \
+        /kaggle/input/YOUR_RUN/checkpoint_epoch10.pt \
+        /kaggle/input/YOUR_RUN/checkpoint_epoch15.pt \
+        /kaggle/input/YOUR_RUN/checkpoint_epoch20.pt
+```
+
+## GT-free online prediction
+
+The cache is a training acceleration, not an inference requirement. Keep the
+same parent checkpoint, a selected adapter snapshot and the OCR provider/cache
+protocol. Put the image's OCR record at `OCR_CACHE/single/IMAGE_STEM.json`.
+
+```bash
+uv run predict_evidence_transport.py \
+    --checkpoint outputs/transport/checkpoint_epoch10.pt \
+    --parent-checkpoint "$PYRAMID_CKPT" \
     --image /path/image.jpg --question "What does the label say?" \
-    --cache-root /path/ocr_cache --output prediction.png
-# Replace --cache-root ... with --no-ocr for the missing-evidence path.
+    --cache-root "$OCR_CACHE" --output prediction.png
 ```
 
-Use `eval_joint.py` / `predict_joint.py` for new checkpoints. Old pyramid/OCR
-checkpoints remain supported by their original entrypoints on their branches.
-This is a new experiment and requires fresh training.
+Use the epoch actually chosen in `selection.json`. Replace `--cache-root ...`
+with `--no-ocr` for the exact parent fallback. The online path shares the same
+feature conversion/storage rounding as extraction and verifies the parent hash
+and OCR protocol. It consumes image, Q and OCR only; no GT masks or answers.
 
-## Verification boundary
+For comparison, use the native cached parent metrics (`base_mean_iou` and
+`base_metrics`) and the two adapters' validation-selected results. Only the two
+adapter recipes form a matched objective ablation; comparing against older
+end-to-end runs also changes freezing, training budget and objective.
 
-Offline checks cover native geometry/loss contracts, crop-to-pyramid gradients,
-empty OCR, strict checkpoint loading, two-rank CPU/Gloo accumulation and exact
-epoch-boundary resume, all inference views, native mean/global IoU, diagnostics
-and GT-free prediction. Mixed-precision checks exercise CPU fp16/bfloat16 paths.
-They do not establish real GPU accuracy, speed, VRAM usage or transfer performance.
+## Validation boundary
 
+CPU fixtures test finite FP16 forward/backward, empty OCR fallback, GT/answer
+independence, native versus batched composition, stable leave-one-out against
+explicit removal, checkpoint recovery, original-resolution metrics and the full
+cache/train/eval pipeline. These checks do not establish Kaggle speed, real-data
+accuracy or cross-backbone/dataset transfer. Selection, scope and local-mask
+errors can still coexist; the diagnostics distinguish them before another
+full-backbone experiment is justified.
 
-## Optimized execution and existing checkpoints
-
-The packed-native runtime keeps the same learned tensors, architecture metadata,
-loss weights, precision policy and checkpoint format. It packs only candidates
-that remain valid after OCR dropout into the CNN, then scatters masks back to
-the original slots. Padding/dropped slots produce zeros and do not enter the
-objective. Entirely empty OCR batches skip the crop CNN with a zero-gradient DDP
-anchor; the global correction still runs. GroupNorm normalizes each sample, so
-removing padded samples does not change valid-sample normalization.
-
-Dataset workers generate RGB context crops only for real candidates. Native
-composition accumulates occupied windows instead of allocating a padded full-image
-tensor per candidate. Training reuses those exact native crop-logit windows for
-ROI loss, and avoids a redundant global-logit interpolation. The raw-pyramid
-inference view bypasses the unused crop head and RGB crop preparation.
-
-Frozen OCR text descriptors are cached in a bounded CPU LRU of16,384 strings per
-process (about48 MiB for768-dimensional FP32 vectors). The cache is nonpersistent,
-rebuilds after resume, separates autocast/device/mode settings and invalidates when
-encoder parameters are loaded. Trainable text bypasses caching. This is internal
-runtime caching; the existing OCR dataset cache remains unchanged.
-
-Keep the same train command and all settings. To continue an interrupted old
-joint-crop run, add `--resume-checkpoint /kaggle/input/YOUR_RUN/latest_resume.pt`
-and use a fresh empty output directory. Keep `--num-epochs 20`: it denotes the
-total target, not20 more epochs. A weights-only snapshot cannot recover Adam state.
-No retraining from epoch0 is required for compatibility. Existing inference
-checkpoints remain loadable. Runtime changes are recorded in run_config.json;
-history now includes epoch_seconds, excluding checkpoint I/O. Do not combine
-old/new timing segments as though execution were unchanged.
-
-Output/loss/gradient equivalence was checked against the preceding implementation
-on CPU fixtures, including empty OCR and overlapping native windows. Small
-floating-point differences from packed convolution batches or accumulation order
-can occur; identical GPU trajectories are not promised. A CPU fixture benchmark
-with batch2,8 slots/image and only1 valid crop total measured about1.78s versus
-0.14s per forward+backward. This sparse synthetic workload does not predict T4
-speedup, real candidate density, or Kaggle session duration. Measure the new
-GPU epoch_seconds before estimating remaining training time.
+The existing `train_joint.py`, `eval_joint.py`, old checkpoints and their behavior
+are unchanged. Their guide remains on [exp/joint-native-crop](https://github.com/DPTPhatUS/VizWiz-VQA-Grounding/tree/exp/joint-native-crop).
