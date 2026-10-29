@@ -29,6 +29,7 @@ from training.joint_checkpoint import (
     storage_estimate,
 )
 from training.joint_objective import DEFAULTS, OBJECTIVE_VERSION, JointObjective
+from training_image_protocol import image_names
 from training_options import (
     TrainingArgumentParser,
     TrainingControls,
@@ -43,6 +44,10 @@ def arguments(argv=None):
     p.add_argument("--data-root", required=True)
     p.add_argument("--cache-root", required=True)
     p.add_argument("--output-dir", required=True)
+    p.add_argument(
+        "--train-image-list",
+        help="Optional JSON image list; default remains all train images",
+    )
     p.add_argument("--variant", choices=("pyramid", "joint-crop"), required=True)
     p.add_argument(
         "--resume-checkpoint", help="latest_resume.pt, never a weights-only snapshot"
@@ -73,6 +78,7 @@ def arguments(argv=None):
             "cache_root",
             "output_dir",
             "resume_checkpoint",
+            "train_image_list",
         }:
             p.error(
                 "Paths stay on CLI; config overrides training/model/objective settings"
@@ -167,6 +173,7 @@ def train(args, rank, world, device, group):
         max_candidates=args.max_candidates,
         mode="native_crop" if model.variant == "joint-crop" else "native_point",
     )
+    data.names = image_names(args.train_image_list, data.names)
     sampler = (
         DistributedSampler(data, world, rank, seed=args.seed) if world > 1 else None
     )
@@ -231,6 +238,7 @@ def train(args, rank, world, device, group):
         "eval_joint.py",
         "predict_joint.py",
         "training_options.py",
+        "training_image_protocol.py",
         "models/joint_grounding.py",
         "models/model.py",
         "models/image_encoder.py",

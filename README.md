@@ -1,326 +1,341 @@
-# Evidence Transport: selection and evidence use
+# Parent-unseen utility evidence edits
 
-Branch: `exp/evidence-transport`.
+Branch: `exp/utility-evidence-edits`.
 
-Two independent **20-epoch adapter** experiments share one frozen-pyramid feature
-cache. This is a new training protocol, not a continuation of joint-crop.
-The parent is the **matched pyramid control from `exp/joint-native-crop`, epoch
-20**. Do not substitute a joint-crop checkpoint, B+5, or an older pyramid
-checkpoint: the extractor checks the checkpoint family and variant.
+Goal: improve small (<1% GT area) and medium (1-10%) masks while limiting damage
+to large (>=10%) masks. Improvement is a hypothesis, not a measured result.
+This branch preserves the existing pyramid architecture and adds a small
+question-conditioned decision head. It does not regenerate OCR masks with a CNN.
 
-The previous joint-crop's selected validation checkpoint barely changed when OCR
-was removed or its strings shuffled. These experiments remove the semantic-mask
-bypass from the evidence branch and explicitly supervise which evidence matters.
-They do not guarantee improvement or resolve an intrinsically ambiguous question.
+## Why this experiment differs
 
-## Experiments
+The previous Transport head learned useful word scores, but the learned mask
+and scope gate lost their benefit. On 145 val images satisfying its GT scope
+criterion, learned evidence IoU was about 28.7%, versus about 57.3% using the same
+selection scores and original polygon unions. The original gate still failed.
+These are diagnostic subgroup results, not deployable performance claims.
 
-| Recipe | What is trained | Question tested |
+Three methodological connections motivate this implementation:
+
+- [Mask Scoring R-CNN, CVPR 2019](https://openaccess.thecvf.com/content_CVPR_2019/html/Huang_Mask_Scoring_R-CNN_CVPR_2019_paper.html)
+  learns mask quality separately from classification confidence. Here the head
+  predicts the **advantage of an exact candidate mask over the parent**, rather
+  than OCR purity. We do not reproduce its network or COCO claims.
+- [Consistent Estimators for Learning to Defer, ICML 2020](https://proceedings.mlr.press/v119/mozannar20b.html)
+  frames expert selection as cost-sensitive learning. Here identity/parent is
+  an explicit zero-advantage action. Our Huber-plus-expected-regret objective
+  is an adaptation, **not the paper's exact surrogate or consistency theorem**.
+- [Learn then Test](https://arxiv.org/abs/2110.01052) separates learning from risk
+  testing. We select a single policy on tune, then audit it on independent
+  safety images with an exact binomial bound. This is a restricted fixed-policy
+  application, not a reproduction of its full multiple-testing framework.
+
+## Architecture and two matched objectives
+
+```text
+I + Q --> frozen pyramid --> native parent mask P
+                |
+                +--> visual feature map + full question tokens
+OCR strings --> frozen text encoder --> word vectors
+OCR polygons --> singles / nearby line groups / all-word union
+                |
+        exact native actions:
+        P; R; P intersect R; P union R; P minus R
+                |
+word/Q attention + set context + candidate visual/geometry + parent reference
+                |
+        shared advantage scorer (64 hidden channels)
+                |
+choose one action if its score exceeds the selected threshold; otherwise P
+```
+
+`R` is a polygon union. Nearby groups use existing deterministic geometry-based
+proposals; no GT or answer influences proposal membership/order. There are at
+most `4*(2*N+1)+1` actions (197 at N=24), often fewer because identity edits are
+removed. Candidate features are cached. Mask geometry/IoU labels remain native.
+The scorer adds **170,577 parameters** at CLIP dimensions (about 0.68 MB FP32 weights).
+The scorer has no backbone-specific text/visual width; dimensions come from the
+manifest. A new backbone still requires a compatible extractor and new cache.
+
+Both experiments have the **same actions, architecture, initialization and image
+order**, differing only in objective:
+
+| Recipe | Supervised utility | Training emphasis |
 |---|---|---|
-| `transport` | word selection + local masks + evidence segmentation + scope gate | Can a separately grounded evidence mask improve the frozen parent? |
-| `intervention` | identical architecture and initialization, plus leave-one-evidence-out contribution loss | Does supervising actual evidence contribution improve selection/use? |
+| `gain` | `Delta = IoU(action, GT) - IoU(parent, GT)` | expected IoU improvement |
+| `risk` | `Delta - 3 * is_large_GT * max(-Delta, 0)` | stronger cost for harming large GT; small/medium image losses weighted 2 |
 
-The adapter adds **169,891 parameters** at CLIP dimensions (about 0.68 MB of FP32 weights).
-Both parent encoders **and the entire parent decoder are frozen**. OCR remains
-external/frozen and uses the existing PP-OCR cache. No answer is needed for
-training or inference. GT masks provide training labels only. The scope target
-never depends on parent accuracy, avoiding the old train-seen parent-quality
-calibration shortcut. This does not eliminate all possible overfitting.
+For each image, loss is valid-edit mean Huber regression on utility/0.1 plus
+expected regret under `softmax(scores/0.1)`. Regret is best utility minus the
+policy's expected utility. Padding is excluded and slot zero is exactly zero.
+Native labels use integer intersections/unions and float64 ratios. Sensitive loss
+operations use FP32; no FP16 mask-area sums. Safety's strict 5-point IoU-loss
+comparison uses integer cross-multiplication, including at threshold boundaries.
+The resulting scores are **utilities, not calibrated probabilities**. We select
+a complete binary mask; no multiplication of gate/word/pixel confidences.
 
-### Architecture
+GT area appears only in training costs, tuning metrics and safety auditing;
+there is no GT area/answer input during inference.
 
-```text
-Image + Q -- frozen parent encoder --> region visual descriptors, scene, full Q tokens
-OCR strings -- same frozen text encoder --> word descriptors
-OCR boxes --> 2x context boxes (minimum 32 native pixels) --> RGB crops 64 x 64
-                         |
-word + region visual + geometry -- Q attention -- set attention --> 64-dim tokens
-                         |                                      |
-                    selection logits                     scope gate g
-                         |
-RGB crop --> 16/24-channel CNN + token conditioning --> 64 x 64 local probabilities
-                         |
-    inverse warp into image + competition with explicit background
-                         |
-                  evidence-only probability E
-                         |
-Final P = (1-g) * sigmoid(native parent logits) + g * E
-```
+## Parent-unseen protocol (required)
 
-The evidence branch cannot read parent logits, decoder semantic features, or GT.
-It uses pre-fusion region features, full Q tokens, recognized text, geometry and
-RGB. Empty OCR gives `g=0` and exactly the parent's prediction. Multiple words
-can contribute simultaneously; there is no hard top-one OCR selection.
-Outside all context boxes, `E=0`, so an evidence route can suppress excess
-foreground outside OCR, unlike a correction restricted to OCR support.
+An old full-train pyramid cannot supply honest train-side utility labels: it has
+already learned those images. This pilot therefore requires **one newly trained
+parent**, with image membership recorded in its checkpoint.
 
-The head accepts arbitrary text/visual dimensions from the cache manifest and
-has no CLIP-specific hidden width. A different backbone/data adapter must produce
-the same feature schema and a **new cache**; cached features are not portable
-between checkpoints. OCR is not appropriate for every non-text grounding task.
+1. Hash-split official train into 80% parent-fit and 20% head-only images, keeping identical upright pixel hashes
+   in the same group. One representative per exact duplicate is retained for
+   the head cohorts; exclusions are recorded.
+2. Train the parent on parent-fit only, for 20 epochs.
+3. Freeze the entire parent. Split head-only images, independently of labels,
+   into 60% fit / 20% tune / 20% safety.
+4. Train each head on fit for 20 epochs. Select checkpoint 5/10/15/20 and threshold
+   on tune, maximizing the equally weighted small/medium IoU gain, subject to
+   nonnegative overall and large-group mean gain on tune.
+5. Audit the ONE chosen policy on safety. Do not search another threshold after
+   inspecting safety. If it fails, deploy identity/parent.
+6. Evaluate proposed and audited policies on **untouched official val/test**.
+   They are not used for checkpoint/threshold fitting in this protocol.
 
-### Targets and losses
+With 6,494 train images, the split is approximately 5,195 parent-fit / 779 head-fit
+/ 260 tune / 260 safety. Code checks exact lists, parent overlap, cache hashes,
+and data annotations. All images remain in their original directories.
 
-Native GT polygon purity is `intersection / polygon area`. Selection learns this
-soft target, balancing present positive/negative candidate groups within each
-image. The scope target is 1 only when the union of polygons with purity >=0.5
-covers >=80% of GT and has precision >=50%; otherwise it is 0. Scope BCE remains
-unweighted to avoid silently changing its probability calibration.
+This is a matched pilot against **its own 80%-trained parent**. The old full-train
+pyramid remains an external reference, not a matched control. A positive pilot
+would still need a larger/out-of-fold study and repeated seeds before a paper
+claim. Do not hide the reduced parent training set or extra head training budget.
 
-The evidence-only segmentation loss is applied on scope-positive images. All
-valid local masks receive BCE supervision. The parent/final mask's training
-accuracy is **not** used to choose the gate target. No validation/test labels are
-stored in the feature records or consumed by the head.
+### What the safety check actually means
 
-```text
-L_transport = L_selection + L_scope + L_local + L_evidence
-L_intervention = L_transport + 0.5 * L_leave_one_out
-```
+For each fixed proposed policy it audits
+`P(IoU loss > 0.05 | GT area >= 0.10)` over all large images, not only switches.
+A one-sided Clopper-Pearson upper bound must be <=0.05. Confidence error is 0.025
+per recipe (Bonferroni for two recipes: joint error <=0.05). Safety also requires
+nonnegative **observed** mean gain overall and on large images.
 
-`L_evidence` is BCE + soft Dice. Global training targets use area-resampled
-192 x 192 masks; local targets use supersampled pixel-centre sampling followed
-by averaging to 64 x 64. These are explicit training surrogates, **not the old
-full-native-resolution objective**. Native polygon purity and scope use original
-GT resolution. All final masks/mean IoU/global IoU use original image resolution.
+This is **not a guarantee of nondecreasing population mean IoU**, nor a guarantee
+that no large image is harmed. The bound requires an independent safety sample,
+fixed policy and IID images from the target distribution. Distribution shift or
+repeated redesign after peeking at safety invalidates that interpretation. Too
+few safety large images can prevent certification. Identity has exactly zero
+relative harm by construction, even without a statistical estimate.
 
-For intervention, analytically remove each candidate from the probability
-competition. On unique GT mass of a positive polygon, its foreground contribution
-is encouraged towards 1; on a negative polygon's background pixels it is
-encouraged towards 0. Overlapping positive polygons are not falsely required to
-be independently indispensable. Prefix/suffix log-sum-exp computes all removals
-in O(B*N*H*W), with no extra CNN/attention forwards and no unstable `1-weight`
-subtraction. This tests spatial evidence use; it does not guarantee semantic
-understanding of recognized strings. The shuffled-text diagnostic tests that.
+`policy.json` records proposed/deployed thresholds and the audit. A null deployed
+threshold means **exact parent fallback**, not a successful new method.
 
-## Kaggle: one GPU session for cache + both runs
+## Kaggle Session 1: train the disjoint parent
 
-Use a GPU notebook, internet enabled, and attach:
+Use the usual 2-GPU notebook, internet enabled, with VizWiz and the existing OCR
+cache attached. Do not use any of the old `PYRAMID_CKPT` or feature-cache files.
 
-1. VizWiz grounding data.
-2. The existing OCR cache (no new OCR generation session).
-3. The **matched pyramid control epoch-20 checkpoint** downloaded from the recent
-   `joint_native_pyramid` run. Its `latest_resume.pt` is also accepted by the
-   extractor, but a weights-only snapshot is smaller.
-
-One GPU is sufficient: **do not use torchrun**. Both recipes run sequentially
-with fresh model/optimizer/scaler and identical seed/order. Each result has a
-20-epoch parent history plus 20 adapter epochs; it is not a fresh 20-epoch
-end-to-end model. This is 40 lightweight
-head epochs, not 40 full-backbone epochs. Actual Kaggle duration is unmeasured;
-the history records seconds per epoch. Keep the effective batch unchanged when
-comparing the two recipes.
-
-### 1. Setup
+### Setup
 
 ```python
 !pip install -q uv
-!git clone --single-branch --branch exp/evidence-transport https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+!git clone --single-branch --branch exp/utility-evidence-edits https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
 %cd /kaggle/working/VizWiz-VQA-Grounding
 !uv sync --frozen
 
 import os
 from pathlib import Path
-
 os.environ['DATA_ROOT'] = '/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz'
 os.environ['OCR_CACHE'] = '/kaggle/input/datasets/khoahoang0512/vizwiz-ocr-cache/ocr_cache'
-os.environ['PYRAMID_CKPT'] = '/kaggle/input/YOUR_PYRAMID_DATASET/checkpoint_epoch20.pt'
-os.environ['RUN_ROOT'] = 'outputs'
-os.environ['FEATURE_CACHE'] = 'outputs/feature_cache'
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MPLBACKEND'] = 'Agg'
-Path(os.environ['RUN_ROOT']).mkdir(exist_ok=True)
-assert Path(os.environ['PYRAMID_CKPT']).is_file()
-assert (Path(os.environ['OCR_CACHE']) / 'manifest.json').is_file()
 ```
-
-Change `PYRAMID_CKPT` to the actual Kaggle Input path. Do not copy it to working
-disk. The two run folders will be `outputs/transport` and `outputs/intervention`.
-
-### 2. Build the shared feature cache once
 
 ```bash
 %%bash
 set -euo pipefail
-uv run cache_evidence_transport.py \
-    --checkpoint "$PYRAMID_CKPT" \
+uv run prepare_parent_split.py --data-root "$DATA_ROOT" \
+    --output-dir splits --holdout-fraction 0.2 --cache-root "$OCR_CACHE" --seed 42
+uv run torchrun --standalone --nproc_per_node=2 train_joint.py \
     --data-root "$DATA_ROOT" --cache-root "$OCR_CACHE" \
-    --output-dir "$FEATURE_CACHE" \
-    --max-candidates 24 --batch-size 2 --num-workers 2
+    --output-dir outputs --variant pyramid --train-image-list splits/parent_fit.json \
+    --num-epochs 20 --batch-size 2 --gradient-accumulation-steps 2 \
+    --num-workers 2 --lr 0.00001 --optimizer adam --weight-decay 0 \
+    --lr-scheduler none --warmup-ratio 0 \
+    --freeze-vision-encoder False --freeze-text-encoder True \
+    --max-candidates 24 --ocr-dropout 0.2 --text-dropout 0.2 \
+    --gradient-checkpointing --amp --save-every 10 --seed 42
 ```
 
-The cache is GT-free on val/test; only train has a separate target payload.
-Training extraction skips the high-resolution parent decoder entirely. Region
-and full-token descriptors are stored FP16; context RGB is uint8; losses run at
-FP32 with FP64 Dice reductions. Area targets stay floating point so subpixel
-GT mass is not rounded away to uint8; contribution normalization also preserves
-fractional pixel mass. The same rounded cached inputs are used by both
-recipes. Parent evaluation logits retain FP32 at their original grid size so
-cache compression does not change the reference mask. Sparse polygon targets
-avoid storing 24 dense 192 x 192 planes per training image.
+`batch-size` here is the global microbatch; effective global batch is 4. Parent
+snapshots/resume are saved at 10/20, with no in-training validation. Two snapshots
+plus replacing full Adam resume have about 9.93 GB transient tensor footprint;
+startup checks space including additional reserve. No checkpoint deletion.
 
-For the full dataset, FP32 parent grids on val/test alone take about **8.27 GB**
-(decimal); other features/targets add storage. Startup checks a projected cache
-budget plus 2 GiB reserve, and every atomic write checks free space. The estimate
-is not an absolute bound on image/candidate-dependent cache sizes. If it fails,
-use a separate GPU cache session, ZIP its feature folder, download/upload it as
-Kaggle Input, and set `FEATURE_CACHE` to that input folder in the training session.
-Do not delete or duplicate existing user checkpoints to make space.
-
-A completed feature cache can be reused for additional head runs. Check
-`manifest.json` for `complete: true`, the parent SHA256 and the count
-`training_scope_positives`. Cache generation requires a new/empty destination;
-an interrupted extraction must be rerun into a new/empty cache directory.
-
-### 3. Train, validate, test and run interventions
-
-```bash
-%%bash
-set -euo pipefail
-uv run run_evidence_transport.py \
-    --feature-cache "$FEATURE_CACHE" --data-root "$DATA_ROOT" \
-    --output-dir "$RUN_ROOT" --recipe both \
-    --num-epochs 20 --batch-size 8 --num-workers 2 \
-    --lr 0.0003 --weight-decay 0.01 --seed 42 --amp
-```
-
-For each recipe the command automatically:
-
-- trains a freshly initialized adapter for 20 epochs;
-- saves small weights-only snapshots at 5/10/15/20 and one replacing
-  `latest_resume.pt` **every epoch**;
-- evaluates all four on validation, selecting highest mean IoU (earlier epoch
-  breaks ties);
-- evaluates test at the validation-selected epoch and epoch 20 separately;
-- evaluates selected-checkpoint val with missing OCR, zero word descriptors and
-  globally shuffled recognized-word descriptors, independently of batch size;
-- saves native PNG masks, per-image metrics, size groups, global IoU, gate/word
-  scores, evidence-only IoU, rescue/harm counts and a GT oracle envelope.
-
-The oracle envelope chooses between the **predicted** parent and evidence masks
-using GT, only to diagnose unused potential. It is never a deployable result or
-a checkpoint-selection metric. Compare oracle potential, actual gains, selection
-scores, missing/shuffled sensitivity and large-region losses together.
-
-Keep batch 8 for the matched comparison; reduce it for **both** runs if needed.
-The code uses packed valid crops, shared CNN output for counterfactuals, batched
-inverse warps, persistent loader workers, pinned transfers, AMP and foreach
-AdamW on GPU. It avoids backbone backprop, per-candidate full-native losses and
-repeated full-model training. No compilation/recompilation overhead or OCR model
-is added to these head runs. None of these choices proves a measured GPU speedup.
-
-### 4. ZIP analysis results, excluding weights and the shared cache
+Download **`outputs/checkpoint_epoch20.pt`** and **`splits/refiner_fit.json`** and
+upload them together as a new Kaggle input dataset. Keep that exact parent file.
+Also keep the small metadata ZIP:
 
 ```python
 import zipfile
-
-root = Path(os.environ['RUN_ROOT'])
-archive = Path('evidence_transport_two_runs_ep20_seed42.zip')
-with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as bundle:
-    for recipe in ('transport', 'intervention'):
-        for path in sorted((root / recipe).rglob('*')):
-            if path.is_file() and path.suffix.lower() not in ('.pt', '.tmp', '.zip'):
-                bundle.write(path, path.relative_to(root))
-    bundle.write(Path(os.environ['FEATURE_CACHE']) / 'manifest.json', 'feature_manifest.json')
-print(archive.resolve())
+with zipfile.ZipFile('utility_parent_metadata.zip', 'w', zipfile.ZIP_DEFLATED) as z:
+    for path in sorted(Path('splits').glob('*.json')):
+        z.write(path, path.name)
+    for name in ('run_config.json', 'history.jsonl'):
+        z.write(Path('outputs') / name, name)
 ```
 
-Download this ZIP for analysis. Stop here for the ordinary training session;
-the optional cache export below is not needed to analyze either run. Download desired small adapter checkpoints
-separately. For a reusable cache, ZIP **the feature cache only**, separately:
+If recovering this parent session, use a new empty output folder and the same
+parent-fit list with `--resume-checkpoint INPUT/latest_resume.pt`; num-epochs 20
+is the total target. Retain the split files; never generate a different split.
+
+## Kaggle Session 2: one cache, both lightweight heads and all evaluation
+
+One GPU is sufficient; **do not use torchrun for head training**. Attach data,
+OCR cache, and the NEW parent plus `refiner_fit.json` from Session 1. Existing
+`evidence_transport_feature_cache` cannot be reused because parent and labels
+have changed.
+
+Use the same clone/sync/environment setup, then set:
 
 ```python
-import shutil
-
-cache = Path(os.environ['FEATURE_CACHE']).resolve()
-archive = Path('evidence_transport_feature_cache.zip').resolve()
-if cache == archive.parent or cache in archive.parents:
-    raise ValueError('Write the ZIP outside the feature cache')
-if archive.exists():
-    raise FileExistsError(archive)
-files = [p for p in cache.rglob('*') if p.is_file()]
-# Conservative incompressible-data estimate, headers and 2 GiB notebook reserve.
-required = int(sum(p.stat().st_size for p in files) * 1.01) + len(files) * 4096 + 2 * 1024**3
-free = shutil.disk_usage(archive.parent).free
-if free < required:
-    print(f'SKIP cache ZIP: need {required / 1024**3:.2f} GiB free; have {free / 1024**3:.2f} GiB. Analysis ZIP is sufficient.')
-else:
-    print(shutil.make_archive(str(archive.with_suffix('')), 'zip', str(cache)))
+os.environ['PARENT_INPUT'] = '/kaggle/input/YOUR_NEW_PARENT_DATASET'
+os.environ['PYRAMID_CKPT'] = os.environ['PARENT_INPUT'] + '/checkpoint_epoch20.pt'
+os.environ['HEAD_LIST'] = os.environ['PARENT_INPUT'] + '/refiner_fit.json'
+os.environ['UTILITY_CACHE'] = 'outputs/utility_cache'
+Path('outputs').mkdir(exist_ok=True)
+assert Path(os.environ['PYRAMID_CKPT']).is_file()
+assert Path(os.environ['HEAD_LIST']).is_file()
 ```
 
-**Only run the optional cache ZIP in a separate cache-export session with enough
-free disk for a second copy**; it is deliberately excluded from the ordinary
-single-session workflow. Keep the source parent checkpoint for future inference.
-Adapters are small: four snapshots plus one AdamW resume per recipe are only
-about 5 MB of tensor data (serialization adds overhead). The large shared
-grids/features are the main disk cost here. A previous notebook output can also
-be attached directly as Kaggle Input for reuse, without copying the cache.
-
-## Resume or evaluate existing adapter checkpoints
-
-Resume one recipe in a new session with a completed feature cache attached as
-Input, the same code/seed/batch/optimizer settings, and a new output directory:
+### Cache (frozen parent once)
 
 ```bash
-uv run run_evidence_transport.py \
-    --feature-cache /kaggle/input/YOUR_FEATURE_CACHE \
-    --data-root "$DATA_ROOT" --output-dir outputs --recipe intervention \
-    --num-epochs 20 --batch-size 8 --num-workers 2 \
-    --lr 0.0003 --weight-decay 0.01 --seed 42 --amp \
-    --resume-checkpoint /kaggle/input/YOUR_RUN/latest_resume.pt \
-    --previous-checkpoint-dir /kaggle/input/YOUR_RUN
+%%bash
+set -euo pipefail
+uv run cache_utility_evidence.py \
+    --checkpoint "$PYRAMID_CKPT" --head-image-list "$HEAD_LIST" \
+    --data-root "$DATA_ROOT" --cache-root "$OCR_CACHE" \
+    --output-dir "$UTILITY_CACHE" --max-candidates 24 \
+    --batch-size 2 --num-workers 2 --seed 42
 ```
 
-`num-epochs` is the **total** target. Old snapshots are read directly from Input,
-new ones from Output; all four participate in val selection. Upload the earlier
-snapshots alongside the resume file. Source/cache/training-control mismatch is
-rejected instead of silently resetting the optimizer. Recovery starts at the
-next epoch. Weights-only snapshots intentionally cannot exact-resume AdamW.
+Parent exposure causes a clear error. Fit/tune/safety labels are separate from
+features. Val/test cache construction does not open GT masks. No dense FP32
+768-grid cache is stored: native parent masks are losslessly bit-packed,
+proposals are deterministic polygon edits, and only small descriptors are FP16.
+No old 8.3-GB logit cache or RGB crop CNN cache is needed. Actual cache size varies
+with native resolution/candidate count; each write preserves a 2 GiB notebook
+reserve and never deletes existing files. The cache must be new/empty.
 
-To evaluate existing snapshots without training, use a new output directory:
+### Train + select + audit + evaluate (automatic)
 
 ```bash
-uv run run_evidence_transport.py \
-    --feature-cache "$FEATURE_CACHE" --data-root "$DATA_ROOT" \
-    --output-dir outputs_eval --recipe transport --batch-size 8 \
-    --evaluate-checkpoints /kaggle/input/YOUR_RUN/checkpoint_epoch5.pt \
-        /kaggle/input/YOUR_RUN/checkpoint_epoch10.pt \
-        /kaggle/input/YOUR_RUN/checkpoint_epoch15.pt \
-        /kaggle/input/YOUR_RUN/checkpoint_epoch20.pt
+%%bash
+set -euo pipefail
+uv run run_utility_evidence.py \
+    --feature-cache "$UTILITY_CACHE" --data-root "$DATA_ROOT" \
+    --output-dir outputs --recipe both --num-epochs 20 \
+    --batch-size 16 --num-workers 2 --lr 0.0003 --weight-decay 0.01 \
+    --seed 42 --amp
 ```
 
-## GT-free online prediction
+This command includes **all evaluation**, not training alone:
 
-The cache is a training acceleration, not an inference requirement. Keep the
-same parent checkpoint, a selected adapter snapshot and the OCR provider/cache
-protocol. Put the image's OCR record at `OCR_CACHE/single/IMAGE_STEM.json`.
+- Each head independently trains 20 epochs on fit; the parent never backprops.
+- Weights-only snapshots at 5/10/15/20; one tiny replacing full resume every epoch.
+- All four checkpoints and the fixed threshold grid are evaluated on tune.
+- The chosen checkpoint/threshold is audited once on safety.
+- Native masks, per-image/size-group mean IoU and global IoU are exported on
+  official val/test for BOTH `proposed` and `certified` views. If safety rejects,
+  `certified` is the parent exactly, while `proposed` exposes the failed candidate.
+
+Outputs: `outputs/gain/` and `outputs/risk/`, each with `policy.json`, history,
+tuning results, safety rows, snapshots and `eval_{val,test}_{proposed,certified}`.
+No teacher checkpoint, answer input, new OCR inference model, native crop CNN or
+repeated backbone training per head. Both runs share feature cache, image order,
+architecture and initialization. Input dimensions are inferred from the manifest.
+GPU training time/VRAM/accuracy are not locally measured; epoch seconds are logged.
+
+### ZIP results (no checkpoints or feature cache)
+
+```python
+import zipfile
+root = Path('outputs')
+with zipfile.ZipFile('utility_evidence_two_runs_ep20_seed42.zip', 'w', zipfile.ZIP_DEFLATED) as z:
+    for recipe in ('gain', 'risk'):
+        for path in sorted((root / recipe).rglob('*')):
+            if path.is_file() and path.suffix.lower() not in ('.pt', '.tmp', '.zip'):
+                z.write(path, path.relative_to(root))
+    z.write(Path(os.environ['UTILITY_CACHE']) / 'manifest.json', 'utility_manifest.json')
+```
+
+Stop here for normal export. Do **not** ZIP the large shared cache on working
+disk. Reuse it by attaching this notebook's output as Kaggle Input, without
+copying it. Head checkpoints and `policy.json` are small; download them separately
+if needed. Keep the exact parent checkpoint and original OCR cache for deployment.
+
+## Evaluate existing heads without training
+
+Read the selected epoch from `policy.json`, then use the corresponding snapshot:
 
 ```bash
-uv run predict_evidence_transport.py \
-    --checkpoint outputs/transport/checkpoint_epoch10.pt \
+uv run eval_utility_evidence.py \
+    --checkpoint /kaggle/input/YOUR_HEAD/checkpoint_epoch5.pt \
+    --policy /kaggle/input/YOUR_HEAD/policy.json \
+    --feature-cache "$UTILITY_CACHE" --data-root "$DATA_ROOT" \
+    --output-dir outputs_eval_gain --dataset both --view both \
+    --batch-size 16 --num-workers 2
+```
+
+This does not retune thresholds or reopen safety selection. The checkpoint hash
+must match the policy. The chosen epoch may differ from this example.
+
+## Resume a head
+
+Use a completed cache attached as Input and a fresh output folder:
+
+```bash
+uv run run_utility_evidence.py \
+    --feature-cache /kaggle/input/YOUR_UTILITY_CACHE --data-root "$DATA_ROOT" \
+    --output-dir outputs --recipe risk --num-epochs 20 \
+    --batch-size 16 --num-workers 2 --lr 0.0003 --weight-decay 0.01 --seed 42 --amp \
+    --resume-checkpoint /kaggle/input/YOUR_HEAD/latest_resume.pt \
+    --previous-checkpoint-dir /kaggle/input/YOUR_HEAD
+```
+
+Upload earlier snapshots alongside the resume, since the selected checkpoint
+may be from the previous session. Epoch target is total. If latest resume is
+already epoch 20, this command finalizes selection/audit/evaluation without more
+training. Cache, recipe, source and optimizer settings must match. Do not use
+weights-only snapshots to resume AdamW. Never use a previously inspected safety
+cohort to iteratively redesign/tune the model and retain the original risk claim.
+
+## GT-free online inference
+
+```bash
+uv run predict_utility_evidence.py \
+    --checkpoint /path/SELECTED_HEAD.pt --policy /path/policy.json \
     --parent-checkpoint "$PYRAMID_CKPT" \
     --image /path/image.jpg --question "What does the label say?" \
     --cache-root "$OCR_CACHE" --output prediction.png
 ```
 
-Use the epoch actually chosen in `selection.json`. Replace `--cache-root ...`
-with `--no-ocr` for the exact parent fallback. The online path shares the same
-feature conversion/storage rounding as extraction and verifies the parent hash
-and OCR protocol. It consumes image, Q and OCR only; no GT masks or answers.
+Put the image's OCR JSON under `OCR_CACHE/single/IMAGE_STEM.json`. The policy,
+parent and OCR protocol are verified; the same feature builder and exact native
+edit operations are used online. `--no-ocr` replaces `--cache-root` for the exact
+parent fallback. There is no GT/answer/GT-size input.
 
-For comparison, use the native cached parent metrics (`base_mean_iou` and
-`base_metrics`) and the two adapters' validation-selected results. Only the two
-adapter recipes form a matched objective ablation; comparing against older
-end-to-end runs also changes freezing, training budget and objective.
+## Interpretation and validation boundary
 
-## Validation boundary
+Develop further only if the proposed policy has meaningful small/medium gains
+without overall/large degradation on untouched validation, and the audit accepts
+nontrivial edits. Report test separately, without tuning from it. An identity-only
+result is a failed improvement experiment, even though it passes safety. If the
+raw proposal is bad, do not relax safety to manufacture a gain.
 
-CPU fixtures test finite FP16 forward/backward, empty OCR fallback, GT/answer
-independence, native versus batched composition, stable leave-one-out against
-explicit removal, checkpoint recovery, original-resolution metrics and the full
-cache/train/eval pipeline. These checks do not establish Kaggle speed, real-data
-accuracy or cross-backbone/dataset transfer. Selection, scope and local-mask
-errors can still coexist; the diagnostics distinguish them before another
-full-backbone experiment is justified.
+CPU fixtures cover native rendering/IoU labels, empty OCR and empty parent,
+FP16 finite gradients, parent-exposure rejection, cache/online parity, no val/test
+GT access during extraction, two-worker epoch resume, exact binomial bounds,
+size-conditioned auditing and full train/select/eval paths. No GPU speed, accuracy,
+mean-IoU safety guarantee or cross-dataset/backbone transfer is established.
 
-The existing `train_joint.py`, `eval_joint.py`, old checkpoints and their behavior
-are unchanged. Their guide remains on [exp/joint-native-crop](https://github.com/DPTPhatUS/VizWiz-VQA-Grounding/tree/exp/joint-native-crop).
+The only changes to old public scripts are an optional train-image-list in
+`train_joint.py` and optional holdout-fraction in `prepare_parent_split.py`.
+Defaults retain all train images and the old 15% filename split respectively.
+The optional OCR-cache split groups exact pixel duplicates; the new guide enables it. Legacy model
+keys/checkpoints/objectives are unchanged. Old guides remain on their branches.
