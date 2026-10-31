@@ -201,48 +201,56 @@ done
 
 `parent_checkpoint_config.json` is the direct record of the original 20-epoch training configuration (optimizer, learning rate, batch size). The `eval_*_ep20/metrics.json` files add the test Global IoU, which the original archive lacks. Then run Cell Z.
 
-## Session D: strict single-scale baseline (A2) and question sensitivity (A5)
+## Session D: strict single-scale baseline (A2), question sensitivity (A5), mask audit (A6)
 
-### Cell D1: A2 training at the original single-scale commit
+**Why this session uses two copies of the repository**
 
-A2 reruns the published single-scale baseline from **the exact commit that trained it** (`2079c8a`), in its built-in question-only mode:
-- `--training-recipe grounding-only` with `"question_only": true` trains with BCE + 0.5 Dice only. There is no answer-alignment loss, and the answer is never used.
-- The optimizer, learning rate, batch size and schedule are the baseline's own: Adam, lr $10^{-5}$, global batch 4, 20 epochs, seed 42, frozen text encoder, fine-tuned vision encoder.
+| Folder | Code | Used for |
+|---|---|---|
+| `/kaggle/working/VizWiz-VQA-Grounding` (from Cell 1) | this branch | A5, A6 and the ZIP (Cell Z) |
+| `/kaggle/working/baseline_code` (Cell D1) | old commit `2079c8a` | A2 training and evaluation |
 
-**What A2 does not control.** It removes the answer-supervision confound only. Its decoder still differs from QGDP-Net's:
-- a compact skip decoder that predicts a $384^2$ mask from the $24\times24$ grid;
-- loss on a $336^2$ target;
-- no 768 px view, detail pyramid, auxiliary heads or residual refiner;
-- the answer predictor and answer-gated modules stay in the model but are unused, because no answer vector is formed.
+The single-scale baseline in the paper was trained with commit `2079c8a`. That model is not in the current branch, so A2 checks out that exact commit in a separate folder and changes only one thing: it trains in the commit's built-in **question-only** mode, with no answer-alignment loss.
 
-It is therefore not an architecture-matched baseline.
+A2 is still not architecture-matched to QGDP-Net. Its decoder is different, and it has no 768 px view, detail pyramid, auxiliary heads or refiner.
+
+Run Cell 1 first (setup, `DATA_ROOT`, `PARENT_CKPT`), then the cells below.
+
+### Cell D1: get the baseline code
 
 ```bash
 %%bash
 set -euo pipefail
 cd /kaggle/working
-rm -rf single_scale_2079c8a
-git clone https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git single_scale_2079c8a
-cd single_scale_2079c8a
-git checkout --detach 2079c8a
+rm -rf baseline_code
+git clone https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git baseline_code
+cd baseline_code
+git checkout --detach 2079c8a   # commit that trained the published single-scale baseline
 uv sync --frozen
-echo '{"freeze_text_encoder": true, "question_only": true, "dice_weight": 0.5}' > /kaggle/working/a2_question_only.json
-uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
-    --data-root "$DATA_ROOT" --num-epochs 20 --batch-size 4 --num-workers 2 \
-    --lr 0.00001 --seed 42 --save-every 10 \
-    --training-recipe grounding-only \
-    --config /kaggle/working/a2_question_only.json \
-    --output-dir /kaggle/working/VizWiz-VQA-Grounding/outputs/a2_single_scale_question_only
 ```
 
-If the session ends early, resume with the same command and flags, adding `--resume-checkpoint .../checkpoint_epoch10.pt` (`--num-epochs` stays 20).
-
-### Cell D2: A2 evaluation (same commit)
+### Cell D2: train A2 (20 epochs, same recipe as the baseline)
 
 ```bash
 %%bash
 set -euo pipefail
-cd /kaggle/working/single_scale_2079c8a
+cd /kaggle/working/baseline_code
+echo '{"freeze_text_encoder": true, "question_only": true, "dice_weight": 0.5}' > a2_config.json
+uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
+    --data-root "$DATA_ROOT" --num-epochs 20 --batch-size 4 --num-workers 2 \
+    --lr 0.00001 --seed 42 --save-every 10 \
+    --training-recipe grounding-only --config a2_config.json \
+    --output-dir /kaggle/working/VizWiz-VQA-Grounding/outputs/a2_single_scale_question_only
+```
+
+The output goes into the main repository's `outputs/` folder, so Cell Z includes it. If the session stops early, rerun the same command with `--resume-checkpoint <output-dir>/checkpoint_epoch10.pt` added.
+
+### Cell D3: evaluate A2 (still with the baseline code)
+
+```bash
+%%bash
+set -euo pipefail
+cd /kaggle/working/baseline_code
 run_dir=/kaggle/working/VizWiz-VQA-Grounding/outputs/a2_single_scale_question_only
 for epoch in 10 20; do
     for split in val test; do
@@ -254,39 +262,32 @@ for epoch in 10 20; do
 done
 ```
 
-The `metrics.json` summaries must report `"grounding_mode": "question"`. Select epoch 10 or 20 by validation mIoU only.
+Each `metrics.json` should say `"grounding_mode": "question"`.
 
-### Cell D3: A5 question sensitivity of QGDP-Net (inference only)
-
-Run from this branch (`/kaggle/working/VizWiz-VQA-Grounding`) on the published epoch-20 checkpoint (`PARENT_CKPT` from Cell 1).
+### Cell D4: A5 and A6 (back in the main repository)
 
 ```bash
 %%bash
 set -euo pipefail
+cd /kaggle/working/VizWiz-VQA-Grounding
 for split in val test; do
     uv run --frozen python revision/question_sensitivity.py \
         --checkpoint "$PARENT_CKPT" --data-root "$DATA_ROOT" --dataset "$split" \
         --output-dir "$RUN_ROOT/a5_question_sensitivity_${split}" \
         --batch-size 4 --device cuda --seed 2027
 done
-```
-
-The image stays fixed and only the question changes: the original question again, a random donor question, a size-group-matched donor question, "What is this?", and an empty question. The primary measures compare each prediction with the original-question prediction (agreement IoU, changed pixels, area ratio), so they measure sensitivity, not correctness. IoU against the ground truth is stored only as a descriptive secondary value.
-
-### Cell D4: A6 audit of the training masks (CPU)
-
-```bash
-%%bash
-set -euo pipefail
 uv run --frozen python revision/mask_resolution_audit.py \
     "$DATA_ROOT/binary_masks_png/train" "$RUN_ROOT/a6_mask_audit_train.json"
 ```
 
+- **A5** keeps each image fixed and changes only the question (the same question again, a random donor question, a size-matched donor question, "What is this?", an empty question). It measures how much the predicted mask changes; it is a sensitivity measure, not an accuracy measure.
+- **A6** is CPU-only: it checks how much target detail survives mask resizing on the training split.
+
+### Cell D5: name the ZIP, then run Cell Z
+
 ```python
 os.environ['RUN_NAME'] = 'session_d_a2_a5_a6'
 ```
-
-Then run Cell Z.
 
 ## Cell Z: ZIP results, excluding checkpoints
 
