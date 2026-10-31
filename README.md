@@ -1,237 +1,204 @@
-# Size-weighted pyramid: resume A/B from +5 to +10
+# ACIIDS revision controls: Kaggle guide
 
-Branch: `exp/size-weighted-pyramid`. This workflow resumes the completed `natural` (A) and `mild_focus` (B) continuation runs from epoch +5 to epoch +10 independently, preserving each run's optimizer state, AMP scaler, frozen encoders, loss weights, balanced sampler, seed, and constant learning rate. Use `train_group.py` rather than `train.py`.
+Branch: `exp/aciids-revision-controls` (from `exp/size-weighted-pyramid`). This branch adds two opt-in controls requested by the manuscript revision. Default behaviour, checkpoint keys and the published runs are unchanged.
 
-Passing `--num-epochs 10` sets the final continuation counter so each run trains epochs 6 through 10 only (reaching 30 total epochs when counting the original 20-epoch parent pyramid). Because both runs resume from their own `checkpoint_epoch5.pt` files via `--resume-checkpoint`, the original 20-epoch parent checkpoint is not needed for this session.
+| Option | Where | What it does |
+|---|---|---|
+| `--sampling uniform` | `train_group.py` | Size-agnostic control for the continuation stage. Same 1,083 steps per epoch, global batch 6, frozen encoders, Adam, clipping and evaluation as the stratified runs, but the 6 images of each step are drawn uniformly from the whole training set and averaged into one gradient. |
+| `--detail-input zeros` | `train.py` (also `preflight.py`) | Detail-pathway ablation. Every QGDP-Net module is kept, but the five detail maps are zero. The 0.31M pyramid weights stay in the checkpoint, are never used and are excluded from optimisation. This removes the 768 px pathway's information; it does **not** isolate input resolution. |
+| `--detail-input low_res` | `train.py` | Optional resolution-controlled ablation. The CNN sees the 336 px view upsampled to 768 px, so only image resolution changes. |
 
-## Cell 1: Setup
+Helper scripts in `revision/`:
+- `dump_checkpoint_config.py` prints a checkpoint's saved `run_config` on CPU.
+- `cost.py` reports FLOPs and GPU latency.
 
-Start a fresh Kaggle session with Internet and two GPUs enabled. Attach the VizWiz dataset and both full A and B `checkpoint_epoch5.pt` files (the previous results ZIP excludes `.pt` files and cannot be used to resume training).
+Local checks (kept outside Git, like other tests in this repo): `tests/test_revision_controls.py`, which covers the new options with the tiny model, including a CPU preflight of both sampling modes.
+
+Select checkpoints by validation only; test metrics are reported, never used for selection. Do not modify or delete existing checkpoints or result archives.
+
+## Runs
+
+| ID | Session | Command | Purpose |
+|---|---|---|---|
+| R1 | A | `train_group.py --sampling uniform --focus-alpha 0`, seeds 42, 43, 44 | Uniform continuation control |
+| R2–R5 | A | `train_group.py --sampling balanced --focus-alpha {0, 0.25}`, seeds 43, 44 | Extra seeds for natural and mild-focus continuation |
+| R6 | B | `train.py --detail-input zeros`, 20 epochs, seed 42 | Detail-pathway ablation |
+| R6b (optional) | B | `train.py --detail-input low_res`, 20 epochs, seed 42 | Resolution-only ablation |
+| R7 | C | `eval.py` on the published epoch-20 checkpoint | Test Global IoU and masks for the base model |
+| R8 | C | `revision/cost.py` | FLOPs and T4 latency |
+| G2 | C | `revision/dump_checkpoint_config.py` | Direct record of the base model's training configuration |
+
+Each continuation run takes about as long as one run of the previous one-session A/B guide, so plan two or three runs per Session A. Run the seven continuation runs over several sessions by changing `RUNS` in Cell A2.
+
+## Cell 1 (all sessions): setup
+
+Enable Internet and two T4 GPUs. Attach the VizWiz dataset and the published 20-epoch QGDP-Net checkpoint (`vizwiz-question-guided-detail-pyramid/checkpoint_epoch20.pt`).
 
 ```python
-!git clone --single-branch --branch exp/size-weighted-pyramid https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+!git clone --single-branch --branch exp/aciids-revision-controls https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
 %cd /kaggle/working/VizWiz-VQA-Grounding
 !uv sync --frozen
 ```
 
-If the repository is already cloned on this branch, run `!git pull --ff-only` and `!uv sync --frozen`.
-
-## Cell 2: Locate A/B and restore their configurations
-
-This script identifies the A (`natural`, `focus_alpha = 0.0`) and B (`mild_focus`, `focus_alpha = 0.25`) checkpoints from their saved metadata rather than folder names. If multiple matching checkpoints are mounted under `/kaggle/input`, narrow `INPUT_ROOT` or set explicit paths in `selected`.
-
 ```python
-import gc
-import json
-import os
+import hashlib, os
 from pathlib import Path
-from utils import read_checkpoint
 
 os.environ['DATA_ROOT'] = '/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz'
-os.environ['INPUT_ROOT'] = '/kaggle/input'
 os.environ['RUN_ROOT'] = 'outputs'
-os.environ['RUN_NAME'] = 'size_weighted_pyramid_two_runs_ep10_seed42'
 os.environ['EVAL_BATCH'] = '4'
-os.environ['EVAL_TEST'] = '1'  # Use0 if local test GT is unavailable.
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MPLBACKEND'] = 'Agg'
 
-selected = {'natural': '', 'mild_focus': ''}  # Optional exact checkpoint paths.
-candidates = {run: [] for run in selected}
-explicit = {str(Path(path)) for path in selected.values() if path}
-paths = sorted(set(Path(os.environ['INPUT_ROOT']).rglob('checkpoint_epoch5.pt'))
-               | {Path(path) for path in explicit})
-metadata = {}
-for path in paths:
-    saved = read_checkpoint(path)
-    run_config = saved.get('run_config', {})
-    alpha = run_config.get('focus_alpha')
-    if (saved.get('epoch') == 5
-            and run_config.get('objective_version') == 'size-weighted-updates-v1'
-            and alpha in (0.0, 0.25)):
-        run = 'natural' if alpha == 0.0 else 'mild_focus'
-        candidates[run].append(path)
-        metadata[str(path)] = {
-            'epoch': saved['epoch'],
-            'has_optimizer': bool(saved.get('optimizer_state_dict', {}).get('state')),
-            'has_scaler': 'scaler_state_dict' in saved,
-            'run_config': run_config,
-            'controls': saved.get('training_controls', {}).get('config'),
-        }
-    del saved
-    gc.collect()
-
-root = Path(os.environ['RUN_ROOT'])
-for run, expected_alpha in (('natural', 0.0), ('mild_focus', 0.25)):
-    choices = [Path(selected[run])] if selected[run] else candidates[run]
-    if len(choices) != 1:
-        raise ValueError(f'Select exactly one {run} checkpoint: {choices}')
-    path = choices[0]
-    info = metadata.get(str(path))
-    if info is None:
-        raise ValueError(f'Not a compatible A/B epoch5 checkpoint: {path}')
-    config = info['run_config']
-    assert info['has_optimizer'] and info['has_scaler'], 'Use full training checkpoints.'
-    assert config['focus_alpha'] == expected_alpha, f'Wrong checkpoint for {run}'
-    assert config['batch_size'] == 6 and config['gradient_accumulation_steps'] == 1
-    assert config['world_size'] == 2 and config['seed'] == 42
-    assert config['lr'] == 0.00001 and config['gradient_checkpointing'] is True
-    assert config['project_updates'] is False
-    controls = info['controls']
-    assert controls is not None, 'Missing saved optimizer/freezing controls.'
-    for key, expected in {
-        'optimizer': 'adam', 'lr': 0.00001, 'weight_decay': 0.0,
-        'lr_scheduler': 'none', 'warmup_ratio': 0.0,
-        'freeze_vision_encoder': True, 'freeze_text_encoder': True,
-    }.items():
-        assert controls[key] == expected, f'{run}: unexpected {key}'
-    folder = root / run
-    if folder.exists() and any(folder.iterdir()):
-        raise ValueError(f'Use a fresh output folder: {folder}')
-    os.environ[f'{run.upper()}_CKPT'] = str(path)
-    selected[run] = str(path)
-
-left, right = [metadata[selected[run]]['run_config'] for run in selected]
-for key in ('training_config', 'optimization_config', 'train_annotation_sha256',
-            'experiment_config'):
-    assert left[key] == right[key], f'A/B mismatch: {key}'
-for key in ('initial_checkpoint', 'mask_group_sha256', 'group_counts',
-            'sampling', 'updates_per_epoch'):
-    assert left['group_protocol'][key] == right['group_protocol'][key], key
-(root / 'configs').mkdir(parents=True, exist_ok=True)
-for run in selected:
-    config = metadata[selected[run]]['run_config']
-    settings = {**config['training_config'], 'focus_alpha': config['focus_alpha'],
-                'project_updates': False}
-    (root / 'configs' / f'{run}.json').write_text(json.dumps(settings, indent=2))
-(root / 'continuation.json').write_text(json.dumps({
-    'start_counter': 5, 'target_counter': 10, 'total_parent_epochs': 20,
-    'checkpoints': selected, 'saved_metadata': metadata,
-}, indent=2))
-print(json.dumps(selected, indent=2))
+EXPECTED = '6117b074a9b5c93c53c222d74d23a08a9a761621f2534ef1bb01da531f9e99aa'  # parent of all continuation runs
+matches = []
+for path in Path('/kaggle/input').rglob('checkpoint_epoch20.pt'):
+    digest = hashlib.sha256()
+    with path.open('rb') as f:
+        for block in iter(lambda: f.read(1 << 24), b''):
+            digest.update(block)
+    if digest.hexdigest() == EXPECTED:
+        matches.append(path)
+assert len(matches) == 1, f'Attach exactly one published epoch-20 checkpoint: {matches}'
+os.environ['PARENT_CKPT'] = str(matches[0])
+print('Parent checkpoint:', matches[0])
 ```
 
-JSON config values take precedence over CLI flags, which take precedence over defaults. Here the loss settings are restored directly from each checkpoint's metadata, and the trainer verifies that all resume settings and dataset hashes match. Each run continues its own optimizer state and epoch-indexed sampling with both encoders frozen.
+## Session A: continuation controls (R1–R5)
 
-## Cell 3: One session: A then B, train and evaluate
+### Cell A2: choose this session's runs
 
-Each command runs as a separate process. Preflight tests a temporary in-memory copy of the resumed state and discards its updates, after which `train_group.py` reloads the mounted checkpoint from `/kaggle/input`.
+Each entry is `name:sampling:alpha:seed`. Use a different subset in each session. Never reuse an output folder.
+
+```python
+os.environ['RUN_NAME'] = 'continuation_controls_session1'
+os.environ['RUNS'] = ' '.join([
+    'uniform_s42:uniform:0:42',
+    'natural_s43:balanced:0:43',
+    'mild_focus_s43:balanced:0.25:43',
+])
+# Remaining sessions, for example:
+#   'uniform_s43:uniform:0:43 natural_s44:balanced:0:44 mild_focus_s44:balanced:0.25:44'
+#   'uniform_s44:uniform:0:44'
+```
+
+### Cell A3: preflight, train 5 epochs, evaluate
 
 ```bash
 %%bash
 set -euo pipefail
-for run in natural mild_focus; do
-    checkpoint_var="${run^^}_CKPT"
-    checkpoint="${!checkpoint_var}"
-    run_dir="$RUN_ROOT/$run"
+for spec in $RUNS; do
+    IFS=: read -r name sampling alpha seed <<< "$spec"
+    run_dir="$RUN_ROOT/$name"
+    if [[ -e "$run_dir" ]]; then echo "Refusing to reuse $run_dir"; exit 1; fi
     common=(
-        --data-root "$DATA_ROOT"
-        --resume-checkpoint "$checkpoint"
-        --config "$RUN_ROOT/configs/${run}.json"
-        --batch-size 6
-        --gradient-accumulation-steps 1
-        --lr 0.00001
-        --optimizer adam
-        --weight-decay 0
-        --lr-scheduler none
-        --warmup-ratio 0
-        --freeze-vision-encoder True
-        --freeze-text-encoder True
-        --no-project-updates
-        --gradient-checkpointing
-        --seed 42
+        --data-root "$DATA_ROOT" --init-checkpoint "$PARENT_CKPT"
+        --sampling "$sampling" --focus-alpha "$alpha" --no-project-updates
+        --batch-size 6 --gradient-accumulation-steps 1
+        --lr 0.00001 --optimizer adam --weight-decay 0
+        --lr-scheduler none --warmup-ratio 0
+        --freeze-vision-encoder True --freeze-text-encoder True
+        --gradient-checkpointing --seed "$seed"
     )
     uv run --frozen torchrun --standalone --nproc_per_node=2 preflight_group.py \
         "${common[@]}" --num-workers 0 --steps 3
     uv run --frozen torchrun --standalone --nproc_per_node=2 train_group.py \
         "${common[@]}" --output-dir "$run_dir" \
-        --num-epochs 10 --num-workers 2 \
-        --save-every 10 --no-save-final-weights
-
-    # Evaluate both counters using the same checkout and native-resolution rules.
-    for epoch in 5 10; do
-        eval_checkpoint="$checkpoint"
-        if [[ "$epoch" == '10' ]]; then
-            eval_checkpoint="$run_dir/checkpoint_epoch10.pt"
-        fi
+        --num-epochs 5 --num-workers 2 --save-every 5 --no-save-final-weights
+    for split in val test; do
         uv run --frozen python eval.py \
-            --checkpoint "$eval_checkpoint" --dataset val \
+            --checkpoint "$run_dir/checkpoint_epoch5.pt" --dataset "$split" \
             --data-root "$DATA_ROOT" --device cuda \
             --batch-size "$EVAL_BATCH" --num-workers 2 \
-            --output-dir "$run_dir/eval_val_ep${epoch}"
-        uv run --frozen python diagnose.py \
-            --predictions "$run_dir/eval_val_ep${epoch}" --data-root "$DATA_ROOT" \
-            --output-dir "$run_dir/diagnostic_ep${epoch}"
-        if [[ "$EVAL_TEST" == '1' ]]; then
-            uv run --frozen python eval.py \
-                --checkpoint "$eval_checkpoint" --dataset test \
-                --data-root "$DATA_ROOT" --device cuda \
-                --batch-size "$EVAL_BATCH" --num-workers 2 \
-                --output-dir "$run_dir/eval_test_ep${epoch}"
-        fi
+            --output-dir "$run_dir/eval_${split}_ep5"
     done
+    uv run --frozen python diagnose.py \
+        --predictions "$run_dir/eval_val_ep5" --data-root "$DATA_ROOT" \
+        --output-dir "$run_dir/diagnostic_ep5"
 done
 ```
 
-Validation runs after training finishes, evaluating both +5 and +10 checkpoints in FP32 at native mask resolution. Use validation metrics for checkpoint selection; lower `EVAL_BATCH` to `1` if batch size 4 exceeds GPU memory.
+The protocol is identical to the published `natural` and `mild_focus` runs: the same parent, 1,083 updates per epoch, global batch 6, Adam with lr $10^{-5}$, no weight decay, frozen encoders and no projection. Only `--sampling` and `--seed` vary. Uniform runs record `"sampling": "uniform-shuffled-control"` in `group_protocol`.
 
-This workflow writes two new checkpoint files:
+Then run Cell Z to download the results.
 
-- `outputs/natural/checkpoint_epoch10.pt`
-- `outputs/mild_focus/checkpoint_epoch10.pt`
+## Session B: detail-pathway ablation (R6, optional R6b)
 
-Intermediate epochs (6 through 9), duplicate epoch-5 copies, and extra final weight files are not written. Keep the mounted epoch-5 checkpoints separately. If a run is interrupted before epoch 10, restart that run from epoch 5 in a clean output folder. If `natural` (A) completes and `mild_focus` (B) fails, rerun Cell 3 with `for run in mild_focus; do` after clearing any partial files in `outputs/mild_focus`.
+### Cell B2: preflight and 20-epoch training
 
-## Cell 4: Compare +5 versus +10
+These are the published base-model settings (Adam, lr $10^{-5}$, no weight decay or schedule, global microbatch 2 × accumulation 2, seed 42), plus `--detail-input`.
 
 ```python
-import csv
-
-root = Path(os.environ['RUN_ROOT'])
-rows = []
-for run in ('natural', 'mild_focus'):
-    baseline = None
-    for epoch in (5, 10):
-        folder = root / run
-        summary = json.loads((folder / f'eval_val_ep{epoch}/metrics.json').read_text())['summary']
-        diagnostic = json.loads((folder / f'diagnostic_ep{epoch}/summary.json').read_text())
-        protocol = summary['training_protocol']
-        assert summary['objective_version'] == 'size-weighted-updates-v1'
-        assert protocol['focus_alpha'] == (0.0 if run == 'natural' else 0.25)
-        assert protocol['projection'] is False
-        source = metadata[selected[run]]['run_config']['group_protocol']
-        for key in ('initial_checkpoint', 'mask_group_sha256', 'proposal_weights',
-                    'group_counts', 'updates_per_epoch'):
-            assert protocol[key] == source[key], key
-        values = {
-            'val_miou_pct': 100 * summary['mean_iou'],
-            'val_global_iou_pct': 100 * summary['global_iou'],
-            **{f'{name}_miou_pct': 100 * diagnostic['by_gt_area'][group]['mean_iou']
-               for name, group in [('small', 'small_lt_1pct'),
-                                   ('medium', 'medium_1_to_10pct'),
-                                   ('large', 'large_ge_10pct')]},
-        }
-        if baseline is None:
-            baseline = values
-        row = {'run': run, 'counter': epoch, 'total_training_epochs': 20 + epoch,
-               **values,
-               **{f'{key}_delta_vs_ep5_pp': value - baseline[key]
-                  for key, value in values.items()}}
-        test_path = folder / f'eval_test_ep{epoch}/metrics.json'
-        row['test_miou_pct'] = (100 * json.loads(test_path.read_text())['summary']['mean_iou']
-                                if test_path.is_file() else None)
-        rows.append(row)
-comparison = root / 'continuation_comparison.csv'
-with comparison.open('w', newline='') as handle:
-    writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
-    writer.writeheader()
-    writer.writerows(rows)
-print(comparison.read_text())
+os.environ['RUN_NAME'] = 'detail_input_zeros_ep20_seed42'
+os.environ['DETAIL_INPUT'] = 'zeros'  # or 'low_res' for the optional R6b
 ```
 
-Compare +5 and +10 across small, medium, and large ground-truth area groups as well as overall validation mean IoU. For reference, the seed-42 20-epoch parent pyramid scores 65.7663% validation mean IoU (19.4521% small, 46.2369% medium, 79.5730% large).
+```bash
+%%bash
+set -euo pipefail
+run_dir="$RUN_ROOT/detail_$DETAIL_INPUT"
+uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
+    --data-root "$DATA_ROOT" --batch-size 2 --num-workers 0 --steps 3 \
+    --gradient-checkpointing --detail-input "$DETAIL_INPUT"
+uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
+    --data-root "$DATA_ROOT" --output-dir "$run_dir" \
+    --num-epochs 20 --batch-size 2 --gradient-accumulation-steps 2 \
+    --gradient-checkpointing --num-workers 2 --lr 0.00001 --seed 42 \
+    --optimizer adam --weight-decay 0 --lr-scheduler none --warmup-ratio 0 \
+    --save-every 10 --detail-input "$DETAIL_INPUT"
+```
 
-## Cell 5: ZIP results, exclude checkpoints
+If the session ends early, resume in a new session from the last full checkpoint with the **same** flags, replacing `--output-dir` by the same folder and adding `--resume-checkpoint "$run_dir/checkpoint_epoch10.pt"` (`--num-epochs` stays 20).
+
+### Cell B3: evaluate epochs 10 and 20
+
+```bash
+%%bash
+set -euo pipefail
+run_dir="$RUN_ROOT/detail_$DETAIL_INPUT"
+for epoch in 10 20; do
+    for split in val test; do
+        uv run --frozen python eval.py \
+            --checkpoint "$run_dir/checkpoint_epoch${epoch}.pt" --dataset "$split" \
+            --data-root "$DATA_ROOT" --device cuda \
+            --batch-size "$EVAL_BATCH" --num-workers 2 \
+            --output-dir "$run_dir/eval_${split}_ep${epoch}"
+    done
+    uv run --frozen python diagnose.py \
+        --predictions "$run_dir/eval_val_ep${epoch}" --data-root "$DATA_ROOT" \
+        --output-dir "$run_dir/diagnostic_ep${epoch}"
+done
+```
+
+Then run Cell Z.
+
+## Session C: base-model records and cost (R7, R8, G2)
+
+```python
+os.environ['RUN_NAME'] = 'base_records_and_cost'
+```
+
+```bash
+%%bash
+set -euo pipefail
+out="$RUN_ROOT/base_records"
+mkdir -p "$out"
+uv run --frozen python revision/dump_checkpoint_config.py "$PARENT_CKPT" > "$out/parent_checkpoint_config.json"
+for split in val test; do
+    uv run --frozen python eval.py \
+        --checkpoint "$PARENT_CKPT" --dataset "$split" \
+        --data-root "$DATA_ROOT" --device cuda \
+        --batch-size "$EVAL_BATCH" --num-workers 2 \
+        --output-dir "$out/eval_${split}_ep20"
+done
+for mode in image zeros; do
+    uv run --frozen python revision/cost.py "$out/cost_${mode}.json" --detail-input "$mode" --device cuda
+done
+```
+
+`parent_checkpoint_config.json` is the direct record of the original 20-epoch training configuration (optimizer, learning rate, batch size). The `eval_*_ep20/metrics.json` files add the test Global IoU, which the original archive lacks. Then run Cell Z.
+
+## Cell Z: ZIP results, excluding checkpoints
 
 ```python
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -243,22 +210,6 @@ with ZipFile(archive, 'w', compression=ZIP_DEFLATED) as bundle:
         if path.is_file() and path.suffix.lower() not in {'.pt', '.tmp', '.zip'}:
             bundle.write(path, path.relative_to(root))
 print('Download results:', archive)
-print('Keep both checkpoint_epoch10.pt files separately for future resume.')
 ```
 
-The archive contains configuration files, continuation metadata, training history for epochs 6 through 10, validation and test predictions and metrics for counters 5 and 10, diagnostics, and `continuation_comparison.csv`, while excluding `.pt`, `.tmp`, and nested `.zip` files.
-
-## Objective and compatibility
-
-Group proposal weights are interpolated from the training split's mask-size frequencies `p`:
-
-    weights = (1 - focus_alpha) * p + focus_alpha * (0.5, 0.5, 0)
-
-| Run | `focus_alpha` | Small / medium / large weights (current train set) |
-|---|---:|---|
-| `natural` (A) | 0 | 3.83% / 25.81% / 70.36% |
-| `mild_focus` (B) | 0.25 | 15.38% / 31.86% / 52.77% |
-
-Both runs use the balanced group sampler, so `natural` (A) pairs natural-frequency loss weighting with stratified group sampling. On this branch, `--focus-alpha` defaults to `0.25` and gradient projection defaults to `False`. Model architecture and inference parameters are unchanged. Full optimizer resume requires a `size-weighted-updates-v1` checkpoint with matching loss configuration, `focus_alpha`, dataset hash, optimizer, encoder freezing policy, seed, world size, batch size, and gradient accumulation steps.
-
-To start a fresh 5-epoch A/B experiment from the original 20-epoch parent checkpoint instead of continuing from epoch 5, pass `--init-checkpoint` pointing to the parent `checkpoint_epoch20.pt` along with `--num-epochs 5 --save-every 5`.
+Keep checkpoints separately if you may resume. Return the ZIPs; they are analysed read-only.

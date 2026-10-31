@@ -2,6 +2,7 @@
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from models.detail_pyramid import DetailPyramid, HighResolutionRefiner
@@ -10,13 +11,25 @@ from models.mask_decoder import DetailDecoder
 from models.text_encoder import TextEncoder, masked_mean
 
 EXPERIMENT = "question-guided-detail-pyramid-v1"
+# "image": 768 px view through the detail CNN (the published model).
+# "zeros": ablation; every module stays, but all detail maps are zero.
+# "low_res": ablation; the detail CNN sees the 336 px view upsampled to 768 px.
+DETAIL_INPUTS = ("image", "zeros", "low_res")
 
 
 class GroundingModel(nn.Module):
     """336 CLIP view + 768 CNN view + Q -> 768 logits; never consumes an answer."""
 
-    def __init__(self, tiny: bool = False, gradient_checkpointing: bool = False):
+    def __init__(
+        self,
+        tiny: bool = False,
+        gradient_checkpointing: bool = False,
+        detail_input: str = "image",
+    ):
         super().__init__()
+        if detail_input not in DETAIL_INPUTS:
+            raise ValueError(f"detail_input must be one of {DETAIL_INPUTS}")
+        self.detail_input = detail_input
         self.image_encoder = TinyVision() if tiny else ImageEncoder()
         self.text_encoder = TextEncoder(tiny)
         self.text_encoder.requires_grad_(False)
@@ -34,6 +47,9 @@ class GroundingModel(nn.Module):
             nn.Linear(text_dim, 8 if tiny else 16), nn.GELU()
         )
         self.detail_pyramid = DetailPyramid(tiny=tiny)
+        if detail_input == "zeros":
+            # Kept for identical checkpoint keys; never used, so never trained.
+            self.detail_pyramid.requires_grad_(False)
         self.decoder = DetailDecoder(visual_dim, text_dim, tiny=tiny)
         self.refiner = HighResolutionRefiner(
             self.decoder.output_channels, 8 if tiny else 16, tiny=tiny
@@ -68,6 +84,9 @@ class GroundingModel(nn.Module):
             "refiner": "signed-logit-residual",
             "normalization": "clip-rgb-both-views",
         }
+        if detail_input != "image":
+            # Recorded only for ablations so existing checkpoints still match.
+            self.experiment_config["detail_input"] = detail_input
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -114,15 +133,32 @@ class GroundingModel(nn.Module):
             .transpose(1, 2)
             .reshape_as(features[-1])
         )
-        detail = self.detail_pyramid(
-            (detail_image - self.image_mean) / self.image_std, self._run
-        )
+        detail = self._detail_maps(image, detail_image, fused.dtype)
         detail_question = self.question_projection(question)
         logits, semantic, auxiliary = self.decoder(
             (*features[:3], fused), question, detail, detail_question, self._run
         )
         final = self._run(self.refiner, logits, semantic, detail[-1], detail_question)
         return {"logits": final, "auxiliary_logits": auxiliary}
+
+    def _detail_maps(self, image: Tensor, detail_image: Tensor, dtype) -> tuple:
+        if self.detail_input == "zeros":
+            width = self.detail_pyramid.lateral[0].out_channels
+            sizes = [self.detail_size // 2**k for k in range(4, -1, -1)]
+            return tuple(
+                torch.zeros(image.shape[0], width, s, s, device=image.device, dtype=dtype)
+                for s in sizes
+            )  # coarse-to-fine, same shapes as the pyramid output
+        if self.detail_input == "low_res":
+            detail_image = F.interpolate(
+                image.float(),
+                size=(self.detail_size, self.detail_size),
+                mode="bicubic",
+                align_corners=False,
+            ).clamp(0, 1)  # (B, 3, 768, 768) carrying only 336 px information
+        return self.detail_pyramid(
+            (detail_image - self.image_mean) / self.image_std, self._run
+        )
 
     @classmethod
     def from_checkpoint(cls, path, device="cpu"):

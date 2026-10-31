@@ -20,7 +20,12 @@ from losses import TRAINING_DEFAULTS, SegmentationObjective
 from models.model import GroundingModel
 from train import seed_everything
 from training.projection import constrained_step, gradient_vector, parameter_vector
-from training.size_groups import GROUP_NAMES, BalancedGroupBatches, mask_groups
+from training.size_groups import (
+    GROUP_NAMES,
+    BalancedGroupBatches,
+    UniformBatches,
+    mask_groups,
+)
 from training.size_objective import resolve_group_weights
 from training_options import (
     TrainingArgumentParser,
@@ -83,6 +88,12 @@ def parser(preflight=False):
     result.add_argument(
         "--project-updates", action=argparse.BooleanOptionalAction, default=False
     )
+    result.add_argument(
+        "--sampling",
+        choices=("balanced", "uniform"),
+        default="balanced",
+        help="'uniform' is the size-agnostic control: same steps, optimizer and freezing",
+    )
     if preflight:
         result.add_argument("--steps", type=int, default=3)
     return result
@@ -97,15 +108,19 @@ def file_hash(path):
 
 
 def collect_gradient(model, batches, objective, controls, scaler, device, group):
-    """Stream microbatches and reduce one mean group gradient across DDP ranks."""
+    """Stream microbatches and reduce one mean group gradient across DDP ranks.
+
+    group=None skips the area check (uniform control batches mix all sizes).
+    """
     controls.optimizer.zero_grad(set_to_none=True)
     total = 0.0
     for index, batch in enumerate(batches):
         batch = to_device(batch, device)
-        area = batch["mask"].float().mean((1, 2, 3))
-        actual = torch.where(area < 0.01, 0, torch.where(area < 0.1, 1, 2))
-        if bool((actual != group).any()):
-            raise ValueError("Sampler and loaded target area disagree")
+        if group is not None:
+            area = batch["mask"].float().mean((1, 2, 3))
+            actual = torch.where(area < 0.01, 0, torch.where(area < 0.1, 1, 2))
+            if bool((actual != group).any()):
+                raise ValueError("Sampler and loaded target area disagree")
         last = index + 1 == len(batches)
         context = (
             model.no_sync()
@@ -168,7 +183,31 @@ def one_update(
     return metrics
 
 
+def one_uniform_update(model, slot_batches, objective, controls, scaler, device):
+    """Size-agnostic control: one mean gradient over all images of the step."""
+    batches = [batch for slot in slot_batches for batch in slot]
+    gradient, loss = collect_gradient(
+        model, batches, objective, controls, scaler, device, None
+    )
+    # Identical rows make the weighted proposal equal to the plain mean gradient.
+    metrics = constrained_step(
+        controls,
+        scaler,
+        torch.stack([gradient, gradient, gradient]),
+        project=False,
+        group_weights=(1 / 3, 1 / 3, 1 / 3),
+    )
+    if dist.is_initialized():
+        tensor = torch.tensor([loss], device=device, dtype=torch.float64)
+        dist.all_reduce(tensor)
+        loss = float(tensor[0]) / dist.get_world_size()
+    metrics["train_loss"] = metrics["proposal_loss"] = loss
+    return metrics
+
+
 def execute(args, rank, world, device, preflight):
+    if args.sampling == "uniform" and args.project_updates:
+        raise ValueError("Uniform sampling is a control; it does not support projection")
     saved = read_checkpoint(args.resume_checkpoint or args.init_checkpoint)
     if args.resume_checkpoint:
         if (
@@ -191,6 +230,8 @@ def execute(args, rank, world, device, preflight):
         ):
             if getattr(args, key) != saved["run_config"][key]:
                 raise ValueError(f"Resume {key} differs from checkpoint")
+        if args.sampling != saved["run_config"].get("sampling", "balanced"):
+            raise ValueError("Resume sampling differs from checkpoint")
     options = checkpoint_model_kwargs(saved)
     requested = recipe_config(args, LOSS_DEFAULTS)
     settings = {
@@ -251,7 +292,7 @@ def execute(args, rank, world, device, preflight):
     del saved
     if not preflight and start >= args.num_epochs:
         raise ValueError("num-epochs must exceed the resumed epoch")
-    sampler = BalancedGroupBatches(
+    sampler = (UniformBatches if args.sampling == "uniform" else BalancedGroupBatches)(
         groups,
         args.batch_size,
         args.gradient_accumulation_steps,
@@ -284,7 +325,9 @@ def execute(args, rank, world, device, preflight):
         "group_names": GROUP_NAMES,
         "group_counts": list(map(len, groups)),
         "mask_group_sha256": digest,
-        "sampling": "balanced-cyclic-shuffled",
+        "sampling": "balanced-cyclic-shuffled"
+        if args.sampling == "balanced"
+        else "uniform-shuffled-control",
         "projection": args.project_updates,
         "constraint_relative_tolerance": 1e-6,
         "focus_alpha": args.focus_alpha,
@@ -379,15 +422,21 @@ def execute(args, rank, world, device, preflight):
                     group_batches[group].append(next(iterator))
             retries = 0
             while True:
-                metrics = one_update(
-                    model,
-                    group_batches,
-                    objective,
-                    controls,
-                    scaler,
-                    device,
-                    args.project_updates,
-                    proposal_weights,
+                metrics = (
+                    one_uniform_update(
+                        model, group_batches, objective, controls, scaler, device
+                    )
+                    if args.sampling == "uniform"
+                    else one_update(
+                        model,
+                        group_batches,
+                        objective,
+                        controls,
+                        scaler,
+                        device,
+                        args.project_updates,
+                        proposal_weights,
+                    )
                 )
                 if not preflight or metrics["optimizer_update"]:
                     break

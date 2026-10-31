@@ -110,3 +110,30 @@ class BalancedGroupBatches(Sampler):
                     )
                     cursor[group] += count
                 yield selected[self.rank :: self.world]
+
+
+class UniformBatches(BalancedGroupBatches):
+    """Control sampler: same step count and microbatch layout, but size-agnostic.
+
+    Each optimizer window yields three microbatch slots, like the balanced
+    sampler, but every slot draws batch_size // 3 global images from one
+    shuffled queue over the whole training set, so the batch composition
+    follows the natural size distribution.
+    """
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch * 10007)
+        members = [index for group in self.groups for index in group]
+        queue, cursor = [], 0
+        global_count = self.batch_size // 3
+        for _ in range(self.steps * self.accumulation):
+            for _slot in range(3):
+                selected = []
+                while len(selected) < global_count:
+                    if cursor == len(queue):
+                        order = torch.randperm(len(members), generator=generator).tolist()
+                        queue, cursor = [members[i] for i in order], 0
+                    count = min(global_count - len(selected), len(queue) - cursor)
+                    selected.extend(queue[cursor : cursor + count])
+                    cursor += count
+                yield selected[self.rank :: self.world]

@@ -18,7 +18,7 @@ from tqdm.auto import tqdm
 
 from dataset import VizWizGroundingDataset, make_loader
 from losses import OBJECTIVE_VERSION, TRAINING_DEFAULTS, SegmentationObjective
-from models.model import GroundingModel
+from models.model import DETAIL_INPUTS, GroundingModel
 from training_options import (
     TrainingArgumentParser,
     TrainingControls,
@@ -64,6 +64,12 @@ def training_parser():
     parser.add_argument(
         "--config",
         help="Optional JSON for overlap loss and auxiliary supervision weights",
+    )
+    parser.add_argument(
+        "--detail-input",
+        choices=DETAIL_INPUTS,
+        default="image",
+        help="Detail-pathway input; 'zeros' and 'low_res' are ablations",
     )
     return parser
 
@@ -161,7 +167,13 @@ def _train(args, rank, world, distributed, device):
         read_checkpoint(args.resume_checkpoint) if args.resume_checkpoint else None
     )
     restore_control_arguments(args, checkpoint)
-    options = checkpoint_model_kwargs(checkpoint) if checkpoint else {}
+    options = (
+        checkpoint_model_kwargs(checkpoint)
+        if checkpoint
+        else {"detail_input": args.detail_input}
+    )
+    if options.get("detail_input", "image") != args.detail_input:
+        raise ValueError("--detail-input must match the resumed checkpoint")
     settings = resolve_training_arguments(args, checkpoint)
     seed_everything(args.seed)
     out = Path(args.output_dir)

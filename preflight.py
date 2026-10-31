@@ -12,7 +12,7 @@ from torch.utils.data import DistributedSampler
 
 from dataset import VizWizGroundingDataset, make_loader
 from losses import SegmentationObjective
-from models.model import GroundingModel
+from models.model import DETAIL_INPUTS, GroundingModel
 from train import TRAINING_DEFAULTS, resolve_training_arguments, seed_everything
 from training_options import TrainingArgumentParser, TrainingControls
 from utils import to_device
@@ -130,6 +130,12 @@ def main(argv=None):
     parser.add_argument(
         "--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True
     )
+    parser.add_argument(
+        "--detail-input",
+        choices=DETAIL_INPUTS,
+        default="image",
+        help="Detail-pathway input; 'zeros' and 'low_res' are ablations",
+    )
     args = parser.parse_args(argv)
     world, rank, local = [
         int(os.environ.get(k, v))
@@ -155,7 +161,10 @@ def main(argv=None):
     try:
         seed_everything(42)
         model = (
-            GroundingModel(gradient_checkpointing=args.gradient_checkpointing)
+            GroundingModel(
+                gradient_checkpointing=args.gradient_checkpointing,
+                detail_input=args.detail_input,
+            )
             .to(device)
             .train()
         )
