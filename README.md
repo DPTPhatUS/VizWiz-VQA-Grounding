@@ -29,6 +29,7 @@ Select checkpoints by validation only; test metrics are reported, never used for
 | G2 | C | `revision/dump_checkpoint_config.py` | Direct record of the base model's training configuration |
 | A2 | D | Single-scale baseline commit `2079c8a`, `--training-recipe grounding-only` + `"question_only": true`, 20 epochs, seed 42 | Single-scale baseline without the answer-alignment loss |
 | A5 | D | `revision/question_sensitivity.py` on the published epoch-20 QGDP-Net | How much the predicted mask depends on the question |
+| E (priority) | E | `train.py --detail-input {image,zeros}`, seeds 43 and 44, 20 epochs | Seed repeats for the detail-pathway conclusion |
 | A6 | C or D (CPU) | `revision/mask_resolution_audit.py` on the training masks | Target information lost by resizing; grid IoU ceilings |
 
 Each continuation run takes about as long as one run of the previous one-session A/B guide, so plan two or three runs per Session A. Run the seven continuation runs over several sessions by changing `RUNS` in Cell A2.
@@ -288,6 +289,58 @@ uv run --frozen python revision/mask_resolution_audit.py \
 ```python
 os.environ['RUN_NAME'] = 'session_d_a2_a5_a6'
 ```
+
+## Session E: seed repeats of QGDP-Net vs. zeroed detail pathway (priority)
+
+**Why.** With seed 42, zeroing the detail maps did not lower accuracy (validation-selected: +0.15 test points, CI −0.65 to +0.95), but checkpoint-to-checkpoint noise is about 1.3 points. The paper's claim about the detail pathway needs repeated seeds, run as pairs that share everything except `--detail-input`.
+
+| Order | `DETAIL_INPUT` | `SEED` | Output folder |
+|---|---|---|---|
+| 1 | `image` | 43 | `outputs/seed_image_s43` |
+| 2 | `zeros` | 43 | `outputs/seed_zeros_s43` |
+| 3 | `image` | 44 | `outputs/seed_image_s44` |
+| 4 | `zeros` | 44 | `outputs/seed_zeros_s44` |
+
+Run one row per session, in this order. Rows 1–2 are the minimum useful pair. The protocol is identical to the published 20-epoch model: same flags, checkpoints and evaluation at epochs 10 and 20, selection by validation only.
+
+### Cell E1: choose the run
+
+```python
+os.environ['DETAIL_INPUT'] = 'image'   # 'image' or 'zeros'
+os.environ['SEED'] = '43'              # '43' or '44'
+os.environ['RUN_NAME'] = f"seed_{os.environ['DETAIL_INPUT']}_s{os.environ['SEED']}"
+```
+
+### Cell E2: train and evaluate
+
+```bash
+%%bash
+set -euo pipefail
+run_dir="$RUN_ROOT/$RUN_NAME"
+if [[ -e "$run_dir" ]]; then echo "Refusing to reuse $run_dir"; exit 1; fi
+uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
+    --data-root "$DATA_ROOT" --batch-size 2 --num-workers 0 --steps 3 \
+    --gradient-checkpointing --detail-input "$DETAIL_INPUT"
+uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
+    --data-root "$DATA_ROOT" --output-dir "$run_dir" \
+    --num-epochs 20 --batch-size 2 --gradient-accumulation-steps 2 \
+    --gradient-checkpointing --num-workers 2 --lr 0.00001 --seed "$SEED" \
+    --optimizer adam --weight-decay 0 --lr-scheduler none --warmup-ratio 0 \
+    --save-every 10 --detail-input "$DETAIL_INPUT"
+for epoch in 10 20; do
+    for split in val test; do
+        uv run --frozen python eval.py \
+            --checkpoint "$run_dir/checkpoint_epoch${epoch}.pt" --dataset "$split" \
+            --data-root "$DATA_ROOT" --device cuda --batch-size "$EVAL_BATCH" --num-workers 2 \
+            --output-dir "$run_dir/eval_${split}_ep${epoch}"
+    done
+    uv run --frozen python diagnose.py \
+        --predictions "$run_dir/eval_val_ep${epoch}" --data-root "$DATA_ROOT" \
+        --output-dir "$run_dir/diagnostic_ep${epoch}"
+done
+```
+
+If the session ends early, resume with the same command plus `--resume-checkpoint "$run_dir/checkpoint_epoch10.pt"` (same `--num-epochs 20`) and then run the evaluation loop. Then run Cell Z.
 
 ## Cell Z: ZIP results, excluding checkpoints
 
