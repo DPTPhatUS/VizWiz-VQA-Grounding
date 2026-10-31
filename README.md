@@ -27,6 +27,9 @@ Select checkpoints by validation only; test metrics are reported, never used for
 | R7 | C | `eval.py` on the published epoch-20 checkpoint | Test Global IoU and masks for the base model |
 | R8 | C | `revision/cost.py` | FLOPs and T4 latency |
 | G2 | C | `revision/dump_checkpoint_config.py` | Direct record of the base model's training configuration |
+| A2 | D | Single-scale baseline commit `2079c8a`, `--training-recipe grounding-only` + `"question_only": true`, 20 epochs, seed 42 | Single-scale baseline without the answer-alignment loss |
+| A5 | D | `revision/question_sensitivity.py` on the published epoch-20 QGDP-Net | How much the predicted mask depends on the question |
+| A6 | C or D (CPU) | `revision/mask_resolution_audit.py` on the training masks | Target information lost by resizing; grid IoU ceilings |
 
 Each continuation run takes about as long as one run of the previous one-session A/B guide, so plan two or three runs per Session A. Run the seven continuation runs over several sessions by changing `RUNS` in Cell A2.
 
@@ -197,6 +200,93 @@ done
 ```
 
 `parent_checkpoint_config.json` is the direct record of the original 20-epoch training configuration (optimizer, learning rate, batch size). The `eval_*_ep20/metrics.json` files add the test Global IoU, which the original archive lacks. Then run Cell Z.
+
+## Session D: strict single-scale baseline (A2) and question sensitivity (A5)
+
+### Cell D1: A2 training at the original single-scale commit
+
+A2 reruns the published single-scale baseline from **the exact commit that trained it** (`2079c8a`), in its built-in question-only mode:
+- `--training-recipe grounding-only` with `"question_only": true` trains with BCE + 0.5 Dice only. There is no answer-alignment loss, and the answer is never used.
+- The optimizer, learning rate, batch size and schedule are the baseline's own: Adam, lr $10^{-5}$, global batch 4, 20 epochs, seed 42, frozen text encoder, fine-tuned vision encoder.
+
+**What A2 does not control.** It removes the answer-supervision confound only. Its decoder still differs from QGDP-Net's:
+- a compact skip decoder that predicts a $384^2$ mask from the $24\times24$ grid;
+- loss on a $336^2$ target;
+- no 768 px view, detail pyramid, auxiliary heads or residual refiner;
+- the answer predictor and answer-gated modules stay in the model but are unused, because no answer vector is formed.
+
+It is therefore not an architecture-matched baseline.
+
+```bash
+%%bash
+set -euo pipefail
+cd /kaggle/working
+rm -rf single_scale_2079c8a
+git clone https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git single_scale_2079c8a
+cd single_scale_2079c8a
+git checkout --detach 2079c8a
+uv sync --frozen
+echo '{"freeze_text_encoder": true, "question_only": true, "dice_weight": 0.5}' > /kaggle/working/a2_question_only.json
+uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
+    --data-root "$DATA_ROOT" --num-epochs 20 --batch-size 4 --num-workers 2 \
+    --lr 0.00001 --seed 42 --save-every 10 \
+    --training-recipe grounding-only \
+    --config /kaggle/working/a2_question_only.json \
+    --output-dir /kaggle/working/VizWiz-VQA-Grounding/outputs/a2_single_scale_question_only
+```
+
+If the session ends early, resume with the same command and flags, adding `--resume-checkpoint .../checkpoint_epoch10.pt` (`--num-epochs` stays 20).
+
+### Cell D2: A2 evaluation (same commit)
+
+```bash
+%%bash
+set -euo pipefail
+cd /kaggle/working/single_scale_2079c8a
+run_dir=/kaggle/working/VizWiz-VQA-Grounding/outputs/a2_single_scale_question_only
+for epoch in 10 20; do
+    for split in val test; do
+        uv run --frozen python eval.py \
+            --checkpoint "$run_dir/checkpoint_epoch${epoch}.pt" --dataset "$split" \
+            --data-root "$DATA_ROOT" --device cuda --batch-size 4 --num-workers 2 \
+            --output-dir "$run_dir/eval_${split}_ep${epoch}"
+    done
+done
+```
+
+The `metrics.json` summaries must report `"grounding_mode": "question"`. Select epoch 10 or 20 by validation mIoU only.
+
+### Cell D3: A5 question sensitivity of QGDP-Net (inference only)
+
+Run from this branch (`/kaggle/working/VizWiz-VQA-Grounding`) on the published epoch-20 checkpoint (`PARENT_CKPT` from Cell 1).
+
+```bash
+%%bash
+set -euo pipefail
+for split in val test; do
+    uv run --frozen python revision/question_sensitivity.py \
+        --checkpoint "$PARENT_CKPT" --data-root "$DATA_ROOT" --dataset "$split" \
+        --output-dir "$RUN_ROOT/a5_question_sensitivity_${split}" \
+        --batch-size 4 --device cuda --seed 2027
+done
+```
+
+The image stays fixed and only the question changes: the original question again, a random donor question, a size-group-matched donor question, "What is this?", and an empty question. The primary measures compare each prediction with the original-question prediction (agreement IoU, changed pixels, area ratio), so they measure sensitivity, not correctness. IoU against the ground truth is stored only as a descriptive secondary value.
+
+### Cell D4: A6 audit of the training masks (CPU)
+
+```bash
+%%bash
+set -euo pipefail
+uv run --frozen python revision/mask_resolution_audit.py \
+    "$DATA_ROOT/binary_masks_png/train" "$RUN_ROOT/a6_mask_audit_train.json"
+```
+
+```python
+os.environ['RUN_NAME'] = 'session_d_a2_a5_a6'
+```
+
+Then run Cell Z.
 
 ## Cell Z: ZIP results, excluding checkpoints
 
