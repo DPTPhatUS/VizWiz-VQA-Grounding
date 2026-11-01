@@ -369,9 +369,43 @@ os.environ['RUN_NAME'] = f"dice_{os.environ['DETAIL_INPUT']}_s{os.environ['SEED'
 Path('dice_config.json').write_text('{"overlap_loss": "dice"}\n')
 ```
 
-### Cell F2: train and evaluate
+### Cell F2: train and evaluate (complete cell; do not reuse Cell E2)
 
-Use Cell E2 unchanged, except add `--config dice_config.json` to the `train.py` command. When you resume, keep the same `--config`: resume refuses a different loss configuration. After training, check that `history.jsonl` shows `"overlap_loss": "dice"` in `training_config`. Then run Cell Z.
+> **Result of the first attempt (2026-11-01).** All four Session F runs recorded `"overlap_loss": "lovasz"` in `history.jsonl`, so `--config dice_config.json` did not reach `train.py`. Cell F2 previously said "use Cell E2 and add the flag"; this complete cell replaces that instruction. Those four runs are kept as same-seed Lovász repeats (see the paper and `analyze_replicates.py`).
+
+```bash
+%%bash
+set -euo pipefail
+run_dir="$RUN_ROOT/$RUN_NAME"
+if [[ -e "$run_dir" ]]; then echo "Refusing to reuse $run_dir"; exit 1; fi
+grep -q '"dice"' dice_config.json || { echo "dice_config.json missing or wrong"; exit 1; }
+uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
+    --data-root "$DATA_ROOT" --batch-size 2 --num-workers 0 --steps 3 \
+    --gradient-checkpointing --detail-input "$DETAIL_INPUT"
+uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
+    --data-root "$DATA_ROOT" --output-dir "$run_dir" \
+    --num-epochs 20 --batch-size 2 --gradient-accumulation-steps 2 \
+    --gradient-checkpointing --num-workers 2 --lr 0.00001 --seed "$SEED" \
+    --optimizer adam --weight-decay 0 --lr-scheduler none --warmup-ratio 0 \
+    --save-every 10 --detail-input "$DETAIL_INPUT" --config dice_config.json
+# Stop before evaluation if the run did not use Dice.
+python -c "import json,sys; h=[json.loads(l) for l in open('$run_dir/history.jsonl')]; \
+losses={r['training_config']['overlap_loss'] for r in h}; print('overlap_loss:', losses); \
+sys.exit(0 if losses == {'dice'} else 1)"
+for epoch in 10 20; do
+    for split in val test; do
+        uv run --frozen python eval.py \
+            --checkpoint "$run_dir/checkpoint_epoch${epoch}.pt" --dataset "$split" \
+            --data-root "$DATA_ROOT" --device cuda --batch-size "$EVAL_BATCH" --num-workers 2 \
+            --output-dir "$run_dir/eval_${split}_ep${epoch}"
+    done
+    uv run --frozen python diagnose.py \
+        --predictions "$run_dir/eval_val_ep${epoch}" --data-root "$DATA_ROOT" \
+        --output-dir "$run_dir/diagnostic_ep${epoch}"
+done
+```
+
+To check early, look at the first line of `$run_dir/history.jsonl` after epoch 1 (about 25 minutes): it must contain `"overlap_loss": "dice"`. If the session ends early, resume with the same command plus `--resume-checkpoint "$run_dir/checkpoint_epoch10.pt"`, keeping `--config dice_config.json`. Then run Cell Z.
 
 ## Session T: mask-threshold sweep (inference only, about 30–60 min)
 
