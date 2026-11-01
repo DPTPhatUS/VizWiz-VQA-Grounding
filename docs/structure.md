@@ -10,6 +10,7 @@ Command scripts and shared implementation files live directly in the repository 
 ├── pyproject.toml                    Python requirement and dependencies
 ├── uv.lock                           Locked dependencies shared by Linux, Kaggle, and Vast.ai
 ├── .gitignore                        Excludes datasets, generated results, and Python caches
+├── vast.ipynb                        Vast.ai settings, source/data setup, GPU probe, Run All, monitoring
 │
 ├── train.py                          Argument resolution, Adam training, resume, best/latest selection
 ├── eval.py                           Selected-checkpoint evaluation, native masks, metric export
@@ -43,6 +44,7 @@ Command scripts and shared implementation files live directly in the repository 
 │   ├── launch.py                     Manifest selection, preflight/train/test processes, final upload
 │   ├── summarize.py                  Seed metrics, sample standard deviations, paired CM–FTC changes
 │   ├── hub.py                        Completed-run/manual Hub upload and verified pinned restore
+│   ├── vast.py                       Notebook data preparation, resource checks, resumable worker
 │   └── export.py                     Result archives, optionally including checkpoint payloads
 │
 ├── diagnostics/
@@ -71,6 +73,7 @@ Command scripts and shared implementation files live directly in the repository 
     ├── test_experiments.py           Model controls, objectives, metrics, diagnostics, selection, presets
     ├── test_hub.py                   Offline Hub, transfer failures, restoration, final-upload flow
     ├── test_commands.py              Script/module entry points and real subprocess launch behavior
+    ├── test_vast.py                  Notebook Run All/reattachment, ZIP handling, fit probe, worker resume
     ├── fixtures/
     │   ├── cm_reference.pt           Tiny CM reference weights, inputs, and outputs
     │   └── ftc_reference.pt          Tiny FTC reference weights, inputs, and outputs

@@ -1,10 +1,26 @@
 # Vast.ai: matched Context–Membership study
 
-Use the same source revision, lockfile, manifest, and two-process protocol as Kaggle. The code uses ordinary CUDA/PyTorch and SSH commands; it does not depend on a Vast.ai SDK or create paid instances automatically.
+Use [vast.ipynb](../vast.ipynb) for a browser-based setup. It uses the same source revision, lockfile, manifest, and launch tools as the CLI. One GPU is the default. The notebook does not rent instances or install drivers.
+
+## Notebook: settings and Run All
+
+Choose Vast.ai's recommended **NVIDIA CUDA** template and open Jupyter through the instance portal. Vast.ai uses that template in its [template quick start](https://docs.vast.ai/guides/templates/quickstart) and documents [Jupyter access](https://docs.vast.ai/guides/instances/connect/jupyter).
+
+For the full study, plan for **one GPU with 48 GB VRAM or more, 32 GB allocated RAM, at least four CPU cores, and 200 GB disk**. These are conservative capacity targets, not measured minimums. The notebook checks free resources, container memory limits, and two successful full-batch optimizer steps before launching. The lockfile uses CUDA 13; select a host with **driver 580 or newer**, per [NVIDIA's compatibility table](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
+
+Upload the notebook, then edit its first settings cell. Leave `PROCESSES=1` and `RUN_IDS=[]` for all thirteen runs at 30 epochs. Set `REPO_DIR` to an uploaded source checkout, or leave it blank to clone `exp/context-membership`. Cloning requires the current changes to be pushed first; existing source is reused without an automatic pull/reset.
+
+The dataset defaults to `Last-Bullet/VizWiz-VQA-Grounding`, file `vizwiz.zip`. Download/extraction is cached, ZIP paths are checked, the dataset root is detected, and its source commit/archive hash are recorded. A repeat setup uses that pinned extraction. Provide `HF_TOKEN` through the instance environment or the masked prompt; the notebook verifies dataset access and write access to the public checkpoint repository before downloading.
+
+Run All installs the locked Python 3.12 environment, validates all data splits, runs offline checks and a full-batch GPU probe, previews commands, and starts an independent worker. Training uploads only after each run's test evaluation. Re-running attaches to an active worker; otherwise it resumes local checkpoints or restores remote ones when enabled. A monitoring interrupt leaves the worker running. The optional stop cell is disabled during ordinary Run All.
+
+Outputs live under `WORK_DIR/outputs/revision/`; logs, status, summaries, and record archives live under `WORK_DIR/jobs/<session>/`. The final cell shows download links. A failed final upload can be retried by Run All without repeating completed training. Unfinished local progress has no automatic off-machine backup: use the manual backup command after stopping the worker if needed.
+
+The commands below are the equivalent manual SSH workflow.
 
 ## 1. Instance and source
 
-Choose an SSH-capable PyTorch/CUDA instance with two visible GPUs and enough disk for the dataset, dependencies/CLIP cache, and outputs. Keep roughly 6 GB per retained run for latest plus best checkpoints, plus temporary space for another resumable checkpoint during atomic saving. GPU memory requirements still need a real-hardware smoke check; CPU tests do not establish a minimum VRAM size.
+Choose an SSH-capable CUDA instance with one visible GPU and enough disk for the dataset, dependencies/CLIP cache, and outputs. Keep roughly 6 GB per retained run for latest plus best checkpoints, plus temporary space for another resumable checkpoint during atomic saving. GPU memory requirements still need a real-hardware smoke check; CPU tests do not establish a minimum VRAM size.
 
 Container storage is deleted when a Vast.ai instance is destroyed. A local volume survives destruction but is tied to its host machine. Completed-run uploads to Hugging Face provide the off-machine copy; explicitly upload unfinished progress before releasing an instance. See Vast.ai's [storage documentation](https://github.com/vast-ai/docs/blob/main/guides/instances/storage/types.mdx).
 
@@ -41,7 +57,7 @@ Use a write-enabled token for `Last-Bullet/vizwiz-cm-aciids-2027` in the interac
 uv run --frozen python -m unittest discover -s tests -v
 uv run --frozen python preflight.py --data-root "$CM_DATA_ROOT" --dataset-check-only
 uv run --frozen python -m tests.smoke.decoder_gpu
-uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs context_only_s42 --dry-run
+uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 1 --runs context_only_s42 --dry-run
 ```
 
 The actual launcher runs a finite model forward/backward preflight and verifies Hub write access before each training job. The preset creates a **public model repository** if needed. The dry run does not contact the Hub or write outputs.
@@ -53,28 +69,28 @@ If `tmux` is installed, start a session with `tmux new -s cm-study`. In that ses
 ```bash
 set -o pipefail
 mkdir -p logs
-uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs context_only_s42 membership_only_s42 2>&1 | tee logs/ablations.log
+uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 1 --runs context_only_s42 membership_only_s42 2>&1 | tee logs/ablations.log
 ```
 
 Detach with `Ctrl-b`, then `d`; reconnect using `tmux attach -t cm-study`. Omit `--runs` to run all thirteen jobs sequentially. Do not launch the same run ID on two machines concurrently.
 
 Every epoch uses global batch 4, validates at probability 0.5, and saves local `latest.pt` and `best.pt`. After all epochs and selected-checkpoint test evaluation finish, one upload publishes both checkpoints, run records, and test metrics to `matched-30ep-v1/<run-id>/`. The next run waits for this upload. There are no automatic intermediate uploads. Dataset images and prediction PNGs are excluded. `hub_status.json` contains the confirmed commit SHA; failed uploads leave the completed local run intact and stop the launcher after retries.
 
-One GPU is supported with `--processes 1`, retaining global batch 4. Use a separate complete study/cohort for that configuration: this workflow requires the same process count across the matched runs and across a run's resume. Two GPUs on both Vast.ai and Kaggle allow moving runs between those platforms with the existing preset.
+One GPU uses `--processes 1` and global batch 4. Keep one process across all matched runs and when resuming. If you choose two GPUs instead, use `--processes 2` throughout that cohort; moving a two-process Kaggle run to one GPU is rejected.
 
 ## 4. Restore and resume on either platform
 
 If the working directory survived, resume directly:
 
 ```bash
-uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs context_only_s42 --resume
+uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 1 --runs context_only_s42 --resume
 ```
 
 On a new instance, repeat setup/authentication, restore a completed run or manually backed-up intermediate epoch into an empty destination, then run the same resume command:
 
 ```bash
 uv run --frozen python -m experiments.hub download --path-in-repo matched-30ep-v1/context_only_s42 --run-dir outputs/revision/context_only_s42
-uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs context_only_s42 --resume
+uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 1 --runs context_only_s42 --resume
 ```
 
 Restoration pins one Hub commit, checks every file's size/hash, and preserves the run identity and best-selection history. Work inside an unfinished epoch is repeated. `--revision COMMIT_SHA` selects an older snapshot, but uploads refuse to replace newer remote progress. A restored completed run skips training and already-recorded test evaluation.

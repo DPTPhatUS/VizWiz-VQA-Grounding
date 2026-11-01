@@ -6,6 +6,7 @@ This branch contains the paper's question-only Context–Membership (CM) models,
 
 ```text
 train.py, eval.py…   Training, evaluation, prediction, preflight, and EXIF commands
+vast.ipynb          Vast.ai browser setup and resumable single-GPU Run All workflow
 dataset.py, losses.py, metrics.py, validation.py   Shared data, objectives, and evaluation
 checkpoints.py, runtime.py, artifacts.py          Checkpoints, provenance, and artifact IO
 models/             CM, FTC, encoders, decoders, and the model factory
@@ -18,6 +19,8 @@ data/, outputs/     Local datasets and generated artifacts; excluded from Git
 ```
 
 The command scripts and shared files live directly in the repository root. Run commands from that directory; no installation or `PYTHONPATH` changes are needed. See [the structure guide](docs/structure.md) for every file's purpose and the command mapping.
+
+For Vast.ai through Jupyter, open [vast.ipynb](vast.ipynb), edit its settings cell, and use Run All. It downloads the supplied Hugging Face dataset ZIP, checks the GPU/full-batch fit, and runs selected jobs with completed-run uploads. See the [Vast.ai guide](docs/vast.md) for instance requirements and source setup.
 
 ## Models and ablations
 
