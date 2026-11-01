@@ -373,6 +373,68 @@ Path('dice_config.json').write_text('{"overlap_loss": "dice"}\n')
 
 Use Cell E2 unchanged, except add `--config dice_config.json` to the `train.py` command. When you resume, keep the same `--config`: resume refuses a different loss configuration. After training, check that `history.jsonl` shows `"overlap_loss": "dice"` in `training_config`. Then run Cell Z.
 
+## Session T: mask-threshold sweep (inference only, about 30–60 min)
+
+**Why.** On small targets QGDP-Net's masks are tighter than the single-scale baseline's (paper Table 3). This session tests whether the baseline closes the gap when its own threshold is tuned. Every model's logits are thresholded at 19 values from −4 to 4. The threshold is chosen on validation only; test is reported at that threshold. No training.
+
+`revision/threshold_sweep.py` runs inside whichever repository holds the model's code: this branch for QGDP-Net, commit `2079c8a` for the baseline. It reproduces `eval.py` exactly at threshold 0; this was checked on CPU in both codebases.
+
+**Attach:**
+- the VizWiz dataset;
+- the published QGDP-Net checkpoint (Cell 1);
+- the **single-scale baseline checkpoint**: `checkpoint_epoch20.pt` of the `spatial_alignment_frozen` run, commit `2079c8a`;
+- optional: the A2 checkpoint (`a2_single_scale_question_only/checkpoint_epoch20.pt`), if you kept it.
+
+Run Cell 1 first.
+
+### Cell T1: checkpoint paths
+
+```python
+os.environ['SINGLE_CKPT'] = '/kaggle/input/REPLACE/checkpoint_epoch20.pt'  # single-scale baseline (required)
+os.environ['A2_CKPT'] = ''                                                # optional, '' to skip
+os.environ['RUN_NAME'] = 'threshold_sweep'
+assert Path(os.environ['SINGLE_CKPT']).is_file(), 'Set SINGLE_CKPT to the attached baseline checkpoint'
+```
+
+### Cell T2: sweep validation and test
+
+```bash
+%%bash
+set -euo pipefail
+repo=/kaggle/working/VizWiz-VQA-Grounding
+SWEEP="$repo/revision/threshold_sweep.py"
+out="$repo/outputs/threshold_sweep"
+mkdir -p "$out"
+cd "$repo"
+for split in val test; do
+    uv run --frozen python "$SWEEP" --checkpoint "$PARENT_CKPT" --data-root "$DATA_ROOT" \
+        --dataset "$split" --device cuda --batch-size "$EVAL_BATCH" --output "$out/qgdp_${split}.json"
+done
+if [[ ! -d /kaggle/working/baseline_code ]]; then
+    git clone https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git /kaggle/working/baseline_code
+    (cd /kaggle/working/baseline_code && git checkout --detach 2079c8a && uv sync --frozen)
+fi
+cd /kaggle/working/baseline_code
+for spec in "single:$SINGLE_CKPT" "a2:${A2_CKPT:-}"; do
+    name=${spec%%:*}; ckpt=${spec#*:}
+    [[ -z "$ckpt" ]] && continue
+    for split in val test; do
+        uv run --frozen python "$SWEEP" --checkpoint "$ckpt" --data-root "$DATA_ROOT" \
+            --dataset "$split" --device cuda --batch-size 4 --output "$out/${name}_${split}.json"
+    done
+done
+```
+
+**Check the printed `mean_iou_at_0`.** It must equal the published numbers:
+
+| Model | Validation | Test |
+|---|---|---|
+| QGDP-Net | 0.6577 | 0.6722 |
+| Single-scale baseline | 0.6316 | 0.6506 |
+| A2 | 0.6347 | 0.6491 |
+
+If a value differs, the wrong checkpoint is attached. Then run Cell Z (the ZIP is named `threshold_sweep.zip`).
+
 ## Cell Z: ZIP results, excluding checkpoints
 
 ```python
