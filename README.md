@@ -130,7 +130,9 @@ Then run Cell Z to download the results.
 
 ### Cell B2: preflight and 20-epoch training
 
-These are the published base-model settings (Adam, lr $10^{-5}$, no weight decay or schedule, global microbatch 2 × accumulation 2, seed 42), plus `--detail-input`.
+> **Loss caveat (found 2026-11-01).** On this branch `losses.py` defaults to `overlap_loss: "lovasz"` (inherited from `exp/per-image-lovasz`). The published QGDP-Net used Dice. Cells B2 and E2 below pass no `--config`, so the Session B and E runs used the Lovász main loss. They are matched with each other, not with the published model. Session F gives Dice-matched commands.
+
+These are the published base-model optimizer settings (Adam, lr $10^{-5}$, no weight decay or schedule, global microbatch 2 × accumulation 2, seed 42), plus `--detail-input`. The main overlap loss is **not** matched; see the caveat above.
 
 ```python
 os.environ['RUN_NAME'] = 'detail_input_zeros_ep20_seed42'
@@ -292,6 +294,9 @@ os.environ['RUN_NAME'] = 'session_d_a2_a5_a6'
 
 ## Session E: seed repeats of QGDP-Net vs. zeroed detail pathway (priority)
 
+> **Loss caveat (found 2026-11-01).** On this branch `losses.py` defaults to `overlap_loss: "lovasz"` (inherited from `exp/per-image-lovasz`). The published QGDP-Net used Dice. Cells B2 and E2 pass no `--config`, so the Session B and E runs used the Lovász main loss. They are matched with each other, not with the published model. Session F gives Dice-matched commands.
+
+
 **Why.** With seed 42, zeroing the detail maps did not lower accuracy (validation-selected: +0.15 test points, CI −0.65 to +0.95), but checkpoint-to-checkpoint noise is about 1.3 points. The paper's claim about the detail pathway needs repeated seeds, run as pairs that share everything except `--detail-input`.
 
 | Order | `DETAIL_INPUT` | `SEED` | Output folder |
@@ -341,6 +346,32 @@ done
 ```
 
 If the session ends early, resume with the same command plus `--resume-checkpoint "$run_dir/checkpoint_epoch10.pt"` (same `--num-epochs 20`) and then run the evaluation loop. Then run Cell Z.
+
+## Session F: Dice-matched detail-pathway runs (after the ACIIDS deadline)
+
+**Why.** Sessions B and E used the Lovász main loss, so none of them is matched to the published Dice QGDP-Net. With `{"overlap_loss": "dice"}` this branch's objective equals the published one: BCE averaged over pixels plus 0.5 per-image Dice at 768 px, and Dice auxiliary terms at 96, 192 and 384 px with weights 0.1, 0.2 and 0.3. The published model is the `image` run at seed 42.
+
+| Order | `DETAIL_INPUT` | `SEED` | Output folder | Purpose |
+|---|---|---|---|---|
+| 1 | `zeros` | 42 | `outputs/dice_zeros_s42` | Pairs with the published model |
+| 2 | `image` | 43 | `outputs/dice_image_s43` | Second Dice pair |
+| 3 | `zeros` | 43 | `outputs/dice_zeros_s43` | Second Dice pair |
+| 4 | `low_res` | 42 | `outputs/dice_low_res_s42` | Resolution-only control, paired with the published model |
+
+Each row is one session of about 8 hours. Rows can run in parallel in separate sessions.
+
+### Cell F1: choose the run and write the loss config
+
+```python
+os.environ['DETAIL_INPUT'] = 'zeros'   # 'image', 'zeros' or 'low_res'
+os.environ['SEED'] = '42'              # '42' or '43'
+os.environ['RUN_NAME'] = f"dice_{os.environ['DETAIL_INPUT']}_s{os.environ['SEED']}"
+Path('dice_config.json').write_text('{"overlap_loss": "dice"}\n')
+```
+
+### Cell F2: train and evaluate
+
+Use Cell E2 unchanged, except add `--config dice_config.json` to the `train.py` command. When you resume, keep the same `--config`: resume refuses a different loss configuration. After training, check that `history.jsonl` shows `"overlap_loss": "dice"` in `training_config`. Then run Cell Z.
 
 ## Cell Z: ZIP results, excluding checkpoints
 
