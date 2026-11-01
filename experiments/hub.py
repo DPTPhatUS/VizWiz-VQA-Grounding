@@ -9,11 +9,24 @@ import time
 
 from checkpoints import checkpoint_metadata
 from artifacts import sha256_file, write_json
+from predictions import SavedLogits, logit_artifacts, relative_logit_path
 
 DEFAULT_REPO = 'Last-Bullet/vizwiz-cm-aciids-2027'
-RECORDS = ('run.json', 'history.jsonl', 'manifest_run.json', 'test/metrics.json',
+RECORDS = ('run.json', 'history.jsonl', 'manifest_run.json', 'val/metrics.json', 'test/metrics.json',
+           'val/logits/index.json', 'test/logits/index.json',
            'latest.pt.sha256.json', 'best.pt.sha256.json')
 CHECKPOINTS = ('latest.pt', 'best.pt')
+
+
+def allowed_backup_file(name):
+    if name in CHECKPOINTS + RECORDS:
+        return True
+    for split in ('val', 'test'):
+        prefix = f'{split}/logits/'
+        if name.startswith(prefix):
+            relative_logit_path(name[len(prefix):])
+            return True
+    return False
 
 
 def hub_path(value):
@@ -77,20 +90,34 @@ def backup_plan(run_dir, path):
             raise ValueError('Run/checkpoint identity mismatch')
     if latest['best_epoch'] != best['epoch'] or best['epoch'] > latest['epoch']:
         raise ValueError('latest.pt and best.pt do not describe the same selection history')
+    best_hash = sha256_file(root/'best.pt')
+    names = set(CHECKPOINTS + RECORDS)
+    for split in ('val', 'test'):
+        directory = root/split
+        if (directory/'logits/index.json').exists():
+            index = SavedLogits(directory).index
+            if index['checkpoint_sha256'] != best_hash or index['split'] != split:
+                raise ValueError(f'{split} logits do not match the selected checkpoint')
+            for relative in logit_artifacts(directory):
+                if not (directory/relative).is_file():
+                    raise FileNotFoundError(directory/relative)
+                names.add(f'{split}/{relative}')
     files = {}
-    for name in (*CHECKPOINTS, *RECORDS):
+    for name in sorted(names):
         source = root/name
         if source.is_symlink():
             raise ValueError(f'Backup file cannot be a symlink: {name}')
         if source.is_file():
-            files[name] = {'sha256':sha256_file(source), 'bytes':source.stat().st_size}
+            files[name] = {'sha256':best_hash if name == 'best.pt' else sha256_file(source),
+                           'bytes':source.stat().st_size}
     for name in CHECKPOINTS:
         sidecar = root/(name+'.sha256.json')
         if sidecar.exists() and json.loads(sidecar.read_text())['sha256'] != files[name]['sha256']:
             raise ValueError(f'Checkpoint hash sidecar mismatch: {name}')
-    metrics = root/'test/metrics.json'
-    if metrics.exists() and json.loads(metrics.read_text())['summary']['checkpoint_sha256'] != files['best.pt']['sha256']:
-        raise ValueError('Test metrics do not match the selected checkpoint')
+    for split in ('val', 'test'):
+        metrics = root/split/'metrics.json'
+        if metrics.exists() and json.loads(metrics.read_text())['summary']['checkpoint_sha256'] != files['best.pt']['sha256']:
+            raise ValueError(f'{split} metrics do not match the selected checkpoint')
     return {'backup_version':1, 'path':path, 'run_uuid':run_uuid,
             'epoch':latest['epoch'], 'best_epoch':best['epoch'],
             'best_validation_miou':latest['best_validation_miou'],
@@ -153,8 +180,7 @@ def download_run(repo_id, path, run_dir, revision='main', api=None):
         raise ValueError(f'No backup at {path}')
     if not set(CHECKPOINTS).issubset(index['files']):
         raise ValueError('Backup is missing resumable/selected checkpoints')
-    allowed = set(CHECKPOINTS + RECORDS)
-    if not set(index['files']).issubset(allowed):
+    if not all(allowed_backup_file(name) for name in index['files']):
         raise ValueError('Backup contains unexpected file paths')
     root.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.hub-restore-', dir=root.parent) as tmp:

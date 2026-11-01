@@ -73,7 +73,7 @@ def summarize_counts(records):
 
 
 @torch.inference_mode()
-def evaluate_counts(model, loader, device, output=None, threshold=.5):
+def evaluate_counts(model, loader, device, output=None, threshold=.5, logit_writer=None):
     import math
     if not 0 < threshold < 1:
         raise ValueError('Probability threshold must be in (0, 1)')
@@ -81,11 +81,14 @@ def evaluate_counts(model, loader, device, output=None, threshold=.5):
     model.eval(); records = {}
     for batch in loader:
         batch = to_device(batch, device)
-        for name, logits, truth in native_logits(model(batch)['logits'], batch):
+        raw_logits = model(batch)['logits']
+        for i, (name, logits, truth) in enumerate(native_logits(raw_logits, batch)):
             if name in records:
                 raise ValueError(f'Duplicate sample: {name}')
             pred = logits > cutoff
             records[name] = overlap_counts(pred, truth)
+            if logit_writer is not None:
+                logit_writer.save(name, raw_logits[i, 0], truth.shape)
             if output is not None:
                 path = Path(output) / Path(name).with_suffix('.png')
                 path.parent.mkdir(parents=True, exist_ok=True)

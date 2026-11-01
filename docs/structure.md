@@ -23,6 +23,7 @@ Command scripts and shared implementation files live directly in the repository 
 ├── dataset.py                        Image/mask alignment, question-only text, collating, loader seeding
 ├── losses.py                         Segmentation BCE, occupancy role targets, membership loss
 ├── metrics.py                        Native-grid counts, per-image metrics, dataset summaries
+├── predictions.py                    Float32 logit export/index, reconstruction, evaluation completeness
 ├── validation.py                     Non-padding DDP validation with training modes and RNG restored
 ├── checkpoints.py                    Strict format/model reconstruction, save/load, metadata inspection
 ├── runtime.py                        Project paths, device transfer, parameter counts, source/environment records
@@ -71,6 +72,7 @@ Command scripts and shared implementation files live directly in the repository 
     ├── support.py                    Small synthetic train/validation/test datasets
     ├── test_mechanism.py             CM role semantics, gradients, borders, train/resume/inference
     ├── test_experiments.py           Model controls, objectives, metrics, diagnostics, selection, presets
+    ├── test_predictions.py           Lossless logits, cached calibration, incomplete-export recovery
     ├── test_hub.py                   Offline Hub, transfer failures, restoration, final-upload flow
     ├── test_commands.py              Script/module entry points and real subprocess launch behavior
     ├── test_vast.py                  Notebook bootstrap/interrupt, ZIP retry, launch/upload retry, restore
@@ -85,7 +87,7 @@ Command scripts and shared implementation files live directly in the repository 
 
 ## How the files fit together
 
-The launcher reads the manifest and runs `preflight.py`, `train.py`, and `eval.py`. The Vast notebook uses `--skip-preflight` to start training directly. Those scripts share the dataset, model factory, losses, validation, and native-grid metrics. The checkpoint loader reconstructs each architecture from explicit settings. Diagnostics use that same loader. The Hub uploader runs after training/test processes exit and publishes latest/best checkpoints, run records, and final metrics together.
+The launcher reads the manifest and runs `preflight.py`, `train.py`, and `eval.py`. The Vast notebook uses `--skip-preflight` to start training directly. Those scripts share the dataset, model factory, losses, validation, and native-grid metrics. The checkpoint loader reconstructs each architecture from explicit settings. Diagnostics use that same loader. The Hub uploader runs after training/test processes exit and publishes latest/best checkpoints, run records, validation/test metrics, and indexed logits together.
 
 Changes to CM computation belong in `models/connections.py` or `models/mask_decoder.py`. A new supported model choice belongs in `models/factory.py` and its implementation file. Study-matrix changes belong in `configs/high_priority.json`. Calibration and question-sensitivity changes belong in `diagnostics/`. Platform instructions belong in `docs/` and call the same root scripts and tools.
 
@@ -128,8 +130,10 @@ Dataset paths and artifact locations retain their meaning. `data/`, `outputs*/`,
 | `best.pt` | Validation-selected model for inference/test; excludes optimizer state |
 | `*.sha256.json` | Saved-checkpoint integrity records |
 | `manifest_run.json` | Manifest identity used by the study summarizer |
-| `test/metrics.json` | Selected-checkpoint native-grid test metrics and checkpoint identity |
-| `test/*.png` | Native binary predictions; remain local or in explicit result exports |
+| `val/metrics.json`, `test/metrics.json` | Selected-checkpoint native metrics, per-image results/counts, checkpoint identity |
+| `val/*.png`, `test/*.png` | Native binary predictions; remain local or in explicit result exports |
+| `{val,test}/logits/index.json` | File mapping, checkpoint SHA, split, input size, interpolation settings |
+| `{val,test}/logits/*.npz` | Lossless float32 model-grid logits and per-image identity/native dimensions; included in Hub backups |
 | `hub_status.json` | Confirmed remote commit or last failed-upload record |
 
 Automatic uploads still occur once after each completed run. Intermediate epochs stay local unless explicitly uploaded. Diagnostics, exports, and the paper's existing files keep their chosen output locations.

@@ -14,7 +14,7 @@ Choose the NVIDIA CUDA template, one GPU, and sufficient memory, CPU, and disk. 
 
 The run cell clones the branch, installs `uv`, creates the locked Python 3.12 environment, and downloads `vizwiz.zip` from `Last-Bullet/VizWiz-VQA-Grounding`. The ZIP contains `vizwiz/` directly, so no directory discovery is needed. After successful extraction, the ZIP is deleted to free space. A completion marker lets reruns reuse the extracted data; interrupted extraction keeps the ZIP for retry.
 
-The notebook runs one model at a time on one GPU, with the manifest's global batch of four, 30 epochs, per-epoch validation, and best-validation checkpoint selection. After test evaluation, it uploads the latest and best checkpoints plus records/metrics, then starts the next model. Intermediate epochs stay local. The model, training, native-resolution metrics, and checkpoint selection are unchanged.
+The notebook runs one model at a time on one GPU, with the manifest's global batch of four, 30 epochs, per-epoch validation, and best-validation checkpoint selection. After training, it evaluates `best.pt` on validation and test, saving full metrics, native binary masks, and compressed float32 logits. It then uploads the latest and best checkpoints, records, both splits' metrics and logits, and starts the next model. Intermediate epochs stay local. The model, training, native-resolution metrics, and checkpoint selection are unchanged.
 
 There are no hardware guards, dataset scans, test suites, fit probes, dry runs, interactive prompts, detached workers, or monitoring stages. The notebook passes `--skip-preflight` to the shared launcher; ordinary CLI launches retain their default preflight. Training progress appears directly in the run cell. Interrupting that cell terminates its process group.
 
@@ -25,7 +25,7 @@ Use **Run All** again after resolving a failure:
 - Extracted data are reused without downloading the ZIP again.
 - Training resumes from local `latest.pt`; work inside an unfinished epoch is repeated.
 - A failure before the first saved epoch starts that model again, retaining its partial records under `interrupted/`.
-- Completed local runs skip training and existing test evaluation. A failed final upload is retried.
+- Completed local runs skip training and complete validation/test evaluations. Missing results or logits regenerate only the affected split. A failed final upload is retried.
 - On a new instance, existing Hub backups are restored automatically. Only completed runs have automatic remote backups.
 
 Files under `WORK_DIR`:
@@ -35,9 +35,11 @@ source/                 Automatically cloned source and its .venv
 cache/                  Dependency/model caches
 downloads/              Temporary ZIP download; archive removed after extraction
 data/vizwiz/            Extracted dataset
-outputs/<run-id>/       latest.pt, best.pt, history, test metrics/predictions
+outputs/<run-id>/       latest.pt, best.pt, history, val/ and test/ metrics/masks/logits
 reports/<report-id>/    Summary JSON, seed CSV, and records.zip
 interrupted/            Records from attempts that failed before saving an epoch
 ```
 
-The records ZIP excludes checkpoint payloads. Completed-run checkpoints and metrics are available in the Hugging Face repository. Diagnostics and optional manual backup commands remain documented in [README.md](../README.md).
+Each `val/` and `test/` folder has `metrics.json`, native PNG masks, and `logits/index.json` plus per-image `.npz` files. The same `best.pt` produces both splits, once after training; validation results from other epochs remain aggregate mIoUs in `history.jsonl`. Saved logits retain their model-grid resolution and are resized before thresholding.
+
+The records ZIP includes metrics, masks, and logits and excludes checkpoint payloads. Completed-run checkpoints, validation/test metrics, and logits are available in the Hugging Face repository. PNG masks remain local or in the records ZIP; they can be reconstructed from logits. Diagnostics and optional manual backup commands remain documented in [README.md](../README.md).

@@ -59,7 +59,8 @@ class CommandTests(unittest.TestCase):
                   '--device','cpu','--processes','1','--no-hub')
             run_command(*args)
             folder=root/'runs/context_only_s42'
-            for name in ('latest.pt','best.pt','run.json','history.jsonl','manifest_run.json','test/metrics.json'):
+            for name in ('latest.pt','best.pt','run.json','history.jsonl','manifest_run.json',
+                         'val/metrics.json','test/metrics.json','val/logits/index.json','test/logits/0.npz'):
                 self.assertTrue((folder/name).is_file(),name)
             history=(folder/'history.jsonl').read_bytes()
             run_command(*args,'--resume')

@@ -95,13 +95,15 @@ The rolling policy writes:
 - `latest.pt`: resumable model, optimizer/scaler state, settings, and best score/epoch;
 - `best.pt`: selected model weights and metadata for inference; it cannot resume training;
 - `run.json`, `history.jsonl`, SHA-256 sidecars, and `manifest_run.json`;
-- `test/metrics.json` and native-resolution binary PNG predictions.
+- `val/metrics.json` and `test/metrics.json`: overall metrics, per-image metrics, and native-grid pixel counts from `best.pt`;
+- `val/*.png` and `test/*.png`: native-resolution binary predictions at threshold 0.5;
+- `val/logits/` and `test/logits/`: compressed float32 logits before resizing/thresholding, plus a checkpoint-bound index.
 
 Preserve **both** checkpoint files across sessions. Full CLIP/Adam checkpoints are several GB; allow roughly 6 GB per active run for latest plus best, in addition to masks and other outputs. Atomic local saving also needs temporary room for another `latest.pt`. Copy completed runs off Kaggle between sessions as needed.
 
 ## Hugging Face backups and machine transfers
 
-After training and selected-checkpoint test evaluation finish, the launcher uploads `latest.pt`, `best.pt`, SHA-256 hashes, run records, `test/metrics.json`, and the manifest record in one Hub commit under `matched-30ep-v1/<run-id>/`. Intermediate epochs remain local. The uploader uses an explicit allowlist: dataset images, prediction PNGs, and unrelated files are excluded. It waits for upload completion before launching the next run. After three failed commit attempts, the launcher stops with the completed local run intact; `--resume` retries without repeating completed training or evaluation.
+After training, the launcher evaluates the validation-selected `best.pt` once on each of validation and test. It uploads `latest.pt`, `best.pt`, SHA-256 hashes, run records, both splits' metrics and indexed logit files, and the manifest record in one Hub commit under `matched-30ep-v1/<run-id>/`. Intermediate epochs remain local. The uploader uses an explicit allowlist: dataset images, prediction PNGs, and unrelated files are excluded. It waits for upload completion before launching the next run. After three failed commit attempts, the launcher stops with the completed local run intact; `--resume` retries without repeating completed training or evaluation. A completed run missing validation results or logit files only reruns the affected evaluation; it does not retrain.
 
 The remote paths contain the final latest/best pair. Manual intermediate backups add versions to Hub history, increasing storage use; history is never deleted automatically. See the [storage guidance](https://huggingface.co/docs/hub/storage-limits). The integration uses Hugging Face's [commit API](https://huggingface.co/docs/huggingface_hub/package_reference/hf_api#create_commit).
 
@@ -158,6 +160,8 @@ uv run --frozen python predict_save.py --checkpoint /path/to/model.pt --image ph
 uv run --frozen python visualize_predictions.py --checkpoint /path/to/model.pt --image photo.jpg --question 'What does it say?' --output overlay.png
 ```
 
+Each evaluation folder contains `metrics.json`, native-resolution mask PNGs, and `logits/index.json` plus one compressed `.npz` per image. Each NPZ stores `logits` as a two-dimensional float32 array at the model output resolution, `original_size` as `[height, width]`, `filename`, `split`, `checkpoint_sha256`, and `format_version`. The index records the model input size and interpolation settings. Reconstruct native logits with bilinear interpolation and `align_corners=False` **before** applying sigmoid or a threshold. Compression is lossless; probabilities are not quantized. `metrics.json` retains per-image IoUs under `per_sample` and adds precision, recall, area ratio, and relative area error under `per_sample_metrics`. Final evaluation does not change validation-based model selection.
+
 `IoU.py` remains an evaluation alias. `bake_exif.py` remains an optional dataset utility; the loader already applies EXIF orientation at runtime. The old hard-coded `countnum.py` is replaced by preflight.
 
 ## Threshold calibration
@@ -168,6 +172,15 @@ For each FTC/CM checkpoint, sweep probability thresholds 0.10–0.90 in incremen
 uv run --frozen python -m diagnostics.thresholds validation --checkpoint /path/to/model.pt --data-root /path/to/vizwiz --output-dir outputs/calibration/model_val
 uv run --frozen python -m diagnostics.thresholds test --checkpoint /path/to/model.pt --data-root /path/to/vizwiz --selection outputs/calibration/model_val/selection.json --output-dir outputs/calibration/model_test
 ```
+
+Use the saved logits to calibrate without loading a checkpoint or running the encoders:
+
+```bash
+uv run --frozen python -m diagnostics.thresholds validation --predictions outputs/revision/cm_separate_s42/val --data-root /path/to/vizwiz --device cpu --output-dir outputs/calibration/cached_val
+uv run --frozen python -m diagnostics.thresholds test --predictions outputs/revision/cm_separate_s42/test --data-root /path/to/vizwiz --device cpu --selection outputs/calibration/cached_val/selection.json --output-dir outputs/calibration/cached_test
+```
+
+`--predictions` replaces `--checkpoint`. The dataset is still needed for ground-truth masks and image alignment. Hub restoration includes the cached logits and metrics, so this also works on a replacement machine.
 
 Validation exports overlap counts, mIoU, Acc@0.5, macro precision/recall, severe failures, mask-area ratio, relative area error, and PDF curves. Selection maximizes validation mIoU; ties favor the threshold closest to 0.5, then the lower threshold. `selection.json` binds the selected threshold to the checkpoint SHA. Test evaluates only that threshold and 0.5. A `--limit` smoke run cannot produce a calibration selection. Ratios with zero ground-truth area are null and excluded from area-ratio means, with support reported.
 

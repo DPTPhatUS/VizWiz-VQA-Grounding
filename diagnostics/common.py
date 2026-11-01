@@ -6,8 +6,8 @@ from artifacts import sha256_file
 from runtime import environment, parameter_counts
 
 
-def inference_arguments(parser):
-    parser.add_argument('--checkpoint', required=True)
+def inference_arguments(parser, checkpoint_required=True):
+    parser.add_argument('--checkpoint', required=checkpoint_required)
     parser.add_argument('--data-root', default='data/vizwiz')
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--num-workers', type=int, default=2)

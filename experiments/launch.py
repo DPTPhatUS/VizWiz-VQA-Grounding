@@ -25,10 +25,12 @@ def commands(manifest,run,data_root,out,device,processes,resume=False):
     if resume:flags+=['--resume-checkpoint',str(out/'latest.pt')]
     train=([sys.executable,'train.py'] if processes==1 else
            [sys.executable,'-m','torch.distributed.run','--standalone',f'--nproc_per_node={processes}','train.py'])
-    return [[sys.executable,'preflight.py',*flags], [*train,*flags],
+    evaluations = [
             [sys.executable,'eval.py','--checkpoint',str(out/'best.pt'),'--data-root',str(data_root),
-             '--dataset','test','--device',device,'--num-workers',str(manifest['common'].get('num_workers',2)),
-             '--output-dir',str(out/'test')]]
+             '--dataset',split,'--device',device,'--batch-size',str(manifest['common']['batch_size']),
+             '--num-workers',str(manifest['common'].get('num_workers',2)),
+             '--output-dir',str(out/split)] for split in ('val','test')]
+    return [[sys.executable,'preflight.py',*flags], [*train,*flags], *evaluations]
 
 
 def main(argv=None):
@@ -74,7 +76,7 @@ def main(argv=None):
         if hub:
             from experiments.hub import hub_path
             destination = {'repo_id':hub['repo_id'], 'path':hub_path(f'{hub["prefix"]}/{run["id"]}'),
-                           'private':hub.get('private',False), 'when':'after-training-and-test'}
+                           'private':hub.get('private',False), 'when':'after-training-validation-and-test'}
         print(json.dumps({'run':run['id'],'commands':steps,'huggingface':destination}),flush=True)
         if args.dry_run:continue
         complete=False
@@ -93,13 +95,13 @@ def main(argv=None):
             if previous is not None and previous['epoch'] > saved['epoch']:
                 raise ValueError('Hub backup is newer than local progress; download before resuming')
         if not complete:
-            for command in steps[:-1]:subprocess.run(command,cwd=PROJECT_ROOT,check=True)
-        if not (out/'test/metrics.json').exists():subprocess.run(steps[-1],cwd=PROJECT_ROOT,check=True)
-        else:
-            from artifacts import sha256_file
-            previous=json.loads((out/'test/metrics.json').read_text())
-            if previous['summary'].get('checkpoint_sha256')!=sha256_file(out/'best.pt'):
-                raise ValueError('Existing test evaluation is for a different checkpoint')
+            for command in steps[:-2]:subprocess.run(command,cwd=PROJECT_ROOT,check=True)
+        from artifacts import sha256_file
+        from predictions import evaluation_complete
+        checkpoint_sha256=sha256_file(out/'best.pt')
+        for split,command in zip(('val','test'),steps[-2:]):
+            if not evaluation_complete(out/split,checkpoint_sha256,split):
+                subprocess.run(command,cwd=PROJECT_ROOT,check=True)
         write_json(out/'manifest_run.json',{'cohort':manifest['name'],'run':run,'common':manifest['common']})
         if hub:
             from experiments.hub import upload_run

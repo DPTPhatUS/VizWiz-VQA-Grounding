@@ -88,7 +88,7 @@ class VastWorkflow(unittest.TestCase):
                 hub.failures = 3
                 with self.assertRaisesRegex(OSError, 'interrupted connection'):
                     vast.run_study(workspace, 'test/study', 'study', manifest=path, device='cpu')
-                self.assertEqual(calls, ['train.py', 'eval.py'])
+                self.assertEqual(calls, ['train.py', 'eval.py', 'eval.py'])
                 self.assertTrue((partial/'latest.pt').is_file())
                 self.assertEqual(len(list((workspace/'interrupted').iterdir())), 1)
                 history = (partial/'history.jsonl').read_bytes()
@@ -107,6 +107,8 @@ class VastWorkflow(unittest.TestCase):
                 self.assertEqual(hub.calls, 4)
                 self.assertEqual((restored/'outputs/ftc_s42/latest.pt').read_bytes(),
                                  (partial/'latest.pt').read_bytes())
+                self.assertEqual((restored/'outputs/ftc_s42/val/logits/0.npz').read_bytes(),
+                                 (partial/'val/logits/0.npz').read_bytes())
 
     def test_uploaded_notebook_bootstraps_and_reuses_source_without_prompts(self):
         notebook = json.loads((PROJECT_ROOT/'vast.ipynb').read_text())

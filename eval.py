@@ -5,9 +5,10 @@ from pathlib import Path
 import torch
 from dataset import VizWizGroundingDataset, make_loader
 from checkpoints import read_checkpoint, model_from_checkpoint
-from artifacts import sha256_file
+from artifacts import sha256_file, write_json
 from runtime import environment
 from metrics import evaluate_counts, summarize_counts, sample_metrics
+from predictions import LogitWriter
 
 
 def eval_main(argv=None):
@@ -24,20 +25,27 @@ def eval_main(argv=None):
         raise ValueError("Invalid batch size or worker count")
     saved = read_checkpoint(args.checkpoint)
     config = saved["run_config"]
+    epoch = saved.get('epoch')
     model = model_from_checkpoint(saved)
     del saved
     device = torch.device(args.device); model.to(device)
     dataset = VizWizGroundingDataset(args.data_root,args.dataset,config['image_size'])
     loader = make_loader(dataset,args,args.batch_size)
     out = Path(args.output_dir); out.mkdir(parents=True,exist_ok=True)
-    counts = evaluate_counts(model,loader,device,out)
+    checkpoint_sha256 = sha256_file(args.checkpoint)
+    logits = LogitWriter(out/'logits', args.dataset, checkpoint_sha256, config['image_size'])
+    counts = evaluate_counts(model,loader,device,out,logit_writer=logits)
+    logits.finish()
     scores = {name: sample_metrics(row)["iou"] for name,row in counts.items()}
     summary = {**summarize_counts(counts),
                "dataset":args.dataset,"metric_resolution":"original",
                "text_mode":"question","checkpoint":str(args.checkpoint),
-               "checkpoint_sha256":sha256_file(args.checkpoint), "environment":environment(),
+               "checkpoint_sha256":checkpoint_sha256, "checkpoint_epoch":epoch,
+               "threshold":.5, "environment":environment(),
                "experiment_config":model.experiment_config}
-    (out/"metrics.json").write_text(json.dumps({"summary":summary,"per_sample":scores,"counts":counts},indent=2))
+    write_json(out/'metrics.json', {'summary':summary, 'per_sample':scores,
+        'per_sample_metrics':{name:sample_metrics(row) for name,row in counts.items()},
+        'counts':counts, 'logits':'logits/index.json'})
     print(json.dumps(summary),flush=True)
 
 

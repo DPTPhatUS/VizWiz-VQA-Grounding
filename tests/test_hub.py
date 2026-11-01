@@ -105,11 +105,15 @@ class HubWorkflow(unittest.TestCase):
         self.assertEqual(self.hub.calls,1)
         current = json.loads(self.hub.commits[final['commit']][self.path+'/backup.json'])
         self.assertIn('test/metrics.json',current['files'])
+        self.assertIn('test/logits/index.json',current['files'])
+        self.assertIn('test/logits/0.npz',current['files'])
         self.assertFalse(any(name.endswith('.png') for name in current['files']))
         restored = self.root/'another-machine'
         result = download_run(self.repo,self.path,restored)
         self.assertEqual(result['commit'],final['commit'])
         self.assertEqual(backup_plan(restored,self.path),current)
+        self.assertEqual((restored/'test/logits/0.npz').read_bytes(),
+                         (self.out/'test/logits/0.npz').read_bytes())
         for key,value in read_checkpoint(self.out/'latest.pt')['model_state_dict'].items():
             torch.testing.assert_close(value,read_checkpoint(restored/'latest.pt')['model_state_dict'][key],rtol=0,atol=0)
         resumed = list(self.args)
@@ -182,7 +186,8 @@ class HubWorkflow(unittest.TestCase):
         path=self.root/'manifest.json';path.write_text(json.dumps(manifest))
         calls=[]
         def execute(command,**kwargs):
-            self.assertEqual(self.hub.calls,0)
+            if command[1] != 'eval.py':
+                self.assertEqual(self.hub.calls,0)
             calls.append(command[1])
             {'preflight.py':preflight.main,'train.py':train.train_main,
              'eval.py':evaluation.eval_main}[command[1]](command[2:])
@@ -190,14 +195,24 @@ class HubWorkflow(unittest.TestCase):
               '--output-root',str(self.root/'campaign')]
         with contextlib.redirect_stdout(io.StringIO()),patch.object(launch,'subprocess',SimpleNamespace(run=execute)):
             launch.main(argv)
-            self.assertEqual(calls,['preflight.py','train.py','eval.py'])
+            self.assertEqual(calls,['preflight.py','train.py','eval.py','eval.py'])
             self.assertEqual(self.hub.calls,1)
             calls.clear()
             launch.main(argv+['--resume'])
             self.assertEqual(calls,[])
             self.assertEqual(self.hub.calls,1)
+            # A missing logit reruns only its split, not completed training.
+            folder=self.root/'campaign/ftc_s42'
+            (folder/'test/logits/0.npz').unlink()
+            launch.main(argv+['--resume'])
+            self.assertEqual(calls,['eval.py'])
+            self.assertEqual(self.hub.calls,1)
         index=json.loads(self.hub.commits[self.hub.head]['study/ftc_s42/backup.json'])
         self.assertIn('test/metrics.json',index['files'])
+        self.assertIn('val/metrics.json',index['files'])
+        for split in ('val','test'):
+            self.assertIn(f'{split}/logits/index.json',index['files'])
+            self.assertIn(f'{split}/logits/0.npz',index['files'])
         self.assertIn('manifest_run.json',index['files'])
 
 

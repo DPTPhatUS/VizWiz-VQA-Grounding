@@ -53,7 +53,7 @@ uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --proce
 
 Other IDs: `ftc_s42`, `ftc_s123`, `ftc_s456`, `cm_separate_s42`, `cm_separate_s123`, `cm_separate_s456`, `cm_shared_s42`, `cm_shared_s123`, `cm_shared_s456`, `cm_noaux_s42`, and `ftc_capacity_s42`.
 
-Each run validates every epoch and keeps local `latest.pt` and `best.pt`. After training and test evaluation finish, it uploads both checkpoints, records, and final metrics in one Hub commit. There are no automatic intermediate uploads. Check the printed resolved protocol: 30 epochs, global batch 4, learning rate 1e-5, and the intended model/flags. New local directories and unused remote run paths are required for fresh runs. Never initialize a fresh ablation from a trained full-CM checkpoint.
+Each run validates every epoch and keeps local `latest.pt` and `best.pt`. After training, it evaluates `best.pt` on validation and test and uploads both checkpoints, records, both splits' metrics, and compressed float32 logits in one Hub commit. There are no automatic intermediate uploads. Check the printed resolved protocol: 30 epochs, global batch 4, learning rate 1e-5, and the intended model/flags. New local directories and unused remote run paths are required for fresh runs. Never initialize a fresh ablation from a trained full-CM checkpoint.
 
 ## 4. Resume after a session ends
 
@@ -126,7 +126,7 @@ Gather completed run folders from all sessions before the final summary. Missing
 
 ## 7. Export
 
-Hub backups include checkpoints and run/test metrics. Save diagnostic reports, plots, and PNG predictions through the first archive below; they are not included in automatic Hub backups. The second archive provides an optional local checkpoint export. Choose a fresh archive name each time.
+Hub backups include checkpoints, run records, validation/test metrics, and saved logits. Save diagnostic reports, plots, and PNG predictions through the first archive below; they are not included in automatic Hub backups. The second archive provides an optional local checkpoint export. Choose a fresh archive name each time.
 
 ```bash
 %%bash
@@ -141,4 +141,4 @@ display(FileLink('/kaggle/working/cm_records.zip'))
 display(FileLink('/kaggle/working/cm_resume.zip'))
 ```
 
-Manual intermediate backups remain in Hub history. See the [backup/storage notes](../README.md#hugging-face-backups-and-machine-transfers). Use the [Vast.ai guide](vast.md) for the equivalent SSH workflow.
+Manual intermediate backups remain in Hub history. See the [backup/storage notes](../README.md#hugging-face-backups-and-machine-transfers). Use the [Vast.ai guide](vast.md) for the standalone single-GPU notebook workflow.
