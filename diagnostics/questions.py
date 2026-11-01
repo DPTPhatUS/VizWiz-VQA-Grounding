@@ -1,6 +1,5 @@
 """Question interventions: mask sensitivity, not counterfactual grounding accuracy."""
 import argparse
-import hashlib
 import json
 import random
 from pathlib import Path
@@ -25,9 +24,7 @@ def donor_mapping(dataset,seed):
     donors=list(names);rng=random.Random(seed)
     for i in range(len(donors)-1,0,-1):
         j=rng.randrange(i);donors[i],donors[j]=donors[j],donors[i]
-    questions={name:str(dataset.records[name]['question']) for name in names}
-    fingerprint=hashlib.sha256(json.dumps(questions,sort_keys=True).encode()).hexdigest()
-    return {'seed':seed,'question_sha256':fingerprint,'donors':dict(zip(names,donors))}
+    return {'seed':seed,'donors':dict(zip(names,donors))}
 
 
 def get_donors(dataset,path,seed):

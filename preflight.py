@@ -8,7 +8,6 @@ from dataset import VizWizGroundingDataset, collate_samples
 from models.factory import build_model
 from losses import SupervisedObjective
 from train import training_parser, configure_run, seed_everything
-from checkpoints import read_checkpoint, load_model_weights
 from runtime import parameter_counts, to_device
 
 
@@ -38,8 +37,7 @@ def main(argv=None):
     args=parser.parse_args(argv)
     args._explicit={a[2:].split('=')[0].replace('-','_') for a in argv if a.startswith('--')}
     args.device=args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
-    checkpoint=read_checkpoint(args.resume_checkpoint or args.init_checkpoint) if args.resume_checkpoint or args.init_checkpoint else None
-    configure_run(args,checkpoint)
+    configure_run(args)
     if args.steps<1:raise ValueError('Preflight steps must be positive')
     summary={'datasets':validate_data(args.data_root)}
     if args.dataset_check_only:
@@ -47,9 +45,7 @@ def main(argv=None):
     seed_everything(args.seed)
     model=build_model(args.model,tiny=args.tiny,connection_mode=args.connection_mode,
                       context=not args.disable_context,membership=not args.disable_membership,
-                      pretrained=checkpoint is None).to(args.device)
-    if checkpoint:load_model_weights(model,checkpoint)
-    del checkpoint
+                      pretrained=True).to(args.device)
     dataset=VizWizGroundingDataset(args.data_root,'train',32 if args.tiny else 336)
     objective=SupervisedObjective(args.edge_loss_weight)
     optimizer=torch.optim.Adam([p for p in model.parameters() if p.requires_grad],lr=args.lr)

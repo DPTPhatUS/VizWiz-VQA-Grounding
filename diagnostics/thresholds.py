@@ -67,10 +67,13 @@ def main(argv=None):
         saved = SavedLogits(args.predictions)
         dataset = VizWizGroundingDataset(args.data_root, split, saved.index['image_size'])
         device = torch.device(args.device)
-        result = json.loads((Path(args.predictions)/'metrics.json').read_text())['summary']
-        if result['checkpoint_sha256'] != saved.index['checkpoint_sha256']:
+        evaluation = json.loads((Path(args.predictions)/'metrics.json').read_text())
+        result = evaluation['summary']
+        if result['checkpoint'] != saved.index['checkpoint']:
             raise ValueError('Saved metrics and logits come from different checkpoints')
-        metadata = {key:result[key] for key in ('checkpoint','checkpoint_sha256','experiment_config')}
+        record = json.loads((Path(args.predictions)/evaluation['run']).read_text())
+        metadata = {'checkpoint':result['checkpoint']}
+        metadata['experiment_config'] = record['experiment']
         metadata.update({'split':split, 'limit':args.limit, 'metric_resolution':'original',
                          'prediction_source':str(args.predictions), 'environment':environment()})
     else:
@@ -80,7 +83,7 @@ def main(argv=None):
         if not args.selection:
             raise ValueError('Test requires --selection from validation')
         selection=json.loads(Path(args.selection).read_text())
-        if selection.get('split')!='val' or selection.get('limit') or selection.get('checkpoint_sha256')!=metadata['checkpoint_sha256']:
+        if selection.get('split')!='val' or selection.get('limit') or selection.get('checkpoint')!=metadata['checkpoint']:
             raise ValueError('Selection must be from this checkpoint on complete validation')
         selected=selection['threshold']
         if selected not in THRESHOLDS:
@@ -96,7 +99,7 @@ def main(argv=None):
     if args.action=='validation' and not args.limit:
         selected=select_threshold(report)
         write_json(out/'selection.json',{'split':'val','limit':0,'threshold':selected,
-            'checkpoint_sha256':metadata['checkpoint_sha256'],'objective':'maximum validation mIoU',
+            'checkpoint':metadata['checkpoint'],'objective':'maximum validation mIoU',
             'tie_break':'closest to 0.5, then lower threshold'})
     write_json(out/'results.json',report)
     if args.action=='validation':

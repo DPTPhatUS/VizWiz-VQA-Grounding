@@ -39,7 +39,7 @@ def state_equal(test,a,b):
 
 
 def checkpoint(model):
-    return {'format_version':1, 'model_state_dict':model.state_dict(),
+    return {'model_state_dict':model.state_dict(),
             'experiment_config':model.experiment_config, 'run_config':{}}
 
 
@@ -63,14 +63,14 @@ class RevisionModels(unittest.TestCase):
         with torch.no_grad():torch.testing.assert_close(model(f['batch'])['logits'],f['output']['logits'],rtol=0,atol=0)
         state_equal(self,model_from_checkpoint(checkpoint(model)).state_dict(),f['state'])
 
-    def test_current_checkpoint_format_and_strict_reconstruction(self):
+    def test_checkpoint_settings_and_strict_reconstruction(self):
         for kind in ('cm','ftc','ftc-capacity'):
             model=build_model(kind,tiny=True)
             saved=checkpoint(model)
             state_equal(self,model_from_checkpoint(saved).state_dict(),model.state_dict())
-            saved.pop('format_version')
-            with self.assertRaisesRegex(ValueError,'format_version'):model_from_checkpoint(saved)
-            saved['format_version']=1
+            del saved['run_config']
+            with self.assertRaisesRegex(ValueError,'run_config'):model_from_checkpoint(saved)
+            saved['run_config']={}
             del saved['experiment_config']['tiny']
             with self.assertRaisesRegex(ValueError,'Incomplete'):model_from_checkpoint(saved)
 
@@ -186,31 +186,32 @@ class RevisionPipeline(unittest.TestCase):
     @classmethod
     def setUpClass(cls):torch.set_num_threads(2)
 
-    def test_validation_logging_preserves_training(self):
+    def test_validation_preserves_training(self):
         with tempfile.TemporaryDirectory() as tmp,contextlib.redirect_stdout(io.StringIO()):
-            root=Path(tmp);data=fixture_data(root/'data')
+            root=Path(tmp);data=fixture_data(root/'data');models=[]
+            def create(**kwargs):
+                model=GroundingModel(**kwargs);models.append(model);return model
             common=['--tiny','--data-root',str(data),'--device','cpu','--num-workers','0',
-                    '--batch-size','2','--num-epochs','2','--save-every','1']
-            train.train_main(common+['--output-dir',str(root/'plain')])
-            train.train_main(common+['--output-dir',str(root/'val'),'--val-every','1'])
-            a=read_checkpoint(root/'plain/checkpoint_epoch2.pt');b=read_checkpoint(root/'val/checkpoint_epoch2.pt')
-            state_equal(self,a['model_state_dict'],b['model_state_dict']);self.assertTrue((root/'val/best.pt').exists())
+                    '--batch-size','2','--num-epochs','2']
+            with patch.object(train,'GroundingModel',side_effect=create):
+                with patch.object(train,'validation_iou',return_value=.5):
+                    train.train_main(common+['--output-dir',str(root/'control')])
+                train.train_main(common+['--output-dir',str(root/'validation')])
+            state_equal(self,models[0].state_dict(),models[1].state_dict())
 
-    def test_rolling_resume_preserves_best_and_weights(self):
+    def test_best_selection_uses_validation_and_keeps_earlier_ties(self):
         with tempfile.TemporaryDirectory() as tmp,contextlib.redirect_stdout(io.StringIO()):
-            root=Path(tmp);data=fixture_data(root/'data')
-            common=['--tiny','--model','ftc','--data-root',str(data),'--device','cpu','--num-workers','0',
-                    '--batch-size','2','--val-every','1','--checkpoint-policy','rolling']
-            with patch.object(train,'validation_iou',return_value=.9):train.train_main(common+['--num-epochs','1','--output-dir',str(root/'resume')])
-            with patch.object(train,'validation_iou',return_value=.8):
-                train.train_main(common+['--num-epochs','2','--output-dir',str(root/'resume'),'--resume-checkpoint',str(root/'resume/latest.pt')])
-            with patch.object(train,'validation_iou',side_effect=[.9,.8]):train.train_main(common+['--num-epochs','2','--output-dir',str(root/'continuous')])
-            a=read_checkpoint(root/'resume/latest.pt');b=read_checkpoint(root/'continuous/latest.pt')
-            state_equal(self,a['model_state_dict'],b['model_state_dict']);self.assertEqual(a['best_epoch'],1)
-            self.assertEqual(read_checkpoint(root/'resume/best.pt')['epoch'],1)
-            with self.assertRaisesRegex(ValueError,'seed'):
-                train.train_main(common+['--num-epochs','3','--seed','123','--output-dir',str(root/'resume'),
-                                        '--resume-checkpoint',str(root/'resume/latest.pt')])
+            root=Path(tmp);data=fixture_data(root/'data');out=root/'run'
+            with patch.object(train,'validation_iou',side_effect=[.9,.8,.9]):
+                train.train_main(['--tiny','--model','ftc','--data-root',str(data),
+                    '--device','cpu','--num-workers','0','--batch-size','2',
+                    '--num-epochs','3','--output-dir',str(out)])
+            saved=read_checkpoint(out/'best.pt')
+            self.assertEqual(saved['epoch'],1)
+            self.assertEqual(saved['validation_miou'],.9)
+            self.assertNotIn('optimizer_state_dict',saved)
+            self.assertEqual([p.name for p in out.glob('*.pt')],['best.pt'])
+            self.assertEqual(len((out/'history.jsonl').read_text().splitlines()),3)
 
     def test_preflight_all_models_and_dry_run(self):
         with tempfile.TemporaryDirectory() as tmp,contextlib.redirect_stdout(io.StringIO()):
@@ -221,7 +222,7 @@ class RevisionPipeline(unittest.TestCase):
             from experiments.launch import main
             absent=Path(tmp)/'never-created';main(['--data-root',str(data),'--output-root',str(absent),'--runs','ftc_s42','--dry-run'])
             self.assertFalse(absent.exists());cmds=commands(manifest,manifest['runs'][0],data,absent,'cpu',2)
-            self.assertIn('torch.distributed.run',cmds[1]);self.assertIn('--val-every',cmds[1])
+            self.assertIn('torch.distributed.run',cmds[0]);self.assertIn('--val-every',cmds[0])
 
 
 if __name__=='__main__':unittest.main()

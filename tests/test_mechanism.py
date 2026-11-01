@@ -136,7 +136,7 @@ class MechanismTests(unittest.TestCase):
     def test_checkpoint_mode_roundtrip_and_wrong_mode_rejection(self):
         for mode in ('shared', 'separate'):
             model = make_model(mode)
-            saved = {'format_version':1, 'model_state_dict': model.state_dict(), 'experiment_config': model.experiment_config,
+            saved = {'model_state_dict': model.state_dict(), 'experiment_config': model.experiment_config,
                      'run_config': {'tiny': True, 'image_size': 32}}
             restored = model_from_checkpoint(saved)
             inputs = batch()
@@ -147,60 +147,31 @@ class MechanismTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
-    def test_train_resume_evaluate_predict_for_both_modes(self):
+    def test_fresh_training_evaluation_and_prediction_for_both_modes(self):
+        from tests.support import fixture_data
         torch.set_num_threads(2)
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            for split in ('train', 'val'):
-                (root / split).mkdir()
-                (root / 'binary_masks_png' / split).mkdir(parents=True)
-                records = {}
-                for i in range(2):
-                    name = f'example{i}.jpg'
-                    records[name] = {'question': 'What is the number?'}
-                    Image.new('RGB', (29+i, 21+i), (80, 90, 110)).save(root / split / name)
-                    mask = np.zeros((21+i, 29+i), dtype=np.uint8); mask[4:12, 7:19] = 255
-                    Image.fromarray(mask).save(root / 'binary_masks_png' / split / f'example{i}.png')
-                (root / f'{split}_grounding.json').write_text(json.dumps(records))
-            for mode in ('shared', 'separate'):
-                out = root / mode
-                argv = ['--data-root', str(root), '--output-dir', str(out), '--connection-mode', mode,
-                        '--num-epochs', '1', '--save-every', '1', '--batch-size', '2', '--num-workers', '0']
-                factory = lambda **kw: GroundingModel(**dict({'tiny': True}, **kw))
-                with patch.object(train, 'GroundingModel', side_effect=factory), patch.object(train, 'IMAGE_SIZE', 32), \
-                     patch.object(torch.cuda, 'is_available', return_value=False), contextlib.redirect_stdout(io.StringIO()):
-                    train.train_main(argv)
-                    checkpoint = out / 'checkpoint_epoch1.pt'
-                    # Omitted mode is recovered from the checkpoint on resume.
-                    resumed = [x for x in argv]
-                    pos = resumed.index('--connection-mode'); del resumed[pos:pos+2]
-                    resumed[resumed.index('--num-epochs')+1] = '2'
-                    train.train_main(resumed + ['--resume-checkpoint', str(checkpoint)])
-                    uninterrupted = list(argv)
-                    uninterrupted[uninterrupted.index('--num-epochs')+1] = '2'
-                    uninterrupted[uninterrupted.index('--output-dir')+1] = str(out / 'uninterrupted')
-                    train.train_main(uninterrupted)
-                saved = read_checkpoint(out / 'checkpoint_epoch2.pt')
-                continuous = read_checkpoint(out / 'uninterrupted/checkpoint_epoch2.pt')
-                for key, value in saved['model_state_dict'].items():
-                    torch.testing.assert_close(value, continuous['model_state_dict'][key], rtol=0, atol=0)
-                self.assertEqual(saved['epoch'], 2)
-                self.assertEqual(saved['experiment_config']['connection_mode'], mode)
-                self.assertEqual(saved['run_config']['edge_loss_weight'], .1)
-                self.assertEqual(len((out / 'history.jsonl').read_text().splitlines()), 2)
-                result = out / 'validation'
-                with contextlib.redirect_stdout(io.StringIO()):
-                    evaluation.eval_main(['--checkpoint', str(out / 'checkpoint_epoch2.pt'),
-                        '--data-root', str(root), '--dataset', 'val', '--output-dir', str(result),
-                        '--device', 'cpu', '--batch-size', '2', '--num-workers', '0'])
-                metrics = json.loads((result / 'metrics.json').read_text())
-                self.assertEqual(metrics['summary']['num_samples'], 2)
-                self.assertEqual(metrics['summary']['experiment_config']['connection_mode'], mode)
-                image, prediction = predict_image(out / 'checkpoint_epoch2.pt', root / 'val/example0.jpg',
-                                                   'What is the number?', 'cpu')
-                self.assertEqual(image.size, prediction.size)
-                self.assertEqual(prediction.size, (29, 21))
-                self.assertTrue(set(np.unique(np.asarray(prediction))) <= {0, 255})
+        with tempfile.TemporaryDirectory() as tmp,contextlib.redirect_stdout(io.StringIO()):
+            root=Path(tmp);data=fixture_data(root/'data')
+            for mode in ('shared','separate'):
+                out=root/mode
+                train.train_main(['--tiny','--data-root',str(data),'--output-dir',str(out),
+                    '--connection-mode',mode,'--num-epochs','2','--batch-size','2',
+                    '--num-workers','0','--device','cpu'])
+                saved=read_checkpoint(out/'best.pt')
+                self.assertEqual(saved['experiment_config']['connection_mode'],mode)
+                self.assertEqual(saved['run_config']['edge_loss_weight'],.1)
+                self.assertEqual(len((out/'history.jsonl').read_text().splitlines()),2)
+                self.assertFalse((out/'latest.pt').exists())
+                result=out/'val'
+                evaluation.eval_main(['--checkpoint',str(out/'best.pt'),'--data-root',str(data),
+                    '--dataset','val','--output-dir',str(result),'--device','cpu',
+                    '--batch-size','2','--num-workers','0'])
+                metrics=json.loads((result/'metrics.json').read_text())
+                self.assertEqual(metrics['summary']['num_samples'],3)
+                image,prediction=predict_image(out/'best.pt',data/'val/0.jpg','What color?','cpu')
+                self.assertEqual(image.size,prediction.size)
+                self.assertEqual(prediction.size,(19,13))
+                self.assertTrue(set(np.unique(np.asarray(prediction)))<={0,255})
 
 
 if __name__ == '__main__':

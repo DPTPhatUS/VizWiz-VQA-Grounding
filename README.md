@@ -1,231 +1,140 @@
 # Context–Membership grounding experiments
 
-This branch contains the paper's question-only Context–Membership (CM) models, the exact frozen-text compact control (FTC), and a conventional convolutional capacity control. It provides one training/evaluation interface for the matched revision study. Training the full study is an explicit action; installing dependencies or running tests does not start it.
+This branch trains and evaluates the paper's question-only Context–Membership (CM) models, the exact FTC baseline, and the FTC capacity control. Every campaign trains fresh models and saves research results.
 
-## Repository layout
+For Vast.ai, upload [vast.ipynb](vast.ipynb) to `/workspace` on your single-GPU NVIDIA CUDA instance. Enter your Hugging Face token, edit the settings, and **Run All**. Setup requires a new `/workspace/cm-study` directory. If anything fails, delete that directory and start again. See [the Vast guide](docs/vast.md).
+
+## Experiment matrix
+
+| Configuration | Seeds | Decoder parameters |
+|---|---|---:|
+| FTC | 42, 123, 456 | 690,753 |
+| CM-Shared | 42, 123, 456 | 942,953 |
+| CM-Separate | 42, 123, 456 | 1,120,585 |
+| Context-only, separate | 42 | Registered/trainable counts reported separately |
+| Membership-only, separate | 42 | Registered/trainable counts reported separately |
+| CM-Separate without auxiliary loss | 42 | 1,120,585 |
+| FTC capacity control | 42 | 1,120,845 |
+
+The [manifest](configs/high_priority.json) contains all thirteen runs. Each uses 30 epochs, global batch 4, Adam at 1e-5, zero weight decay, gradient clipping at 1.0, a frozen text encoder, and a trainable image encoder/decoder. Text contains questions only. Validation runs after every epoch at probability threshold 0.5 on the original image grid. Highest validation mIoU selects `best.pt`; ties retain the earlier epoch. Test results do not select the checkpoint.
+
+CM controls are `--model cm`, `--connection-mode shared|separate`, `--disable-context`, `--disable-membership`, and `--edge-loss-weight`. The auxiliary weight defaults to 0.1 with membership, otherwise zero. Context-only bypasses membership updates/supervision; membership-only bypasses context aggregation. A zero auxiliary weight retains the complete forward computation. Disabled modules preserve common initialization but are frozen and excluded from optimization. FTC options are `--model ftc` and `--model ftc-capacity`; CM-specific flags are rejected for them.
+
+## Linux commands
+
+Run commands from the source root. Python 3.12 and locked dependencies can be installed with:
+
+```bash
+python -m pip install uv
+uv python install 3.12
+uv sync --frozen --python 3.12
+```
+
+The data root contains `train_grounding.json`, `val_grounding.json`, `test_grounding.json`, the `train/`, `val/`, `test/` image directories, and `binary_masks_png/<split>/`.
+
+Authenticate with `HF_TOKEN` in the environment or `uv run --frozen hf auth login`. The public destination defaults to `Last-Bullet/vizwiz-cm-aciids-2027` and is created automatically.
+
+```bash
+uv run --frozen python -m experiments.launch --data-root /path/to/vizwiz --processes 1
+```
+
+Omit `--runs` for the whole study, or select models:
+
+```bash
+uv run --frozen python -m experiments.launch --data-root /path/to/vizwiz --processes 1 --runs ftc_s42 cm_shared_s42 cm_separate_s42
+```
+
+Each invocation creates `outputs/<timestamp>/`, trains every selected model from scratch, evaluates `best.pt` on validation and test, and uploads each completed model before starting the next. The final study summary is also uploaded. Remote paths are `matched-30ep-v1/<timestamp>/<run-id>/` and `matched-30ep-v1/<timestamp>/summary/`. A new timestamp keeps earlier results separate. `--hf-repo` and `--hf-prefix` change the destination; `--no-hub` runs locally. `--dry-run` prints commands without creating outputs or contacting Hugging Face. `--processes 2` uses torchrun with microbatch 2 per GPU; validation covers each image once.
+
+A direct training command also starts fresh:
+
+```bash
+uv run --frozen python train.py --model cm --connection-mode separate --data-root /path/to/vizwiz --num-epochs 30 --batch-size 4 --lr 0.00001 --seed 42 --output-dir outputs/my_cm
+```
+
+## Saved research artifacts
 
 ```text
-train.py, eval.py…   Training, evaluation, prediction, preflight, and EXIF commands
-vast.ipynb          Vast.ai browser setup and resumable single-GPU Run All workflow
-dataset.py, losses.py, metrics.py, validation.py   Shared data, objectives, and evaluation
-checkpoints.py, runtime.py, artifacts.py          Checkpoints, provenance, and artifact IO
-models/             CM, FTC, encoders, decoders, and the model factory
-experiments/        Manifest launching, seed summaries, Hugging Face transfer, and export
-diagnostics/        Thresholds, question sensitivity, relation roles, and benchmarking
-configs/            Study manifests: model/seed matrix, protocol, and upload destination
-docs/               File-by-file structure guide, Kaggle/Vast.ai instructions, verification
-tests/              Offline behavior tests, reference fixtures, and opt-in hardware checks
-data/, outputs/     Local datasets and generated artifacts; excluded from Git
+outputs/<timestamp>/
+├── <run-id>/
+│   ├── best.pt
+│   ├── run.json
+│   ├── history.jsonl
+│   ├── val/
+│   │   ├── metrics.json
+│   │   └── logits/
+│   │       ├── index.json
+│   │       └── <image>.npz
+│   └── test/                       # Same result files as val/
+└── summary/
+    ├── summary.json
+    └── runs.csv
 ```
 
-The command scripts and shared files live directly in the repository root. Run commands from that directory; no installation or `PYTHONPATH` changes are needed. See [the structure guide](docs/structure.md) for every file's purpose and the command mapping.
+- `best.pt`: selected weights, architecture/settings, selected epoch, validation mIoU, and source/software information. It has no optimizer state.
+- `run.json`: resolved settings, model/component choice, seed, parameter counts, source commit, software versions, and selected epoch/score.
+- `history.jsonl`: per-epoch total/segmentation/membership losses and validation mIoU. Membership loss is logged unweighted.
+- `metrics.json`: native-resolution overall results and one record per image containing pixel counts, IoU, precision, recall, area ratio, and relative area error. It references the run record and identifies the selected experiment/epoch in plain text.
+- `.npz`: only losslessly compressed float32 logits at the model output resolution and original `[height, width]`. The split index maps filenames and records input size, split, selected model/epoch, dtype, and interpolation settings. Resize logits with bilinear interpolation and `align_corners=False` before applying a threshold.
+- Summary JSON/CSV: individual test results, per-model means and sample standard deviations, missing runs, and paired CM-Separate-minus-FTC seed differences. Fractions remain in 0–1 units; severe failures are counts. Single-seed configurations have no estimated standard deviation.
 
-For Vast.ai, upload only [vast.ipynb](vast.ipynb) to `/workspace` on a single-GPU NVIDIA CUDA instance, edit its settings cell, and use Run All. It clones the source, installs dependencies, extracts the supplied dataset ZIP, and runs the selected jobs sequentially with completed-run uploads. Reruns resume saved progress. See the [Vast.ai guide](docs/vast.md).
+Completed-run uploads contain the checkpoint, settings/history, and validation/test metrics/logits. The summary folder uploads after all selected models finish. There are no continuation checkpoints, backup/status manifests, custom artifact versions, application hashes, or automatic ZIPs.
 
-## Models and ablations
-
-| Choice | Options | Decoder parameters |
-|---|---|---:|
-| FTC | `--model ftc` | 690,753 |
-| FTC capacity control | `--model ftc-capacity` | 1,120,845 |
-| CM-Shared | `--model cm --connection-mode shared` | 942,953 |
-| CM-Separate | `--model cm --connection-mode separate` | 1,120,585 |
-| Context-only | CM-Separate plus `--disable-membership` | Reports registered and trainable counts separately |
-| Membership-only | CM-Separate plus `--disable-context` | Reports registered and trainable counts separately |
-| CM without relation supervision | CM-Separate plus `--edge-loss-weight 0` | 1,120,585 |
-
-The capacity control adds three residual blocks, each expanding 128 to 532 channels, applying a depthwise 3×3 convolution, and projecting back to 128, with GroupNorm and GELU. It adds 430,092 active parameters, only 260 more than CM adds to FTC. These blocks follow skip fusion and precede the first upsampling stage.
-
-Only the CLIP text encoder is frozen. Images use CLIP normalization and 336×336 input; every model uses question-only text (`Q: ...`). Segmentation uses BCE. CM adds 0.1 times the class-balanced directed membership loss unless its weight is explicitly zero. No Dice/Lovász, detail pyramid, answer generator, or crop pathway is introduced.
-
-Context-only retains context aggregation, unary prediction, and the common CM readout. Membership-only feeds uncontextualized features to unary prediction and retains local propagation. Disabling both preserves the unary/readout control; it is **not FTC**. Disabled modules remain registered to preserve initialization and checkpoint layout, but unused parameters are frozen. `shared`/`separate` controls parameter tying, independently of component switches.
-
-## Install and check
-
-Use Python 3.12 or newer and the committed lockfile:
+PNG masks are optional (`SAVE_MASKS=True` in the notebook or `--save-masks` in the launcher/evaluator) and remain local. They can also be exported from saved logits without model inference or dataset access:
 
 ```bash
-uv sync --frozen
-uv run --frozen python -m unittest discover -s tests -v
-uv run --frozen python preflight.py --data-root /path/to/vizwiz --dataset-check-only
+uv run --frozen python predictions.py --predictions outputs/TIMESTAMP/cm_separate_s42/val --output-dir outputs/masks/cm_val --threshold 0.5
 ```
 
-The dataset root contains `train_grounding.json`, `val_grounding.json`, `test_grounding.json`, image folders `train/`, `val/`, `test/`, and `binary_masks_png/<split>/`. Preflight checks filenames, questions, and EXIF-adjusted image/mask dimensions, then runs a finite forward/backward/optimizer step unless `--dataset-check-only` is set. CLIP's unused pooled-output normalization parameters are reported separately; disconnected prediction parameters fail preflight. Add `--tiny --device cpu` only for synthetic smoke data, never for publication runs.
-
-For a model-specific preflight:
+Manual archive export remains available:
 
 ```bash
-uv run --frozen python preflight.py --data-root /path/to/vizwiz --connection-mode separate --disable-context
+uv run --frozen python -m experiments.export --root outputs/TIMESTAMP --output /tmp/cm_results.zip
 ```
 
-## The matched 30-epoch study
-
-`configs/high_priority.json` specifies thirteen fresh runs:
-
-- FTC, full CM-Shared, and full CM-Separate at seeds 42, 123, and 456;
-- Context-only, membership-only, and no-auxiliary-loss CM at seed 42;
-- FTC capacity control at seed 42.
-
-Every run uses 30 epochs, global batch 4, Adam at 1e-5, zero weight decay, gradient clipping at 1.0, and validation after every epoch. The highest native-grid validation mIoU at threshold 0.5 selects `best.pt`; ties retain the earlier epoch. Only that checkpoint is evaluated on test. Seed-42 references are retrained so the selection procedure matches the new ablations and seeds.
-
-Preview commands without creating output directories:
+To upload an individually trained model after its evaluation:
 
 ```bash
-uv run --frozen python -m experiments.launch --data-root /path/to/vizwiz --processes 2 --dry-run
+uv run --frozen python -m experiments.hub --run-dir outputs/my_cm --path-in-repo manual-study/my_cm
 ```
 
-Launch one selected run on two GPUs:
+## Evaluation and diagnostics
+
+Evaluate any saved model, export one prediction, or make an overlay:
 
 ```bash
-uv run --frozen python -m experiments.launch --data-root /path/to/vizwiz --processes 2 --runs context_only_s42
+uv run --frozen python eval.py --checkpoint outputs/my_cm/best.pt --data-root /path/to/vizwiz --dataset val --output-dir outputs/my_cm/val
+uv run --frozen python predict_save.py --checkpoint outputs/my_cm/best.pt --image photo.jpg --question 'What does it say?' --output prediction.png
+uv run --frozen python visualize_predictions.py --checkpoint outputs/my_cm/best.pt --image photo.jpg --question 'What does it say?' --output overlay.png
 ```
 
-Omit `--runs` to execute all thirteen sequentially, or list several IDs. Use `--device cpu --processes 1` only for smoke manifests. `--output-root` defaults to `outputs/revision`. A fresh launch refuses existing nonempty run directories. Two-process training uses a global batch of 4, hence microbatch 2 per GPU. Validation uses non-padding rank shards and restores training/RNG state.
+`IoU.py` remains an evaluation alias. The loader applies EXIF orientation; `bake_exif.py` remains available for explicit dataset preparation. `preflight.py` is an optional standalone data/model check and is not part of the automatic launcher or notebook.
 
-The preset uploads each **completed run** to the **public** Hugging Face model repository `Last-Bullet/vizwiz-cm-aciids-2027`. Authenticate on the training machine with a write-enabled token before launching:
+Threshold calibration can use saved logits on CPU:
 
 ```bash
-uv run --frozen hf auth login
+uv run --frozen python -m diagnostics.thresholds validation --predictions outputs/TIMESTAMP/cm_separate_s42/val --data-root /path/to/vizwiz --device cpu --output-dir outputs/calibration/val
+uv run --frozen python -m diagnostics.thresholds test --predictions outputs/TIMESTAMP/cm_separate_s42/test --data-root /path/to/vizwiz --device cpu --selection outputs/calibration/val/selection.json --output-dir outputs/calibration/test
 ```
 
-Alternatively, supply `HF_TOKEN` through the platform's secrets/environment mechanism. Tokens are never command-line arguments or saved settings. Before training, the launcher creates the repository if needed, verifies write access and visibility, and rejects a remote path belonging to another run. `--dry-run` does not contact the Hub. Add `--no-hub` for local-only runs and offline smoke manifests.
+Alternatively, replace `--predictions` with `--checkpoint /path/to/best.pt` for live inference. Validation sweeps 0.10–0.90 in steps of 0.05 and exports metrics, pixel counts, and PDF curves. Selection maximizes validation mIoU; ties prefer proximity to 0.5, then the lower threshold. Test uses that selection and 0.5. Ground-truth masks are still required. Area ratios exclude empty ground-truth masks and report their support.
 
-The rolling policy writes:
-
-- `latest.pt`: resumable model, optimizer/scaler state, settings, and best score/epoch;
-- `best.pt`: selected model weights and metadata for inference; it cannot resume training;
-- `run.json`, `history.jsonl`, SHA-256 sidecars, and `manifest_run.json`;
-- `val/metrics.json` and `test/metrics.json`: overall metrics, per-image metrics, and native-grid pixel counts from `best.pt`;
-- `val/*.png` and `test/*.png`: native-resolution binary predictions at threshold 0.5;
-- `val/logits/` and `test/logits/`: compressed float32 logits before resizing/thresholding, plus a checkpoint-bound index.
-
-Preserve **both** checkpoint files across sessions. Full CLIP/Adam checkpoints are several GB; allow roughly 6 GB per active run for latest plus best, in addition to masks and other outputs. Atomic local saving also needs temporary room for another `latest.pt`. Copy completed runs off Kaggle between sessions as needed.
-
-## Hugging Face backups and machine transfers
-
-After training, the launcher evaluates the validation-selected `best.pt` once on each of validation and test. It uploads `latest.pt`, `best.pt`, SHA-256 hashes, run records, both splits' metrics and indexed logit files, and the manifest record in one Hub commit under `matched-30ep-v1/<run-id>/`. Intermediate epochs remain local. The uploader uses an explicit allowlist: dataset images, prediction PNGs, and unrelated files are excluded. It waits for upload completion before launching the next run. After three failed commit attempts, the launcher stops with the completed local run intact; `--resume` retries without repeating completed training or evaluation. A completed run missing validation results or logit files only reruns the affected evaluation; it does not retrain.
-
-The remote paths contain the final latest/best pair. Manual intermediate backups add versions to Hub history, increasing storage use; history is never deleted automatically. See the [storage guidance](https://huggingface.co/docs/hub/storage-limits). The integration uses Hugging Face's [commit API](https://huggingface.co/docs/huggingface_hub/package_reference/hf_api#create_commit).
-
-Restore a completed run, or an explicitly uploaded intermediate checkpoint, onto a new Kaggle or Vast.ai machine:
+Further diagnostics are explicit commands; the notebook does not launch them automatically:
 
 ```bash
-uv run --frozen python -m experiments.hub download --path-in-repo matched-30ep-v1/context_only_s42 --run-dir outputs/revision/context_only_s42
-uv run --frozen python -m experiments.launch --data-root /path/to/vizwiz --processes 2 --runs context_only_s42 --resume
-```
-
-Downloads pin one remote commit, verify every file's hash, and refuse a nonempty destination. `--revision COMMIT_SHA` restores a specific historical backup. Resume on the same number of processes. The Vast notebook uses one process; keep studies with different process counts separate.
-
-Back up an unfinished run before ending a rental session, or retry an upload after a connection failure. Pause/stop training at a completed epoch first so the two checkpoint files are stable. `--dry-run` inspects the upload without contacting the Hub:
-
-```bash
-uv run --frozen python -m experiments.hub upload --run-dir outputs/revision/context_only_s42 --path-in-repo matched-30ep-v1/context_only_s42
-```
-
-`hub_status.json` records the last confirmed commit. Uploads reject another run's destination or progress older than the remote backup. A genuinely fresh rerun needs a new local output root **and** a new Hub prefix (`--hf-prefix`). `--hf-repo` overrides the preset destination. The standalone Hub commands also accept `--repo-id`.
-
-Resume selected runs in their existing output directories:
-
-```bash
-uv run --frozen python -m experiments.launch --data-root /path/to/vizwiz --processes 2 --runs context_only_s42 --resume
-```
-
-Resume preserves the seed, global batch, learning rate, objective, architecture, validation policy, and process count. If the 30-epoch run is complete, the launcher proceeds to any missing test evaluation. It rejects stale test results from another checkpoint.
-
-Summarize completed runs; missing runs are listed explicitly:
-
-```bash
-uv run --frozen python -m experiments.summarize --root outputs/revision --output-dir outputs/study_summary
-```
-
-The JSON/CSV exports include per-seed metrics, sample standard deviations, and paired CM-minus-FTC differences. Percent-valued quantities are stored as fractions, except severe-failure counts. A singleton configuration has no estimated standard deviation.
-
-## Direct training and checkpoint format
-
-Direct commands default to full CM-Shared, 30 epochs, no automatic validation, and periodic checkpoints every ten epochs. The revision preset sets all study choices explicitly. For a direct matched no-auxiliary run:
-
-```bash
-uv run --frozen python train.py --data-root /path/to/vizwiz --connection-mode separate --edge-loss-weight 0 --num-epochs 30 --batch-size 4 --lr 0.00001 --seed 42 --val-every 1 --checkpoint-policy rolling --output-dir outputs/noaux_s42
-```
-
-The logged `membership` loss is unweighted and can remain nonzero when its objective weight is zero. Positive relation-loss weights are rejected if membership is disabled. CM-only flags are rejected for FTC.
-
-For a direct training command, use `experiments.hub upload` explicitly after training/evaluation. Automatic completed-run uploads are provided by `experiments.launch`.
-
-All training, evaluation, prediction, and diagnostics use one checkpoint format (`format_version=1`) with explicit model/component settings. Older checkpoints and raw state dictionaries are no longer supported; their files are left untouched. Architecture identity and tensor loading remain strict. Reconstruction avoids redundant pretrained CLIP downloads; the tokenizer is loaded when text is first encoded.
-
-```bash
-uv run --frozen python eval.py --checkpoint /path/to/best.pt --data-root /path/to/vizwiz --dataset val --output-dir outputs/model_val
-uv run --frozen python predict_save.py --checkpoint /path/to/model.pt --image photo.jpg --question 'What does it say?' --output prediction.png
-uv run --frozen python visualize_predictions.py --checkpoint /path/to/model.pt --image photo.jpg --question 'What does it say?' --output overlay.png
-```
-
-Each evaluation folder contains `metrics.json`, native-resolution mask PNGs, and `logits/index.json` plus one compressed `.npz` per image. Each NPZ stores `logits` as a two-dimensional float32 array at the model output resolution, `original_size` as `[height, width]`, `filename`, `split`, `checkpoint_sha256`, and `format_version`. The index records the model input size and interpolation settings. Reconstruct native logits with bilinear interpolation and `align_corners=False` **before** applying sigmoid or a threshold. Compression is lossless; probabilities are not quantized. `metrics.json` retains per-image IoUs under `per_sample` and adds precision, recall, area ratio, and relative area error under `per_sample_metrics`. Final evaluation does not change validation-based model selection.
-
-`IoU.py` remains an evaluation alias. `bake_exif.py` remains an optional dataset utility; the loader already applies EXIF orientation at runtime. The old hard-coded `countnum.py` is replaced by preflight.
-
-## Threshold calibration
-
-For each FTC/CM checkpoint, sweep probability thresholds 0.10–0.90 in increments of 0.05 on validation:
-
-```bash
-uv run --frozen python -m diagnostics.thresholds validation --checkpoint /path/to/model.pt --data-root /path/to/vizwiz --output-dir outputs/calibration/model_val
-uv run --frozen python -m diagnostics.thresholds test --checkpoint /path/to/model.pt --data-root /path/to/vizwiz --selection outputs/calibration/model_val/selection.json --output-dir outputs/calibration/model_test
-```
-
-Use the saved logits to calibrate without loading a checkpoint or running the encoders:
-
-```bash
-uv run --frozen python -m diagnostics.thresholds validation --predictions outputs/revision/cm_separate_s42/val --data-root /path/to/vizwiz --device cpu --output-dir outputs/calibration/cached_val
-uv run --frozen python -m diagnostics.thresholds test --predictions outputs/revision/cm_separate_s42/test --data-root /path/to/vizwiz --device cpu --selection outputs/calibration/cached_val/selection.json --output-dir outputs/calibration/cached_test
-```
-
-`--predictions` replaces `--checkpoint`. The dataset is still needed for ground-truth masks and image alignment. Hub restoration includes the cached logits and metrics, so this also works on a replacement machine.
-
-Validation exports overlap counts, mIoU, Acc@0.5, macro precision/recall, severe failures, mask-area ratio, relative area error, and PDF curves. Selection maximizes validation mIoU; ties favor the threshold closest to 0.5, then the lower threshold. `selection.json` binds the selected threshold to the checkpoint SHA. Test evaluates only that threshold and 0.5. A `--limit` smoke run cannot produce a calibration selection. Ratios with zero ground-truth area are null and excluded from area-ratio means, with support reported.
-
-## Question dependence and relation roles
-
-Generate a single validation donor mapping and reuse it for every model:
-
-```bash
-uv run --frozen python -m diagnostics.questions --checkpoint /path/to/model.pt --data-root /path/to/vizwiz --donors outputs/diagnostics/donors_val_s2027.json --output-dir outputs/diagnostics/model_questions
-uv run --frozen python -m diagnostics.roles --checkpoint /path/to/cm_model.pt --data-root /path/to/vizwiz --output-dir outputs/diagnostics/model_roles
-```
-
-Question conditions are original, repeated original, a fixed no-self permutation (seed 2027), generic, and empty. Identical normalized donor questions are excluded from shuffled-condition means and counted. The intervention changes `text`, the input actually consumed by CM/FTC. Cached image features are checked against ordinary forward inference on the first batch; `--no-cache-images` disables reuse. Changed-question IoU against the original mask is descriptive sensitivity, not ordinary grounding accuracy.
-
-Role diagnostics require CM with membership enabled and use validation only. They export include/exclude/neutral frequencies, mean probabilities, balanced soft loss, hard-target confusion and macro recall, and native mask-area error across the five paper target-size bins. Hard targets use argmax of the existing fractional role targets, with deterministic index-order ties. No background-clutter category is inferred.
-
-## Efficiency
-
-```bash
+uv run --frozen python -m diagnostics.questions --checkpoint /path/to/best.pt --data-root /path/to/vizwiz --donors outputs/donors_val.json --output-dir outputs/questions
+uv run --frozen python -m diagnostics.roles --checkpoint /path/to/cm_best.pt --data-root /path/to/vizwiz --output-dir outputs/roles
 uv run --frozen python -m diagnostics.benchmark --device cuda --output outputs/benchmark_fp32.json
-uv run --frozen python -m diagnostics.benchmark --device cuda --precision fp16 --output outputs/benchmark_fp16.json
 ```
 
-The benchmark covers FTC, both full CM variants, the capacity control, and a benchmark-only replicated U-Net adapter. It uses pretrained CLIP and initialized decoder weights, a fixed question, batch 1, 336×336 input, 10 warm-ups, 50 measurements, and disabled TF32. This is structural timing, not an accuracy evaluation. Use the same GPU and settings for all models.
+Question diagnostics intervene on the actual text, including repeated, shuffled, generic, and empty questions; identical shuffled texts are excluded. Preserve the shared donor mapping for comparable conditions. Relation-role diagnostics report include/exclude/neutral statistics and mask errors by five target-size bins; they require membership-enabled CM. Benchmarking covers FTC, CM-Shared, CM-Separate, capacity control, and the replicated U-Net, reporting full/decoder latency, memory, throughput, and parameters. FP16 is a separate measurement via `--precision fp16`. Decoder timing caches encoder/fusion outputs; full timing includes text encoding and excludes input-file loading/native resizing.
 
-Model-forward timing includes tokenization/text encoding but excludes file loading, host-to-device input-image transfer, and native-output resizing. Decoder timing uses cached image/text/fusion inputs and excludes encoders and bottleneck cross-attention. Peak allocated/reserved CUDA bytes include resident model/input memory; decoder measurements also include cached inputs. Throughput is the reciprocal of mean batch-1 latency. CPU/tiny timings are smoke checks, not deployment measurements.
-
-## Verification and exports
-
-The offline tests preserve CM/FTC reference outputs and test current-format reconstruction, disabled paths and gradients, selection/resume, donor interventions, role/threshold metrics, and mocked Hub backup/recovery. Opt-in hardware checks:
+## Tests and repository layout
 
 ```bash
-uv run --frozen torchrun --standalone --nproc_per_node=2 --module tests.smoke.ddp /path/to/vizwiz
-uv run --frozen python -m tests.smoke.decoder_gpu
+uv run --frozen python -m unittest discover -s tests -v
 ```
 
-The DDP validation smoke uses a tiny model and the provided validation split; CPU local sockets must be available. For a quick check, use the synthetic split generated by `tests.support.fixture_data`. `tests/smoke/decoder_gpu.py` checks full-size CM decoder gradients without training CLIP.
+Offline tests use tiny encoders and synthetic masks. They cover reference CM/FTC behavior, ablations, gradients, capacity counts, native metrics, validation selection, lossless logits, calibration, fresh campaigns, research-only uploads, and notebook setup/interruption. CUDA measurements and the full study require the target hardware.
 
-Export records/results by default; opt into checkpoints when transferring a resumable session:
-
-```bash
-uv run --frozen python -m experiments.export --root outputs/revision --output /path/outside/revision/results.zip
-uv run --frozen python -m experiments.export --root outputs/revision --output /path/outside/revision/resume.zip --include-checkpoints
-```
-
-See [Kaggle guide](docs/kaggle.md) and [Vast.ai guide](docs/vast.md) for commands calling these same tools. Full dataset training, CUDA timing, and scientific results must be obtained on the intended hardware before updating the paper.
-
-See [verification report](docs/verification.md) for completed checks and remaining GPU validation.
+Root scripts/shared files remain directly in the repository, with `models/`, `experiments/`, `diagnostics/`, `configs/`, `docs/`, and `tests/` as folders. See [structure](docs/structure.md), [Kaggle](docs/kaggle.md), [Vast](docs/vast.md), and [verification](docs/verification.md).

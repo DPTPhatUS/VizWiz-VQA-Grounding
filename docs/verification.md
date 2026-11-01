@@ -1,50 +1,20 @@
-# Implementation verification — 1 November 2026
+# Verification — 2 November 2026
 
-Implementation target: `exp/context-membership`, based on commit `6a1736850729d3e90871345b3bc08c887ebef77e`. Changes are in this worktree. The full training campaign has not been launched.
+The branch now implements a fresh-start research workflow. The Vast notebook requires a new workspace and always clones the source, installs the environment, downloads/extracts data, deletes the ZIP, and trains selected models from scratch. If an attempt fails, the user deletes the workspace and starts again.
 
-The file reorganization starts from `a1db5e6ce3b49ad1e08dca24324c80fc58a0a5b1`. Implementation scripts and shared files remain directly in the repository root; `models/`, `experiments/`, `diagnostics/`, `configs/`, `docs/`, and `tests/` are root-level folders. See [structure.md](structure.md) for every file's purpose.
+The experiment matrix remains thirteen runs at 30 epochs: FTC, CM-Shared, and CM-Separate each use seeds 42/123/456; component ablations and the capacity control use seed 42. Training/validation math, native evaluation, initialization, and decoder parameter counts are preserved. Only validation-selected `best.pt` is saved.
 
-## Current workflow
+## Completed checks
 
-- One checkpoint format, `format_version=1`, records explicit model/component settings and a persistent run UUID. Old checkpoint adapters, raw-state inference, metadata normalization, and old-schema round-trip tests have been removed. Original checkpoint files remain untouched.
-- CM/FTC reference fixtures preserve architecture initialization/output checks independently of checkpoint-format support. Disabling components still preserves common initial weights.
-- The thirteen-run preset uploads **after each completed run**, following selected-checkpoint validation and test evaluation, to the public model repository `Last-Bullet/vizwiz-cm-aciids-2027`. There are no automatic intermediate-epoch uploads. Manual intermediate backup and restoration are available.
-- The preset uses 30 epochs for all thirteen runs. FTC, CM-Shared, and CM-Separate each use seeds 42, 123, and 456; the component ablations and capacity control use seed 42. The cohort and remote prefix are `matched-30ep-v1`; direct training also defaults to 30 epochs.
-- Kaggle and Vast.ai use the same launcher, lockfile, and training recipe. The Vast notebook fixes execution to one GPU/process; Kaggle retains its two-GPU commands. The launcher checks Hub write access before training; credentials come from the training machine's environment or Hugging Face login.
+- **35 offline tests passed.** Coverage includes exact CM/FTC reference behavior, shared/separate initialization, bypasses and gradient paths, capacity counts, zero auxiliary weight, native-grid metrics, validation-only selection and earlier-epoch ties, validation preserving training, question interventions/donors, role targets/borders, selected-model round trips, fresh training/evaluation/prediction, and actual command entry points.
+- Saved logits are lossless float32 arrays and reproduce native-grid counts across all 17 thresholds on CPU. Calibration reads them without loading model weights. Optional PNG export is checked against the native predictions.
+- Two consecutive synthetic campaigns both train and evaluate from scratch in different timestamped folders. A simulated upload failure stops the attempt; the next attempt trains again. Selected-model tensors match across same-seed fresh runs.
+- In-memory Hugging Face tests check the exact uploaded research files and final summary. No continuation checkpoint, optimizer state, backup/status manifest, custom artifact version, application hash, or automatic archive is generated.
+- Notebook tests check unconditional clone/install, a new workspace requirement, fresh dataset download/extraction with ZIP deletion, token inheritance without command/config exposure, and interruption of the foreground process group.
+- The notebook passed nbformat validation and a real local Jupyter execution with a tiny CPU model. Source/environment setup and cloud transfers were simulated. Actual training, validation/test export, and study summarization ran; simulated uploads contained the selected model, settings/history, both splits' metrics/logits, and summary.
 
-- Final `best.pt` evaluation now saves full validation and test metrics, native binary masks, and per-image lossless float32 model-grid logits. Logits retain filenames, original sizes, and checkpoint identity and are included in completed-run Hub backups. Threshold calibration accepts `--predictions` to use them without checkpoint/model inference. Per-epoch training validation still logs aggregate mIoU only.
+Decoder parameter counts remain FTC 690,753; CM-Shared 942,953; CM-Separate 1,120,585; FTC capacity 1,120,845. The capacity control differs from CM-Separate by 260 parameters.
 
-## Checks completed
+Full-suite output: `/tmp/cm-fresh-full-tests.log`. Targeted behavior checks: `/tmp/cm-fresh-targeted.log`. Jupyter smoke output: `/tmp/cm-fresh-jupyter.log`, with artifacts in `/tmp/cm-fresh-jupyter/`.
 
-- **41 offline tests passed.** Coverage includes CM/FTC reference outputs, component bypasses and gradients, capacity counts, zero auxiliary loss, current checkpoint reconstruction and rejection of incomplete metadata, nonpersistent CLIP position buffers, training/resume, validation logging, native metrics, validation-only threshold selection, question interventions, and fractional/empty/full role targets. Command tests exercise real subprocess entry points, manifest launch/resume/summary, and matching script/module native predictions. Four Vast tests cover the fixed ZIP layout and interrupted extraction, notebook-only source bootstrap and process-group interruption, and a real tiny CPU train/test/upload-retry/restore pipeline. The notebook skips the separate preflight without changing training or checkpoint selection. Three saved-prediction tests cover lossless float32 round trips, exact native-grid counts across all 17 thresholds, cached calibration without loading weights, and partial-export detection.
-- **`vast.ipynb` passed nbformat schema validation and a real local Jupyter execution.** Cloud downloads and environment installation were simulated, while the foreground runner performed one actual tiny CPU training epoch, validation/test evaluation, summary, and record export against an in-memory Hub. This verifies notebook execution/process handling, not real instance provisioning, GPU capacity, or remote transfers. The tracked notebook contains no execution outputs.
-- **Ten tiny-encoder model variants retained bit-identical outputs and losses:** both parameter-sharing modes with all context/membership combinations, FTC, and the capacity control. Inputs, weights, outputs, and losses were captured before the reorganization and checked after it. Current-format checkpoint metadata and parameter counts are unchanged.
-- **Hub behavior passed against an in-memory, commit-addressed Hub:** one upload after training and final validation/test evaluation; inclusion of latest/best, hashes, both splits' metrics and indexed logits, and manifest records; exclusion of image PNGs; unchanged-upload detection; interrupted transfers and retry; manual intermediate snapshots; pinned historical restoration; corrupt-download rejection; run-identity protection; rejection of older progress; and continuation from a restored checkpoint. No live model repository or checkpoints were published by these tests.
-- **Synthetic launcher pipeline passed:** preflight → two-epoch tiny FTC training → validation-selected checkpoint → native-grid validation/test metrics and logits → one mocked final Hub commit. A completed-run `--resume` skipped training/evaluation and did not create a duplicate commit. Deleting one logit reran only its split and reproduced the same backup contents.
-- **Two-process CPU/Gloo validation passed through the relocated smoke command:** on a three-image synthetic split, shards `[0, 2]` and `[1]` gave the same mIoU as single-process evaluation, `0.20419414062862992`.
-- **Two-process training passed through the final root-level launcher:** FTC and CM-Separate each completed two epochs, per-epoch validation, rolling checkpoints, and native-grid test export. Their trained tensors were bit-identical across the tested intermediate/final file layouts. Uploading occurs after the distributed training process exits.
-- **Diagnostic CLI checks passed with the final paths:** validation threshold selection and fixed-threshold test evaluation, question conditions, role diagnostics, tiny CPU benchmark, seed-summary JSON/CSV, and record export. Those values are smoke results, not scientific findings.
-- The dependency lock check passed offline with 65 packages, including an explicit dependency on the already-locked Hugging Face Hub version.
-
-CPU tests used the workspace's existing Python environment: Python 3.12.10, PyTorch 2.12.1, torchvision 0.27.1, Transformers 5.13.0, Hugging Face Hub 1.22.0, NumPy 2.5.1, Pillow 12.3.0, and Matplotlib 3.11.0. No CUDA device was available. The local DDP checks required localhost socket access outside the default network-restricted sandbox.
-
-## Parameter checks
-
-| Decoder | Registered parameters |
-|---|---:|
-| FTC | 690,753 |
-| CM-Shared | 942,953 |
-| CM-Separate | 1,120,585 |
-| FTC capacity control | 1,120,845 |
-
-The capacity control adds 430,092 active parameters to FTC and differs from CM-Separate by 260 parameters. Ablations report registered/trainable counts separately because disabled modules stay registered for stable initialization.
-
-## Cleanup and remaining work
-
-The hard-coded `countnum.py` was replaced by preflight dataset checks, and the blanket `tests/` ignore rule was removed. Shared inference/metric/backup helpers replace duplicate paths. `IoU.py`, prediction/overlay tools, and the EXIF utility are retained. Datasets, original checkpoints, result archives, the manuscript, and unrelated workspace changes were preserved.
-
-The former `revision/` folder is split into experiment orchestration and diagnostics. Its manifest moves to `configs/`. `utils.py` is split into checkpoint, runtime, and artifact responsibilities. Root script names, the current checkpoint format, and output-directory conventions are retained. Documentation links, Python source parsing, the dependency lock, and `git diff --check` passed.
-
-Live Hub authentication/large-file transfers, CUDA/NCCL training, GPU decoder checks, FP16/FP32 latency and memory measurements, and the full thirteen-run study remain to be exercised on the intended Kaggle/Vast.ai machines. No minimum GPU-memory requirement or actual cloud runtime is inferred from CPU smoke tests.
-
-Current offline test output is recorded temporarily in `/tmp/cm-logit-full-tests.log`. The updated-notebook Jupyter smoke log is `/tmp/cm-logit-jupyter.log`, with artifacts under `/tmp/cm-logit-jupyter/`; its CPU run saved both splits' metrics, PNG masks, and logits and made one in-memory Hub commit containing both logit exports. Earlier structure/distributed/diagnostic logs use `/tmp/cm-structure-*.log`, with synthetic artifacts under `/tmp/cm-structure-smoke/`. The pre-refactor comparison inputs are in `/tmp/cm-structure-reference.pt`. Earlier `/tmp/cm-revision-smoke/` artifacts predate the checkpoint-format change and should not be used with this workflow.
+No scientific training campaign, real GPU measurement, or live Hugging Face upload was launched locally. Those remain for the intended Vast/Kaggle hardware. Existing datasets, checkpoints, result archives, and manuscript files were preserved.

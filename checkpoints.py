@@ -1,14 +1,12 @@
-"""Strict study-checkpoint reconstruction and resumable-state IO."""
+"""Selected-model checkpoint loading, reconstruction, and saving."""
 import os
 from pathlib import Path
 import torch
 
-CHECKPOINT_VERSION = 1
-
 
 def validate_checkpoint(saved):
-    if not isinstance(saved, dict) or saved.get('format_version') != CHECKPOINT_VERSION:
-        raise ValueError('Expected a format_version=1 study checkpoint; start a fresh run with this branch')
+    if not isinstance(saved, dict):
+        raise ValueError('Expected a saved model dictionary')
     for key in ('model_state_dict', 'experiment_config', 'run_config'):
         if not isinstance(saved.get(key), dict):
             raise ValueError(f'Checkpoint requires a {key} dictionary')
@@ -44,7 +42,7 @@ def load_model_weights(model, saved, assign=False):
 def model_from_checkpoint(saved):
     from models.factory import build_model
     options = model_options(saved)
-    # Avoid allocating a second CLIP copy alongside optimizer-heavy resumable files.
+    # Construct without a second copy of pretrained CLIP weights.
     with torch.device('meta'):
         restored = build_model(**options, pretrained=False)
     load_model_weights(restored, saved, assign=True)
@@ -72,10 +70,7 @@ def save_checkpoint(path, saved):
     os.replace(temporary, path)
 
 
-def checkpoint_metadata(path):
-    """Inspect resumable files without allocating their tensor storage."""
-    from torch._subclasses.fake_tensor import FakeTensorMode
-    with FakeTensorMode():
-        saved = read_checkpoint(path)
-    return {key:value for key,value in saved.items()
-            if key not in ('model_state_dict','optimizer_state_dict','scaler_state_dict')}
+def checkpoint_info(path, saved):
+    """Plain experiment name and selected epoch for saved results."""
+    return {'run':saved['run_config'].get('run_id', Path(path).parent.name),
+            'epoch':saved.get('epoch')}

@@ -1,8 +1,7 @@
 """Shared inference arguments, outputs, and provenance."""
 import torch
 from dataset import VizWizGroundingDataset, make_loader
-from checkpoints import read_checkpoint, model_from_checkpoint
-from artifacts import sha256_file
+from checkpoints import read_checkpoint, model_from_checkpoint, checkpoint_info
 from runtime import environment, parameter_counts
 
 
@@ -23,13 +22,14 @@ def load_inference(args, split):
     saved = read_checkpoint(args.checkpoint)
     model = model_from_checkpoint(saved)
     size = saved['run_config']['image_size']
+    info = checkpoint_info(args.checkpoint,saved)
     del saved
     device = torch.device(args.device)
     model.to(device).eval()
     dataset = VizWizGroundingDataset(args.data_root, split, size)
     sampler = list(range(min(args.limit,len(dataset)))) if args.limit else None
     loader = make_loader(dataset,args,args.batch_size,sampler=sampler)
-    metadata = {'checkpoint':str(args.checkpoint), 'checkpoint_sha256':sha256_file(args.checkpoint),
+    metadata = {'checkpoint':info,
                 'experiment_config':model.experiment_config, 'split':split, 'limit':args.limit,
                 'parameters':parameter_counts(model), 'environment':environment()}
     return model, dataset, loader, device, metadata

@@ -1,16 +1,7 @@
-"""Artifact hashes, atomic JSON records, and protected output directories."""
-import hashlib
+"""Atomic JSON records and output directories."""
 import json
 import os
 from pathlib import Path
-
-
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with Path(path).open('rb') as stream:
-        for chunk in iter(lambda: stream.read(8 << 20), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def write_json(path, value):

@@ -1,13 +1,14 @@
 """Evaluate this branch's checkpoint with question-only text and export masks."""
 import argparse
 import json
+import os
 from pathlib import Path
 import torch
 from dataset import VizWizGroundingDataset, make_loader
-from checkpoints import read_checkpoint, model_from_checkpoint
-from artifacts import sha256_file, write_json
-from runtime import environment
+from checkpoints import read_checkpoint, model_from_checkpoint, checkpoint_info
+from artifacts import write_json
 from metrics import evaluate_counts, summarize_counts, sample_metrics
+from runtime import environment
 from predictions import LogitWriter
 
 
@@ -20,32 +21,34 @@ def eval_main(argv=None):
     parser.add_argument("--num-workers",type=int,default=4)
     parser.add_argument("--device",default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir",required=True)
+    parser.add_argument('--save-masks', action='store_true', help='Also export native binary PNG masks')
     args = parser.parse_args(argv)
     if args.batch_size <= 0 or args.num_workers < 0:
         raise ValueError("Invalid batch size or worker count")
     saved = read_checkpoint(args.checkpoint)
     config = saved["run_config"]
-    epoch = saved.get('epoch')
+    info = checkpoint_info(args.checkpoint,saved)
+    record_path = Path(args.checkpoint).parent/'run.json'
+    if not record_path.exists():
+        write_json(record_path,{'run_config':config,'experiment':saved['experiment_config'],
+                               'provenance':saved.get('provenance') or environment()})
     model = model_from_checkpoint(saved)
     del saved
     device = torch.device(args.device); model.to(device)
     dataset = VizWizGroundingDataset(args.data_root,args.dataset,config['image_size'])
     loader = make_loader(dataset,args,args.batch_size)
     out = Path(args.output_dir); out.mkdir(parents=True,exist_ok=True)
-    checkpoint_sha256 = sha256_file(args.checkpoint)
-    logits = LogitWriter(out/'logits', args.dataset, checkpoint_sha256, config['image_size'])
-    counts = evaluate_counts(model,loader,device,out,logit_writer=logits)
+    logits = LogitWriter(out/'logits', args.dataset, info, config['image_size'])
+    counts = evaluate_counts(model,loader,device,out if args.save_masks else None,logit_writer=logits)
     logits.finish()
-    scores = {name: sample_metrics(row)["iou"] for name,row in counts.items()}
     summary = {**summarize_counts(counts),
                "dataset":args.dataset,"metric_resolution":"original",
-               "text_mode":"question","checkpoint":str(args.checkpoint),
-               "checkpoint_sha256":checkpoint_sha256, "checkpoint_epoch":epoch,
-               "threshold":.5, "environment":environment(),
-               "experiment_config":model.experiment_config}
-    write_json(out/'metrics.json', {'summary':summary, 'per_sample':scores,
-        'per_sample_metrics':{name:sample_metrics(row) for name,row in counts.items()},
-        'counts':counts, 'logits':'logits/index.json'})
+               "text_mode":"question","checkpoint":info,
+               "threshold":.5}
+    write_json(out/'metrics.json', {'summary':summary,
+        'run':os.path.relpath(record_path,out),
+        'per_sample':{name:{**row, **sample_metrics(row)} for name,row in counts.items()},
+        'logits':'logits/index.json', 'masks':args.save_masks})
     print(json.dumps(summary),flush=True)
 
 

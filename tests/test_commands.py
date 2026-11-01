@@ -32,7 +32,7 @@ class CommandTests(unittest.TestCase):
     def test_public_script_and_module_commands_resolve_and_preserve_options(self):
         scripts = {'train.py':'train', 'eval.py':'eval', 'IoU.py':'eval',
                    'predict_save.py':'predict_save', 'visualize_predictions.py':'visualize_predictions',
-                   'preflight.py':'preflight', 'bake_exif.py':'bake_exif'}
+                   'preflight.py':'preflight', 'bake_exif.py':'bake_exif', 'predictions.py':'predictions'}
         commands = [(script,'--help') for script in scripts]
         commands += [('-m',name,'--help') for name in sorted(set(scripts.values()))]
         commands += [('-m',f'experiments.{name}','--help')
@@ -46,11 +46,11 @@ class CommandTests(unittest.TestCase):
             self.assertEqual(flags(reports[(script,'--help')]),
                              flags(reports[('-m',name,'--help')]))
 
-    def test_manifest_launch_resume_and_summary_through_subprocesses(self):
+    def test_fresh_campaign_and_summary_through_subprocesses(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);data=fixture_data(root/'data')
             manifest={'name':'structure-smoke','common':{'tiny':True,'num_epochs':2,'batch_size':2,
-                'lr':1e-5,'num_workers':0,'val_every':1,'checkpoint_policy':'rolling'},
+                'lr':1e-5,'num_workers':0,'val_every':1},
                 'runs':[{'id':'context_only_s42','model':'cm','connection_mode':'separate',
                          'disable_membership':True,'seed':42}]}
             path=root/'manifest.json';path.write_text(json.dumps(manifest))
@@ -58,15 +58,18 @@ class CommandTests(unittest.TestCase):
                   '--data-root',str(data),'--output-root',str(root/'runs'),
                   '--device','cpu','--processes','1','--no-hub')
             run_command(*args)
-            folder=root/'runs/context_only_s42'
-            for name in ('latest.pt','best.pt','run.json','history.jsonl','manifest_run.json',
+            campaign=next((root/'runs').iterdir());folder=campaign/'context_only_s42'
+            for name in ('best.pt','run.json','history.jsonl',
                          'val/metrics.json','test/metrics.json','val/logits/index.json','test/logits/0.npz'):
                 self.assertTrue((folder/name).is_file(),name)
-            history=(folder/'history.jsonl').read_bytes()
-            run_command(*args,'--resume')
-            self.assertEqual((folder/'history.jsonl').read_bytes(),history)
+            self.assertFalse((folder/'manifest_run.json').exists())
+            self.assertFalse(list(folder.glob('*.sha256.json')))
+            self.assertEqual(json.loads((folder/'run.json').read_text())['study'],'structure-smoke')
+            run_command('predictions.py','--predictions',str(folder/'val'),'--output-dir',str(root/'masks'))
+            self.assertTrue((root/'masks/0.png').is_file())
+            self.assertFalse((folder/'latest.pt').exists())
             run_command('-m','experiments.summarize','--manifest',str(path),
-                        '--root',str(root/'runs'),'--output-dir',str(root/'summary'))
+                        '--root',str(campaign),'--output-dir',str(root/'summary'))
             result=json.loads((root/'summary/summary.json').read_text())
             self.assertEqual(len(result['runs']),1)
             self.assertEqual(result['missing_runs'],[])
@@ -76,7 +79,7 @@ class CommandTests(unittest.TestCase):
             root=Path(tmp);data=fixture_data(root/'data')
             torch.manual_seed(42);model=build_model('ftc',tiny=True)
             checkpoint=root/'model.pt'
-            save_checkpoint(checkpoint,{'format_version':1,'model_state_dict':model.state_dict(),
+            save_checkpoint(checkpoint,{'model_state_dict':model.state_dict(),
                 'experiment_config':model.experiment_config,'run_config':{'image_size':32}})
             common=('--checkpoint',str(checkpoint),'--image',str(data/'val/0.jpg'),
                     '--question','What color?','--device','cpu')

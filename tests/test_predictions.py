@@ -15,11 +15,11 @@ from torch import nn
 
 import eval as evaluation
 from checkpoints import save_checkpoint
-from dataset import VizWizGroundingDataset, collate_samples, make_loader
+from dataset import VizWizGroundingDataset, make_loader
 from diagnostics import thresholds
 from metrics import evaluate_counts, native_logits, overlap_counts
 from models.factory import build_model
-from predictions import LogitWriter, SavedLogits, evaluation_complete
+from predictions import LogitWriter, SavedLogits
 from tests.support import fixture_data
 
 
@@ -46,8 +46,12 @@ class SavedPredictions(unittest.TestCase):
                 self.assertEqual(arrays['logits'].dtype, np.float32)
                 np.testing.assert_array_equal(arrays['logits'], raw[0,0].numpy())
                 np.testing.assert_array_equal(arrays['original_size'], [5,7])
-                self.assertEqual(arrays['filename'].item(), 'a.jpg')
+                self.assertEqual(set(arrays.files), {'logits','original_size'})
+            saved.export_masks(root/'exported')
             for name, logits, truth in native_logits(raw, batch):
+                from PIL import Image
+                with Image.open(root/'exported'/Path(name).with_suffix('.png')) as image:
+                    np.testing.assert_array_equal(np.asarray(image)>0, saved.native(name).numpy()>0)
                 restored = saved.native(name)
                 torch.testing.assert_close(restored, logits, rtol=0, atol=0)
                 for p in thresholds.THRESHOLDS:
@@ -63,7 +67,7 @@ class SavedPredictions(unittest.TestCase):
             torch.manual_seed(42)
             model = build_model('ftc', tiny=True).eval()
             checkpoint = root/'best.pt'
-            save_checkpoint(checkpoint, {'format_version':1, 'epoch':17,
+            save_checkpoint(checkpoint, {'epoch':17,
                 'model_state_dict':model.state_dict(), 'experiment_config':model.experiment_config,
                 'run_config':{'image_size':32}})
             for split in ('val','test'):
@@ -71,9 +75,15 @@ class SavedPredictions(unittest.TestCase):
                     '--dataset',split,'--device','cpu','--num-workers','0',
                     '--batch-size','2','--output-dir',str(root/split)])
                 result = json.loads((root/split/'metrics.json').read_text())
-                self.assertEqual(result['summary']['checkpoint_epoch'],17)
-                self.assertEqual(set(result['per_sample_metrics']),set(result['per_sample']))
-                self.assertTrue(evaluation_complete(root/split,result['summary']['checkpoint_sha256'],split))
+                self.assertEqual(result['summary']['checkpoint']['epoch'],17)
+                self.assertNotIn('per_sample_metrics',result)
+                self.assertNotIn('counts',result)
+                self.assertNotIn('environment',result['summary'])
+                self.assertNotIn('experiment_config',result['summary'])
+                self.assertIn('iou',result['per_sample']['0.jpg'])
+                self.assertIn('intersection',result['per_sample']['0.jpg'])
+                self.assertFalse((root/split/'0.png').exists())
+                self.assertTrue((root/split/result['run']).is_file())
             dataset = VizWizGroundingDataset(data,'val',32)
             args = SimpleNamespace(num_workers=0,device='cpu')
             live = thresholds.sweep(model,make_loader(dataset,args,2),torch.device('cpu'),thresholds.THRESHOLDS)
@@ -89,23 +99,11 @@ class SavedPredictions(unittest.TestCase):
             report = json.loads((root/'calibration/results.json').read_text())
             self.assertEqual(report['counts'],live)
             fixed = json.loads((root/'calibrated-test/results.json').read_text())
-            self.assertEqual(fixed['counts']['0.50'],json.loads((root/'test/metrics.json').read_text())['counts'])
+            samples=json.loads((root/'test/metrics.json').read_text())['per_sample']
+            expected={name:{key:row[key] for key in ('intersection','predicted','ground_truth','pixels')} for name,row in samples.items()}
+            self.assertEqual(fixed['counts']['0.50'],expected)
             self.assertEqual(json.loads(selection.read_text())['split'],'val')
 
-    def test_partial_export_is_not_marked_complete(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            writer = LogitWriter(root/'logits','val','sha',336)
-            writer.save('a.jpg',torch.zeros(2,2),(5,7))
-            writer.finish()
-            metrics = {'summary':{'checkpoint_sha256':'sha'}, 'per_sample':{'a.jpg':0.},
-                       'logits':'logits/index.json'}
-            (root/'metrics.json').write_text(json.dumps(metrics))
-            self.assertTrue(evaluation_complete(root,'sha','val'))
-            (root/'logits/a.npz').unlink()
-            self.assertFalse(evaluation_complete(root,'sha','val'))
-            with self.assertRaisesRegex(ValueError,'different checkpoint'):
-                evaluation_complete(root,'other-sha','val')
 
 
 if __name__ == '__main__':

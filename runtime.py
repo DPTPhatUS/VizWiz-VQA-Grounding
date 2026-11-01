@@ -1,5 +1,4 @@
 """Device transfer, parameter accounting, and reproducible source/environment records."""
-import hashlib
 import importlib.metadata
 import platform
 import subprocess
@@ -26,14 +25,9 @@ def environment():
     def git(*args):
         result = subprocess.run(['git', '-C', str(root), *args], capture_output=True, text=True)
         return result.stdout.strip() if result.returncode == 0 else None
-    digest = hashlib.sha256()
-    for path in sorted(root.rglob('*.py')):
-        if any(part in ('.venv', '__pycache__', 'tests', 'outputs', 'results') for part in path.relative_to(root).parts):
-            continue
-        digest.update(str(path.relative_to(root)).encode()); digest.update(path.read_bytes())
     return {'python': sys.version, 'platform': platform.platform(), 'versions': versions,
             'git_commit': git('rev-parse', 'HEAD'), 'git_dirty': bool(git('status', '--porcelain')),
-            'source_sha256': digest.hexdigest(), 'cuda_version': torch.version.cuda}
+            'cuda_version': torch.version.cuda}
 
 
 def parameter_counts(model):
