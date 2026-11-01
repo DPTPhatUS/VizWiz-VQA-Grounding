@@ -10,7 +10,7 @@ Command scripts and shared implementation files live directly in the repository 
 ├── pyproject.toml                    Python requirement and dependencies
 ├── uv.lock                           Locked dependencies shared by Linux, Kaggle, and Vast.ai
 ├── .gitignore                        Excludes datasets, generated results, and Python caches
-├── vast.ipynb                        Vast.ai settings, source/data setup, GPU probe, Run All, monitoring
+├── vast.ipynb                        Standalone Vast.ai notebook: settings and a single run cell
 │
 ├── train.py                          Argument resolution, Adam training, resume, best/latest selection
 ├── eval.py                           Selected-checkpoint evaluation, native masks, metric export
@@ -44,7 +44,7 @@ Command scripts and shared implementation files live directly in the repository 
 │   ├── launch.py                     Manifest selection, preflight/train/test processes, final upload
 │   ├── summarize.py                  Seed metrics, sample standard deviations, paired CM–FTC changes
 │   ├── hub.py                        Completed-run/manual Hub upload and verified pinned restore
-│   ├── vast.py                       Notebook data preparation, resource checks, resumable worker
+│   ├── vast.py                       Fixed ZIP layout, sequential single-GPU launch, automatic resume
 │   └── export.py                     Result archives, optionally including checkpoint payloads
 │
 ├── diagnostics/
@@ -61,7 +61,7 @@ Command scripts and shared implementation files live directly in the repository 
 ├── docs/
 │   ├── structure.md                  This guide: file ownership and command migration
 │   ├── kaggle.md                     Notebook setup, secrets, launch, backup/restore, exports
-│   ├── vast.md                       SSH setup, tmux, launch, backup/restore, storage handling
+│   ├── vast.md                       Upload-only notebook setup, settings, rerunning, result locations
 │   ├── verification.md               Completed checks and remaining hardware/live-transfer work
 │   └── assets/
 │       └── task.png                  Existing task illustration
@@ -73,7 +73,7 @@ Command scripts and shared implementation files live directly in the repository 
     ├── test_experiments.py           Model controls, objectives, metrics, diagnostics, selection, presets
     ├── test_hub.py                   Offline Hub, transfer failures, restoration, final-upload flow
     ├── test_commands.py              Script/module entry points and real subprocess launch behavior
-    ├── test_vast.py                  Notebook Run All/reattachment, ZIP handling, fit probe, worker resume
+    ├── test_vast.py                  Notebook bootstrap/interrupt, ZIP retry, launch/upload retry, restore
     ├── fixtures/
     │   ├── cm_reference.pt           Tiny CM reference weights, inputs, and outputs
     │   └── ftc_reference.pt          Tiny FTC reference weights, inputs, and outputs
@@ -85,7 +85,7 @@ Command scripts and shared implementation files live directly in the repository 
 
 ## How the files fit together
 
-The launcher reads the manifest and runs `preflight.py`, `train.py`, and `eval.py`. Those scripts share the dataset, model factory, losses, validation, and native-grid metrics. The checkpoint loader reconstructs each architecture from explicit settings. Diagnostics use that same loader. The Hub uploader runs after training/test processes exit and publishes latest/best checkpoints, run records, and final metrics together.
+The launcher reads the manifest and runs `preflight.py`, `train.py`, and `eval.py`. The Vast notebook uses `--skip-preflight` to start training directly. Those scripts share the dataset, model factory, losses, validation, and native-grid metrics. The checkpoint loader reconstructs each architecture from explicit settings. Diagnostics use that same loader. The Hub uploader runs after training/test processes exit and publishes latest/best checkpoints, run records, and final metrics together.
 
 Changes to CM computation belong in `models/connections.py` or `models/mask_decoder.py`. A new supported model choice belongs in `models/factory.py` and its implementation file. Study-matrix changes belong in `configs/high_priority.json`. Calibration and question-sensitivity changes belong in `diagnostics/`. Platform instructions belong in `docs/` and call the same root scripts and tools.
 

@@ -39,6 +39,7 @@ def main(argv=None):
     parser.add_argument('--device',choices=('cpu','cuda'),default='cuda')
     parser.add_argument('--processes',type=int,default=1)
     parser.add_argument('--resume',action='store_true');parser.add_argument('--dry-run',action='store_true')
+    parser.add_argument('--skip-preflight',action='store_true',help='Start training without the separate data/forward/backward preflight')
     parser.add_argument('--no-hub',action='store_true',help='Disable the manifest\'s Hugging Face backups')
     parser.add_argument('--hf-repo',help='Override the manifest\'s Hub repository')
     parser.add_argument('--hf-prefix',help='Override the study path inside the Hub repository')
@@ -67,6 +68,8 @@ def main(argv=None):
             if args.resume and not (out/'latest.pt').is_file():raise ValueError(f'Missing resumable checkpoint: {out}')
             if not args.resume and out.exists() and any(out.iterdir()):raise ValueError(f'Refusing to reuse {out}')
         steps=commands(manifest,run,data_root,out,args.device,args.processes,args.resume)
+        if args.skip_preflight:
+            steps=steps[1:]
         destination = None
         if hub:
             from experiments.hub import hub_path
@@ -90,8 +93,8 @@ def main(argv=None):
             if previous is not None and previous['epoch'] > saved['epoch']:
                 raise ValueError('Hub backup is newer than local progress; download before resuming')
         if not complete:
-            for command in steps[:2]:subprocess.run(command,cwd=PROJECT_ROOT,check=True)
-        if not (out/'test/metrics.json').exists():subprocess.run(steps[2],cwd=PROJECT_ROOT,check=True)
+            for command in steps[:-1]:subprocess.run(command,cwd=PROJECT_ROOT,check=True)
+        if not (out/'test/metrics.json').exists():subprocess.run(steps[-1],cwd=PROJECT_ROOT,check=True)
         else:
             from artifacts import sha256_file
             previous=json.loads((out/'test/metrics.json').read_text())

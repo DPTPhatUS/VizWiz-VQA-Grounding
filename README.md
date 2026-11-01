@@ -20,7 +20,7 @@ data/, outputs/     Local datasets and generated artifacts; excluded from Git
 
 The command scripts and shared files live directly in the repository root. Run commands from that directory; no installation or `PYTHONPATH` changes are needed. See [the structure guide](docs/structure.md) for every file's purpose and the command mapping.
 
-For Vast.ai through Jupyter, open [vast.ipynb](vast.ipynb), edit its settings cell, and use Run All. It downloads the supplied Hugging Face dataset ZIP, checks the GPU/full-batch fit, and runs selected jobs with completed-run uploads. See the [Vast.ai guide](docs/vast.md) for instance requirements and source setup.
+For Vast.ai, upload only [vast.ipynb](vast.ipynb) to `/workspace` on a single-GPU NVIDIA CUDA instance, edit its settings cell, and use Run All. It clones the source, installs dependencies, extracts the supplied dataset ZIP, and runs the selected jobs sequentially with completed-run uploads. Reruns resume saved progress. See the [Vast.ai guide](docs/vast.md).
 
 ## Models and ablations
 
@@ -112,7 +112,7 @@ uv run --frozen python -m experiments.hub download --path-in-repo matched-30ep-v
 uv run --frozen python -m experiments.launch --data-root /path/to/vizwiz --processes 2 --runs context_only_s42 --resume
 ```
 
-Downloads pin one remote commit, verify every file's hash, and refuse a nonempty destination. `--revision COMMIT_SHA` restores a specific historical backup. Resume on the same number of processes; keep two processes across Kaggle and Vast.ai when combining their results in this study.
+Downloads pin one remote commit, verify every file's hash, and refuse a nonempty destination. `--revision COMMIT_SHA` restores a specific historical backup. Resume on the same number of processes. The Vast notebook uses one process; keep studies with different process counts separate.
 
 Back up an unfinished run before ending a rental session, or retry an upload after a connection failure. Pause/stop training at a completed epoch first so the two checkpoint files are stable. `--dry-run` inspects the upload without contacting the Hub:
 
