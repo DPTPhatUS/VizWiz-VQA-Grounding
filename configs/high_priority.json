@@ -1,12 +1,12 @@
 {
-  "name": "matched-20ep-v1",
+  "name": "matched-30ep-v1",
   "hub": {
     "repo_id": "Last-Bullet/vizwiz-cm-aciids-2027",
-    "prefix": "matched-20ep-v1",
+    "prefix": "matched-30ep-v1",
     "private": false
   },
   "common": {
-    "num_epochs": 20,
+    "num_epochs": 30,
     "batch_size": 4,
     "lr": 1e-05,
     "num_workers": 2,
@@ -26,6 +26,12 @@
       "seed": 42
     },
     {
+      "id": "cm_shared_s42",
+      "model": "cm",
+      "connection_mode": "shared",
+      "seed": 42
+    },
+    {
       "id": "ftc_s123",
       "model": "ftc",
       "seed": 123
@@ -37,6 +43,12 @@
       "seed": 123
     },
     {
+      "id": "cm_shared_s123",
+      "model": "cm",
+      "connection_mode": "shared",
+      "seed": 123
+    },
+    {
       "id": "ftc_s456",
       "model": "ftc",
       "seed": 456
@@ -45,6 +57,12 @@
       "id": "cm_separate_s456",
       "model": "cm",
       "connection_mode": "separate",
+      "seed": 456
+    },
+    {
+      "id": "cm_shared_s456",
+      "model": "cm",
+      "connection_mode": "shared",
       "seed": 456
     },
     {

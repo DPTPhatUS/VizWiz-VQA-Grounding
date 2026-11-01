@@ -55,15 +55,15 @@ For a model-specific preflight:
 uv run --frozen python preflight.py --data-root /path/to/vizwiz --connection-mode separate --disable-context
 ```
 
-## The matched 20-epoch study
+## The matched 30-epoch study
 
-`configs/high_priority.json` specifies ten fresh runs:
+`configs/high_priority.json` specifies thirteen fresh runs:
 
-- FTC and full CM-Separate at seeds 42, 123, and 456;
+- FTC, full CM-Shared, and full CM-Separate at seeds 42, 123, and 456;
 - Context-only, membership-only, and no-auxiliary-loss CM at seed 42;
 - FTC capacity control at seed 42.
 
-Every run uses 20 epochs, global batch 4, Adam at 1e-5, zero weight decay, gradient clipping at 1.0, and validation after every epoch. The highest native-grid validation mIoU at threshold 0.5 selects `best.pt`; ties retain the earlier epoch. Only that checkpoint is evaluated on test. Seed-42 references are retrained so the selection procedure matches the new ablations and seeds.
+Every run uses 30 epochs, global batch 4, Adam at 1e-5, zero weight decay, gradient clipping at 1.0, and validation after every epoch. The highest native-grid validation mIoU at threshold 0.5 selects `best.pt`; ties retain the earlier epoch. Only that checkpoint is evaluated on test. Seed-42 references are retrained so the selection procedure matches the new ablations and seeds.
 
 Preview commands without creating output directories:
 
@@ -77,7 +77,7 @@ Launch one selected run on two GPUs:
 uv run --frozen python -m experiments.launch --data-root /path/to/vizwiz --processes 2 --runs context_only_s42
 ```
 
-Omit `--runs` to execute all ten sequentially, or list several IDs. Use `--device cpu --processes 1` only for smoke manifests. `--output-root` defaults to `outputs/revision`. A fresh launch refuses existing nonempty run directories. Two-process training uses a global batch of 4, hence microbatch 2 per GPU. Validation uses non-padding rank shards and restores training/RNG state.
+Omit `--runs` to execute all thirteen sequentially, or list several IDs. Use `--device cpu --processes 1` only for smoke manifests. `--output-root` defaults to `outputs/revision`. A fresh launch refuses existing nonempty run directories. Two-process training uses a global batch of 4, hence microbatch 2 per GPU. Validation uses non-padding rank shards and restores training/RNG state.
 
 The preset uploads each **completed run** to the **public** Hugging Face model repository `Last-Bullet/vizwiz-cm-aciids-2027`. Authenticate on the training machine with a write-enabled token before launching:
 
@@ -98,14 +98,14 @@ Preserve **both** checkpoint files across sessions. Full CLIP/Adam checkpoints a
 
 ## Hugging Face backups and machine transfers
 
-After training and selected-checkpoint test evaluation finish, the launcher uploads `latest.pt`, `best.pt`, SHA-256 hashes, run records, `test/metrics.json`, and the manifest record in one Hub commit under `matched-20ep-v1/<run-id>/`. Intermediate epochs remain local. The uploader uses an explicit allowlist: dataset images, prediction PNGs, and unrelated files are excluded. It waits for upload completion before launching the next run. After three failed commit attempts, the launcher stops with the completed local run intact; `--resume` retries without repeating completed training or evaluation.
+After training and selected-checkpoint test evaluation finish, the launcher uploads `latest.pt`, `best.pt`, SHA-256 hashes, run records, `test/metrics.json`, and the manifest record in one Hub commit under `matched-30ep-v1/<run-id>/`. Intermediate epochs remain local. The uploader uses an explicit allowlist: dataset images, prediction PNGs, and unrelated files are excluded. It waits for upload completion before launching the next run. After three failed commit attempts, the launcher stops with the completed local run intact; `--resume` retries without repeating completed training or evaluation.
 
 The remote paths contain the final latest/best pair. Manual intermediate backups add versions to Hub history, increasing storage use; history is never deleted automatically. See the [storage guidance](https://huggingface.co/docs/hub/storage-limits). The integration uses Hugging Face's [commit API](https://huggingface.co/docs/huggingface_hub/package_reference/hf_api#create_commit).
 
 Restore a completed run, or an explicitly uploaded intermediate checkpoint, onto a new Kaggle or Vast.ai machine:
 
 ```bash
-uv run --frozen python -m experiments.hub download --path-in-repo matched-20ep-v1/context_only_s42 --run-dir outputs/revision/context_only_s42
+uv run --frozen python -m experiments.hub download --path-in-repo matched-30ep-v1/context_only_s42 --run-dir outputs/revision/context_only_s42
 uv run --frozen python -m experiments.launch --data-root /path/to/vizwiz --processes 2 --runs context_only_s42 --resume
 ```
 
@@ -114,7 +114,7 @@ Downloads pin one remote commit, verify every file's hash, and refuse a nonempty
 Back up an unfinished run before ending a rental session, or retry an upload after a connection failure. Pause/stop training at a completed epoch first so the two checkpoint files are stable. `--dry-run` inspects the upload without contacting the Hub:
 
 ```bash
-uv run --frozen python -m experiments.hub upload --run-dir outputs/revision/context_only_s42 --path-in-repo matched-20ep-v1/context_only_s42
+uv run --frozen python -m experiments.hub upload --run-dir outputs/revision/context_only_s42 --path-in-repo matched-30ep-v1/context_only_s42
 ```
 
 `hub_status.json` records the last confirmed commit. Uploads reject another run's destination or progress older than the remote backup. A genuinely fresh rerun needs a new local output root **and** a new Hub prefix (`--hf-prefix`). `--hf-repo` overrides the preset destination. The standalone Hub commands also accept `--repo-id`.
@@ -125,7 +125,7 @@ Resume selected runs in their existing output directories:
 uv run --frozen python -m experiments.launch --data-root /path/to/vizwiz --processes 2 --runs context_only_s42 --resume
 ```
 
-Resume preserves the seed, global batch, learning rate, objective, architecture, validation policy, and process count. If the 20-epoch run is complete, the launcher proceeds to any missing test evaluation. It rejects stale test results from another checkpoint.
+Resume preserves the seed, global batch, learning rate, objective, architecture, validation policy, and process count. If the 30-epoch run is complete, the launcher proceeds to any missing test evaluation. It rejects stale test results from another checkpoint.
 
 Summarize completed runs; missing runs are listed explicitly:
 
@@ -137,10 +137,10 @@ The JSON/CSV exports include per-seed metrics, sample standard deviations, and p
 
 ## Direct training and checkpoint format
 
-Direct commands default to full CM-Shared, 100 epochs, no automatic validation, and periodic checkpoints every ten epochs. The revision preset sets all study choices explicitly. For a direct matched no-auxiliary run:
+Direct commands default to full CM-Shared, 30 epochs, no automatic validation, and periodic checkpoints every ten epochs. The revision preset sets all study choices explicitly. For a direct matched no-auxiliary run:
 
 ```bash
-uv run --frozen python train.py --data-root /path/to/vizwiz --connection-mode separate --edge-loss-weight 0 --num-epochs 20 --batch-size 4 --lr 0.00001 --seed 42 --val-every 1 --checkpoint-policy rolling --output-dir outputs/noaux_s42
+uv run --frozen python train.py --data-root /path/to/vizwiz --connection-mode separate --edge-loss-weight 0 --num-epochs 30 --batch-size 4 --lr 0.00001 --seed 42 --val-every 1 --checkpoint-policy rolling --output-dir outputs/noaux_s42
 ```
 
 The logged `membership` loss is unweighted and can remain nonzero when its objective weight is zero. Positive relation-loss weights are rejected if membership is disabled. CM-only flags are rejected for FTC.

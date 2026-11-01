@@ -56,9 +56,9 @@ mkdir -p logs
 uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs context_only_s42 membership_only_s42 2>&1 | tee logs/ablations.log
 ```
 
-Detach with `Ctrl-b`, then `d`; reconnect using `tmux attach -t cm-study`. Omit `--runs` to run all ten jobs sequentially. Do not launch the same run ID on two machines concurrently.
+Detach with `Ctrl-b`, then `d`; reconnect using `tmux attach -t cm-study`. Omit `--runs` to run all thirteen jobs sequentially. Do not launch the same run ID on two machines concurrently.
 
-Every epoch uses global batch 4, validates at probability 0.5, and saves local `latest.pt` and `best.pt`. After all epochs and selected-checkpoint test evaluation finish, one upload publishes both checkpoints, run records, and test metrics to `matched-20ep-v1/<run-id>/`. The next run waits for this upload. There are no automatic intermediate uploads. Dataset images and prediction PNGs are excluded. `hub_status.json` contains the confirmed commit SHA; failed uploads leave the completed local run intact and stop the launcher after retries.
+Every epoch uses global batch 4, validates at probability 0.5, and saves local `latest.pt` and `best.pt`. After all epochs and selected-checkpoint test evaluation finish, one upload publishes both checkpoints, run records, and test metrics to `matched-30ep-v1/<run-id>/`. The next run waits for this upload. There are no automatic intermediate uploads. Dataset images and prediction PNGs are excluded. `hub_status.json` contains the confirmed commit SHA; failed uploads leave the completed local run intact and stop the launcher after retries.
 
 One GPU is supported with `--processes 1`, retaining global batch 4. Use a separate complete study/cohort for that configuration: this workflow requires the same process count across the matched runs and across a run's resume. Two GPUs on both Vast.ai and Kaggle allow moving runs between those platforms with the existing preset.
 
@@ -73,7 +73,7 @@ uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --proce
 On a new instance, repeat setup/authentication, restore a completed run or manually backed-up intermediate epoch into an empty destination, then run the same resume command:
 
 ```bash
-uv run --frozen python -m experiments.hub download --path-in-repo matched-20ep-v1/context_only_s42 --run-dir outputs/revision/context_only_s42
+uv run --frozen python -m experiments.hub download --path-in-repo matched-30ep-v1/context_only_s42 --run-dir outputs/revision/context_only_s42
 uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs context_only_s42 --resume
 ```
 
@@ -82,10 +82,10 @@ Restoration pins one Hub commit, checks every file's size/hash, and preserves th
 Before releasing an instance with unfinished training, stop at a completed epoch and upload the stable checkpoint pair explicitly. The same command retries a failed final upload:
 
 ```bash
-uv run --frozen python -m experiments.hub upload --run-dir outputs/revision/context_only_s42 --path-in-repo matched-20ep-v1/context_only_s42
+uv run --frozen python -m experiments.hub upload --run-dir outputs/revision/context_only_s42 --path-in-repo matched-30ep-v1/context_only_s42
 ```
 
-For a new repetition, choose both a fresh local output root and unused remote prefix, for example `--output-root outputs/revision-v2 --hf-prefix matched-20ep-v2`. Existing remote run identities are protected even if the local directory was lost.
+For a new repetition, choose both a fresh local output root and unused remote prefix, for example `--output-root outputs/revision-v2 --hf-prefix matched-30ep-v2`. Existing remote run identities are protected even if the local directory was lost.
 
 ## 5. Results and storage
 

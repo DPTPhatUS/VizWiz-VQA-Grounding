@@ -54,7 +54,7 @@ Command scripts and shared implementation files live directly in the repository 
 │   └── benchmark.py                  Forward/decoder latency, memory, throughput, parameter counts
 │
 ├── configs/
-│   └── high_priority.json            Ten-run matrix, common protocol, public Hub destination
+│   └── high_priority.json            Thirteen-run matrix, common protocol, public Hub destination
 │
 ├── docs/
 │   ├── structure.md                  This guide: file ownership and command migration

@@ -1,6 +1,6 @@
 # Kaggle: matched Context–Membership study
 
-Enable Internet and two T4 GPUs, and attach the VizWiz dataset. Use a notebook session to run one or a few chosen models; the ten-run study is not assumed to fit one session. This workflow trains fresh checkpoints and uploads each completed run to the public repository `Last-Bullet/vizwiz-cm-aciids-2027`.
+Enable Internet and two T4 GPUs, and attach the VizWiz dataset. Use a notebook session to run one or a few chosen models; the thirteen-run study is not assumed to fit one session. This workflow trains fresh checkpoints and uploads each completed run to the public repository `Last-Bullet/vizwiz-cm-aciids-2027`.
 
 ## 1. Setup
 
@@ -51,9 +51,9 @@ set -euo pipefail
 uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs context_only_s42 membership_only_s42
 ```
 
-Other IDs: `ftc_s42`, `ftc_s123`, `ftc_s456`, `cm_separate_s42`, `cm_separate_s123`, `cm_separate_s456`, `cm_noaux_s42`, and `ftc_capacity_s42`.
+Other IDs: `ftc_s42`, `ftc_s123`, `ftc_s456`, `cm_separate_s42`, `cm_separate_s123`, `cm_separate_s456`, `cm_shared_s42`, `cm_shared_s123`, `cm_shared_s456`, `cm_noaux_s42`, and `ftc_capacity_s42`.
 
-Each run validates every epoch and keeps local `latest.pt` and `best.pt`. After training and test evaluation finish, it uploads both checkpoints, records, and final metrics in one Hub commit. There are no automatic intermediate uploads. Check the printed resolved protocol: 20 epochs, global batch 4, learning rate 1e-5, and the intended model/flags. New local directories and unused remote run paths are required for fresh runs. Never initialize a fresh ablation from a trained full-CM checkpoint.
+Each run validates every epoch and keeps local `latest.pt` and `best.pt`. After training and test evaluation finish, it uploads both checkpoints, records, and final metrics in one Hub commit. There are no automatic intermediate uploads. Check the printed resolved protocol: 30 epochs, global batch 4, learning rate 1e-5, and the intended model/flags. New local directories and unused remote run paths are required for fresh runs. Never initialize a fresh ablation from a trained full-CM checkpoint.
 
 ## 4. Resume after a session ends
 
@@ -62,7 +62,7 @@ For an unfinished run, stop training after an epoch completes and upload its sta
 ```bash
 %%bash
 set -euo pipefail
-uv run --frozen python -m experiments.hub upload --run-dir outputs/revision/context_only_s42 --path-in-repo matched-20ep-v1/context_only_s42
+uv run --frozen python -m experiments.hub upload --run-dir outputs/revision/context_only_s42 --path-in-repo matched-30ep-v1/context_only_s42
 ```
 
 In a new session, repeat setup and authentication, then download that backup. This also works when the previous session ran on Vast.ai:
@@ -70,7 +70,7 @@ In a new session, repeat setup and authentication, then download that backup. Th
 ```bash
 %%bash
 set -euo pipefail
-uv run --frozen python -m experiments.hub download --path-in-repo matched-20ep-v1/context_only_s42 --run-dir outputs/revision/context_only_s42
+uv run --frozen python -m experiments.hub download --path-in-repo matched-30ep-v1/context_only_s42 --run-dir outputs/revision/context_only_s42
 ```
 
 The downloader pins one remote commit and verifies hashes before exposing the restored folder. It refuses nonempty local directories. If the original working folder survived, skip the download and resume it directly:

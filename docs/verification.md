@@ -8,7 +8,8 @@ The file reorganization starts from `a1db5e6ce3b49ad1e08dca24324c80fc58a0a5b1`. 
 
 - One checkpoint format, `format_version=1`, records explicit model/component settings and a persistent run UUID. Old checkpoint adapters, raw-state inference, metadata normalization, and old-schema round-trip tests have been removed. Original checkpoint files remain untouched.
 - CM/FTC reference fixtures preserve architecture initialization/output checks independently of checkpoint-format support. Disabling components still preserves common initial weights.
-- The ten-run preset uploads **after each completed run**, following selected-checkpoint test evaluation, to the public model repository `Last-Bullet/vizwiz-cm-aciids-2027`. There are no automatic intermediate-epoch uploads. Manual intermediate backup and restoration are available.
+- The thirteen-run preset uploads **after each completed run**, following selected-checkpoint test evaluation, to the public model repository `Last-Bullet/vizwiz-cm-aciids-2027`. There are no automatic intermediate-epoch uploads. Manual intermediate backup and restoration are available.
+- The preset uses 30 epochs for all thirteen runs. FTC, CM-Shared, and CM-Separate each use seeds 42, 123, and 456; the component ablations and capacity control use seed 42. The cohort and remote prefix are `matched-30ep-v1`; direct training also defaults to 30 epochs.
 - Kaggle and Vast.ai guides use the same launcher, lockfile, and two-process settings. The launcher checks Hub write access before training; credentials come from the training machine's environment or Hugging Face login.
 
 ## Checks completed
@@ -41,6 +42,6 @@ The hard-coded `countnum.py` was replaced by preflight dataset checks, and the b
 
 The former `revision/` folder is split into experiment orchestration and diagnostics. Its manifest moves to `configs/`. `utils.py` is split into checkpoint, runtime, and artifact responsibilities. Root script names, the current checkpoint format, and output-directory conventions are retained. Documentation links, Python source parsing, the dependency lock, and `git diff --check` passed.
 
-Live Hub authentication/large-file transfers, CUDA/NCCL training, GPU decoder checks, FP16/FP32 latency and memory measurements, and the full ten-run study remain to be exercised on the intended Kaggle/Vast.ai machines. No minimum GPU-memory requirement or actual cloud runtime is inferred from CPU smoke tests.
+Live Hub authentication/large-file transfers, CUDA/NCCL training, GPU decoder checks, FP16/FP32 latency and memory measurements, and the full thirteen-run study remain to be exercised on the intended Kaggle/Vast.ai machines. No minimum GPU-memory requirement or actual cloud runtime is inferred from CPU smoke tests.
 
 Current offline test output is recorded temporarily in `/tmp/cm-structure-tests.log`; distributed and diagnostic logs use `/tmp/cm-structure-*.log`. Synthetic artifacts are under `/tmp/cm-structure-smoke/`, and the pre-refactor comparison inputs are in `/tmp/cm-structure-reference.pt`. Earlier `/tmp/cm-revision-smoke/` artifacts predate the checkpoint-format change and should not be used with this workflow.

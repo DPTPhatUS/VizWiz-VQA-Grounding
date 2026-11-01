@@ -46,7 +46,7 @@ def training_parser():
                         help='Default: shared for new runs; saved mode for checkpoint runs')
     parser.add_argument('--edge-loss-weight', type=float,
                         help='Membership supervision weight; default .1, or saved value on resume')
-    parser.add_argument("--num-epochs", type=int, default=100)
+    parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=4, help="Global batch size across all ranks")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-5)
