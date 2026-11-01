@@ -28,14 +28,20 @@ def per_image_iou(logits, target):
     return torch.where(union > 0, intersection / union.clamp_min(1), torch.ones_like(union))
 
 
-def membership_loss(output, mask):
-    """Per-image class-balanced soft labels for directed foreground-source edges."""
+def membership_targets(output, mask):
+    """Fractional mask-derived role targets, zeroed at invalid border slots."""
     shape = output['membership_logits'].shape[-2:]
     occupancy = F.adaptive_avg_pool2d(mask.float(), shape).flatten(1)
     receiver = occupancy[:, :, None]
     sender = occupancy[:, output['edge_indices']]
     targets = torch.stack((receiver * sender, (1 - receiver) * sender, 1 - sender), -1)
     targets = targets * output['edge_valid'][None, :, :, None]
+    return targets
+
+
+def membership_loss(output, mask):
+    """Per-image class-balanced soft labels for directed foreground-source edges."""
+    targets = membership_targets(output, mask)
     log_probability = output['edge_logits'].float().log_softmax(-1)
     mass = targets.sum((1, 2))
     present = mass > 0
@@ -49,7 +55,10 @@ class SupervisedObjective:
     def __call__(self, model, batch):
         output = model(batch)
         segmentation = segmentation_loss(output['logits'], batch['mask'])
-        edges = membership_loss(output, batch['mask'])
+        edges = (membership_loss(output, batch['mask']) if 'edge_logits' in output
+                 else segmentation.new_zeros(()))
+        if self.edge_loss_weight and 'edge_logits' not in output:
+            raise ValueError('Positive relation loss requires membership outputs')
         return segmentation + self.edge_loss_weight * edges, {
             'segmentation': segmentation.detach(), 'membership': edges.detach(),
         }

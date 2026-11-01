@@ -63,7 +63,8 @@ class ConnectionNetwork(nn.Module):
 
 
 class ContextMembership(nn.Module):
-    def __init__(self, channels, text_dim, mode, width=128, pair_width=16, steps=2):
+    def __init__(self, channels, text_dim, mode, width=128, pair_width=16, steps=2,
+                 context=True, membership=True):
         super().__init__()
         if mode not in ('shared', 'separate'):
             raise ValueError('connection mode must be shared or separate')
@@ -82,25 +83,32 @@ class ContextMembership(nn.Module):
         self.unary_norm = nn.LayerNorm(channels)
         self.unary_head = nn.Conv2d(channels, 1, 1)
         self.update_strength = nn.Parameter(torch.zeros(2))
+        self.context_enabled, self.membership_enabled = context, membership
+        # Construct everything before freezing so ablations preserve common initial weights.
+        if not context:
+            for module in (self.context_head, self.context_value, self.context_gate):
+                module.requires_grad_(False)
+        if not (context or (membership and mode == 'shared')):
+            self.context_network.requires_grad_(False)
+        if not membership:
+            self.membership_head.requires_grad_(False)
+            self.update_strength.requires_grad_(False)
+            if self.membership_network is not None:
+                self.membership_network.requires_grad_(False)
 
     def forward(self, feature, text):
         batch, channels, height, width = feature.shape
         # Full-image context at the CLIP grid; membership at twice its resolution.
-        context_feature = F.avg_pool2d(feature, 2)
-        conditioned, positions = self.context_network.condition(context_feature, text)
-        pairs = self.context_network.global_pairs(conditioned, positions)
-        read_weights = self.context_head(pairs).squeeze(-1).float().softmax(-1)
-        values = self.context_value(context_feature).flatten(2).transpose(1, 2)
-        context = (read_weights.to(values.dtype) @ values).transpose(1, 2).reshape_as(context_feature)
-        context = F.interpolate(context, size=(height, width), mode='bilinear', align_corners=False)
-        contextual = feature + self.context_gate(feature).sigmoid() * context
-
-        network = self.context_network if self.mode == 'shared' else self.membership_network
-        conditioned, positions = network.condition(feature, text)
-        indices, valid = neighborhood(height, width, feature.device)
-        pairs = network.local_pairs(conditioned, positions, indices)
-        edge_logits = self.membership_head(pairs)
-        weights = edge_logits.float().softmax(-1) * valid[None, :, :, None]
+        contextual = feature
+        if self.context_enabled:
+            context_feature = F.avg_pool2d(feature, 2)
+            conditioned, positions = self.context_network.condition(context_feature, text)
+            pairs = self.context_network.global_pairs(conditioned, positions)
+            read_weights = self.context_head(pairs).squeeze(-1).float().softmax(-1)
+            values = self.context_value(context_feature).flatten(2).transpose(1, 2)
+            context = (read_weights.to(values.dtype) @ values).transpose(1, 2).reshape_as(context_feature)
+            context = F.interpolate(context, size=(height, width), mode='bilinear', align_corners=False)
+            contextual = feature + self.context_gate(feature).sigmoid() * context
 
         query = contextual.flatten(2).transpose(1, 2)
         tokens = self.unary_text(text.tokens)
@@ -108,6 +116,16 @@ class ContextMembership(nn.Module):
                                           key_padding_mask=~text.attention_mask, need_weights=False)
         unary_features = self.unary_norm(query + attended).transpose(1, 2).reshape_as(feature)
         unary = self.unary_head(unary_features)
+        if not self.membership_enabled:
+            return {'features': unary_features, 'membership_logits': unary.float(),
+                    'unary_logits': unary}
+
+        network = self.context_network if self.mode == 'shared' else self.membership_network
+        conditioned, positions = network.condition(feature, text)
+        indices, valid = neighborhood(height, width, feature.device)
+        pairs = network.local_pairs(conditioned, positions, indices)
+        edge_logits = self.membership_head(pairs)
+        weights = edge_logits.float().softmax(-1) * valid[None, :, :, None]
         logits = unary.float().flatten(1)
         plus, minus = 2 * self.update_strength.sigmoid()
         degree = valid.sum(-1).clamp_min(1)

@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 import torch
 from dataset import VizWizGroundingDataset, make_loader
-from utils import read_checkpoint, model_from_checkpoint
-from metrics import evaluate
+from utils import read_checkpoint, model_from_checkpoint, sha256_file, environment
+from metrics import evaluate_counts, summarize_counts, sample_metrics
 
 
 def eval_main(argv=None):
@@ -25,15 +25,17 @@ def eval_main(argv=None):
     model = model_from_checkpoint(saved)
     del saved
     device = torch.device(args.device); model.to(device)
-    dataset = VizWizGroundingDataset(args.data_root,args.dataset,config.get("image_size", 336))
+    dataset = VizWizGroundingDataset(args.data_root,args.dataset,config['image_size'])
     loader = make_loader(dataset,args,args.batch_size)
     out = Path(args.output_dir); out.mkdir(parents=True,exist_ok=True)
-    scores = evaluate(model,loader,device,out)
-    summary = {"num_samples":len(scores),"mean_iou":sum(scores.values())/len(scores),
+    counts = evaluate_counts(model,loader,device,out)
+    scores = {name: sample_metrics(row)["iou"] for name,row in counts.items()}
+    summary = {**summarize_counts(counts),
                "dataset":args.dataset,"metric_resolution":"original",
                "text_mode":"question","checkpoint":str(args.checkpoint),
+               "checkpoint_sha256":sha256_file(args.checkpoint), "environment":environment(),
                "experiment_config":model.experiment_config}
-    (out/"metrics.json").write_text(json.dumps({"summary":summary,"per_sample":scores},indent=2))
+    (out/"metrics.json").write_text(json.dumps({"summary":summary,"per_sample":scores,"counts":counts},indent=2))
     print(json.dumps(summary),flush=True)
 
 

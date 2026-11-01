@@ -1,12 +1,16 @@
 [project]
 name = "vizwiz-vqa-grounding"
 version = "0.1.0"
-description = "Add your description here"
+description = "Question-only grounding and controlled Context–Membership experiments"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "torch>=2.12.1",
     "torchvision>=0.27.1",
     "tqdm>=4.68.4",
+    "numpy",
+    "Pillow",
+    "matplotlib>=3.11.0",
     "transformers>=5.13.0",
+    "huggingface-hub>=1.22.0",
 ]

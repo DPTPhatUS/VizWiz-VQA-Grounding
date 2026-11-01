@@ -1,11 +1,17 @@
 import torch.nn.functional as F
 import torch.nn as nn
-from transformers import CLIPVisionModel
 
 class ImageEncoder(nn.Module):
-    def __init__(self, model_name="openai/clip-vit-large-patch14-336"):
+    def __init__(self, model_name="openai/clip-vit-large-patch14-336", pretrained=True):
         super().__init__()
-        self.vision_encoder = CLIPVisionModel.from_pretrained(model_name)
+        from transformers import CLIPVisionModel
+        if pretrained:
+            self.vision_encoder = CLIPVisionModel.from_pretrained(model_name)
+        else:
+            from transformers import CLIPVisionConfig
+            self.vision_encoder = CLIPVisionModel(CLIPVisionConfig(
+                hidden_size=1024, intermediate_size=4096, num_hidden_layers=24,
+                num_attention_heads=16, image_size=336, patch_size=14, projection_dim=768))
         self.out_channels = self.vision_encoder.config.hidden_size
 
     def forward(self, x):

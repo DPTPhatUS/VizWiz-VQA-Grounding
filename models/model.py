@@ -9,24 +9,26 @@ EXPERIMENT = 'context-membership'
 
 
 class GroundingModel(nn.Module):
-    def __init__(self, tiny=False, connection_mode='shared'):
+    def __init__(self, tiny=False, connection_mode='shared', context=True, membership=True, pretrained=True):
         super().__init__()
-        self.image_encoder = TinyVision() if tiny else ImageEncoder()
-        self.text_encoder = TextEncoder(tiny).requires_grad_(False)
+        self.image_encoder = TinyVision() if tiny else ImageEncoder(pretrained=pretrained)
+        self.text_encoder = TextEncoder(tiny, pretrained=pretrained).requires_grad_(False)
         self.visual_dim = self.image_encoder.out_channels
         self.text_dim = self.text_encoder.output_dim
         self.text_proj = nn.Linear(self.text_dim, self.visual_dim)
         self.cross_attn = nn.MultiheadAttention(self.visual_dim, 2 if tiny else 8, batch_first=True)
         self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128,
-                                      connection_mode=connection_mode, tiny=tiny)
+                                      connection_mode=connection_mode, tiny=tiny,
+                                      context=context, membership=membership)
         self.register_buffer("image_mean", torch.tensor([.48145466, .4578275, .40821073]).view(1,3,1,1))
         self.register_buffer("image_std", torch.tensor([.26862954, .26130258, .27577711]).view(1,3,1,1))
         self.experiment_config = {
-            'experiment': EXPERIMENT, 'architecture': 'compact', 'tiny': tiny,
+            'experiment': EXPERIMENT, 'model': 'cm', 'architecture': 'compact', 'tiny': tiny,
             'connection_mode': connection_mode, 'connection_width': 16 if tiny else 128,
             'pair_width': 16, 'membership_steps': 2, 'edge_neighborhood': 8,
             'freeze_text_encoder': True, 'skip_film': True, 'residual_fusion': False,
             'protocol': 'context-membership-v1',
+            'context_enabled': context, 'membership_enabled': membership,
         }
 
     def encode_image(self, image):
@@ -44,3 +46,12 @@ class GroundingModel(nn.Module):
 
     def forward(self, batch):
         return self.decode(self.encode_image(batch["image"]), batch["text"])
+
+
+def build_model(model='cm', tiny=False, connection_mode='shared', context=True, membership=True, pretrained=True):
+    if model == 'cm':
+        return GroundingModel(tiny, connection_mode, context, membership, pretrained)
+    if model not in ('ftc', 'ftc-capacity'):
+        raise ValueError(f'Unknown model: {model}')
+    from models.ftc import FTCModel
+    return FTCModel(tiny=tiny, capacity=model == 'ftc-capacity', pretrained=pretrained)

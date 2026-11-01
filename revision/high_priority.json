@@ -1,0 +1,77 @@
+{
+  "name": "matched-20ep-v1",
+  "hub": {
+    "repo_id": "Last-Bullet/vizwiz-cm-aciids-2027",
+    "prefix": "matched-20ep-v1",
+    "private": false
+  },
+  "common": {
+    "num_epochs": 20,
+    "batch_size": 4,
+    "lr": 1e-05,
+    "num_workers": 2,
+    "val_every": 1,
+    "checkpoint_policy": "rolling"
+  },
+  "runs": [
+    {
+      "id": "ftc_s42",
+      "model": "ftc",
+      "seed": 42
+    },
+    {
+      "id": "cm_separate_s42",
+      "model": "cm",
+      "connection_mode": "separate",
+      "seed": 42
+    },
+    {
+      "id": "ftc_s123",
+      "model": "ftc",
+      "seed": 123
+    },
+    {
+      "id": "cm_separate_s123",
+      "model": "cm",
+      "connection_mode": "separate",
+      "seed": 123
+    },
+    {
+      "id": "ftc_s456",
+      "model": "ftc",
+      "seed": 456
+    },
+    {
+      "id": "cm_separate_s456",
+      "model": "cm",
+      "connection_mode": "separate",
+      "seed": 456
+    },
+    {
+      "id": "context_only_s42",
+      "model": "cm",
+      "connection_mode": "separate",
+      "disable_membership": true,
+      "seed": 42
+    },
+    {
+      "id": "membership_only_s42",
+      "model": "cm",
+      "connection_mode": "separate",
+      "disable_context": true,
+      "seed": 42
+    },
+    {
+      "id": "cm_noaux_s42",
+      "model": "cm",
+      "connection_mode": "separate",
+      "edge_loss_weight": 0,
+      "seed": 42
+    },
+    {
+      "id": "ftc_capacity_s42",
+      "model": "ftc-capacity",
+      "seed": 42
+    }
+  ]
+}

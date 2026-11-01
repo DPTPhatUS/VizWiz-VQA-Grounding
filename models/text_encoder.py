@@ -3,7 +3,6 @@ from typing import NamedTuple
 
 import torch
 from torch import nn
-from transformers import CLIPTokenizer, CLIPTextModel
 
 
 class TextFeatures(NamedTuple):
@@ -20,17 +19,25 @@ def masked_mean(tokens, mask):
 
 
 class TextEncoder(nn.Module):
-    def __init__(self, tiny=False, model_name="openai/clip-vit-large-patch14-336"):
+    def __init__(self, tiny=False, model_name="openai/clip-vit-large-patch14-336", pretrained=True):
         super().__init__()
         self.tiny = tiny
         if tiny:
             self.embedding = nn.Embedding(259, 16)
             self.output_dim = 16
         else:
+            from transformers import CLIPTextModel
             # Keep the encoder.model path used by existing checkpoints.
             self.encoder = nn.Module()
-            self.encoder.model = CLIPTextModel.from_pretrained(model_name)
-            self.tokenizer = CLIPTokenizer.from_pretrained(model_name)
+            if pretrained:
+                self.encoder.model = CLIPTextModel.from_pretrained(model_name)
+            else:
+                from transformers import CLIPTextConfig
+                self.encoder.model = CLIPTextModel(CLIPTextConfig(
+                    hidden_size=768, intermediate_size=3072, num_hidden_layers=12,
+                    num_attention_heads=12, projection_dim=768))
+            self.model_name = model_name
+            self.tokenizer = None
             self.output_dim = self.encoder.model.config.hidden_size
 
     def forward(self, texts):
@@ -44,6 +51,9 @@ class TextEncoder(nn.Module):
             attention = ids != 0
             tokens = self.embedding(ids)
         else:
+            if self.tokenizer is None:
+                from transformers import CLIPTokenizer
+                self.tokenizer = CLIPTokenizer.from_pretrained(self.model_name)
             inputs = self.tokenizer(texts, return_tensors="pt", padding=True,
                 truncation=True, max_length=77).to(self.encoder.model.device)
             attention = inputs.attention_mask.bool()
