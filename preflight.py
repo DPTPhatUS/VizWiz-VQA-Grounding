@@ -12,7 +12,7 @@ from torch.utils.data import DistributedSampler
 
 from dataset import VizWizGroundingDataset, make_loader
 from losses import SegmentationObjective
-from models.model import DETAIL_INPUTS, GroundingModel
+from models.model import DETAIL_INPUTS, REFINER_MODES, GroundingModel
 from train import TRAINING_DEFAULTS, resolve_training_arguments, seed_everything
 from training_options import TrainingArgumentParser, TrainingControls
 from utils import to_device
@@ -136,6 +136,10 @@ def main(argv=None):
         default="image",
         help="Detail-pathway input; 'zeros' and 'low_res' are ablations",
     )
+    parser.add_argument("--refiner-mode", choices=REFINER_MODES, default="residual")
+    parser.add_argument(
+        "--skip-film", action=argparse.BooleanOptionalAction, default=True
+    )
     args = parser.parse_args(argv)
     world, rank, local = [
         int(os.environ.get(k, v))
@@ -164,6 +168,8 @@ def main(argv=None):
             GroundingModel(
                 gradient_checkpointing=args.gradient_checkpointing,
                 detail_input=args.detail_input,
+                refiner_mode=args.refiner_mode,
+                skip_film=args.skip_film,
             )
             .to(device)
             .train()

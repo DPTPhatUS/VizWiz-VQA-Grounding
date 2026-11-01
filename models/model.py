@@ -15,6 +15,9 @@ EXPERIMENT = "question-guided-detail-pyramid-v1"
 # "zeros": ablation; every module stays, but all detail maps are zero.
 # "low_res": ablation; the detail CNN sees the 336 px view upsampled to 768 px.
 DETAIL_INPUTS = ("image", "zeros", "low_res")
+# Decoder-component ablations (Session I). "residual" is the published refiner; "none" replaces
+# it by plain bilinear upsampling of the 384 px logits, which is the refiner's own starting point.
+REFINER_MODES = ("residual", "none")
 
 
 class GroundingModel(nn.Module):
@@ -25,11 +28,18 @@ class GroundingModel(nn.Module):
         tiny: bool = False,
         gradient_checkpointing: bool = False,
         detail_input: str = "image",
+        refiner_mode: str = "residual",
+        skip_film: bool = True,
     ):
         super().__init__()
         if detail_input not in DETAIL_INPUTS:
             raise ValueError(f"detail_input must be one of {DETAIL_INPUTS}")
+        if refiner_mode not in REFINER_MODES:
+            raise ValueError(f"refiner_mode must be one of {REFINER_MODES}")
+        if type(skip_film) is not bool:
+            raise ValueError("skip_film must be a bool")
         self.detail_input = detail_input
+        self.refiner_mode = refiner_mode
         self.image_encoder = TinyVision() if tiny else ImageEncoder()
         self.text_encoder = TextEncoder(tiny)
         self.text_encoder.requires_grad_(False)
@@ -50,10 +60,13 @@ class GroundingModel(nn.Module):
         if detail_input == "zeros":
             # Kept for identical checkpoint keys; never used, so never trained.
             self.detail_pyramid.requires_grad_(False)
-        self.decoder = DetailDecoder(visual_dim, text_dim, tiny=tiny)
+        self.decoder = DetailDecoder(visual_dim, text_dim, tiny=tiny, skip_film=skip_film)
         self.refiner = HighResolutionRefiner(
             self.decoder.output_channels, 8 if tiny else 16, tiny=tiny
         )
+        if refiner_mode == "none":
+            # Kept for identical checkpoint keys; never used, so never trained.
+            self.refiner.requires_grad_(False)
         self.register_buffer(
             "image_mean",
             torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1),
@@ -84,9 +97,13 @@ class GroundingModel(nn.Module):
             "refiner": "signed-logit-residual",
             "normalization": "clip-rgb-both-views",
         }
+        # Ablation options are recorded only when non-default, so existing checkpoints still match.
         if detail_input != "image":
-            # Recorded only for ablations so existing checkpoints still match.
             self.experiment_config["detail_input"] = detail_input
+        if refiner_mode != "residual":
+            self.experiment_config["refiner_mode"] = refiner_mode
+        if not skip_film:
+            self.experiment_config["skip_film"] = False
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -138,7 +155,17 @@ class GroundingModel(nn.Module):
         logits, semantic, auxiliary = self.decoder(
             (*features[:3], fused), question, detail, detail_question, self._run
         )
-        final = self._run(self.refiner, logits, semantic, detail[-1], detail_question)
+        if self.refiner_mode == "none":
+            final = F.interpolate(
+                logits.float(),
+                size=(self.detail_size, self.detail_size),
+                mode="bilinear",
+                align_corners=False,
+            )  # (B, 1, 768, 768), as the refiner's upsampling before its correction
+        else:
+            final = self._run(
+                self.refiner, logits, semantic, detail[-1], detail_question
+            )
         return {"logits": final, "auxiliary_logits": auxiliary}
 
     def _detail_maps(self, image: Tensor, detail_image: Tensor, dtype) -> tuple:

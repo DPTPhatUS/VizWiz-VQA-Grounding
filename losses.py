@@ -5,10 +5,14 @@ import math
 import torch
 from torch.nn import functional as F
 
+# Version tag of this objective family (dice, tversky or lovasz main term); the chosen term is
+# recorded separately in training_config["overlap_loss"].
 OBJECTIVE_VERSION = "per-image-lovasz-v1"
 
+# Dice is the default since 2026-11-01: it is the published QGDP-Net objective. Sessions B, E
+# and F ran with the earlier Lovasz default (their histories record "lovasz").
 TRAINING_DEFAULTS = {
-    "overlap_loss": "lovasz",
+    "overlap_loss": "dice",
     "overlap_weight": 0.5,
     "fp_weight": 0.7,
     "aux96_weight": 0.1,
@@ -111,7 +115,7 @@ class SegmentationObjective:
 
     def __init__(
         self,
-        overlap_loss="lovasz",
+        overlap_loss="dice",
         overlap_weight=0.5,
         fp_weight=0.7,
         aux96_weight=0.1,

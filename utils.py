@@ -35,7 +35,7 @@ def checkpoint_model_kwargs(saved):
     tiny = "image_encoder.conv.weight" in state
     if state[key].shape != (1, 8 if tiny else 16, 1, 1):
         raise ValueError("Unexpected detail-pyramid refiner architecture")
-    detail_inputs = set()
+    detail_inputs, refiner_modes, skip_films = set(), set(), set()
     for config in (
         saved.get("experiment_config", {}),
         saved.get("run_config", {}).get("experiment_config", {}),
@@ -46,9 +46,16 @@ def checkpoint_model_kwargs(saved):
             raise ValueError("Checkpoint tiny metadata disagrees with tensors")
         if config:
             detail_inputs.add(config.get("detail_input", "image"))
-    if len(detail_inputs) > 1:
-        raise ValueError("Checkpoint detail_input metadata is inconsistent")
-    return {"tiny": tiny, "detail_input": detail_inputs.pop() if detail_inputs else "image"}
+            refiner_modes.add(config.get("refiner_mode", "residual"))
+            skip_films.add(config.get("skip_film", True))
+    if len(detail_inputs) > 1 or len(refiner_modes) > 1 or len(skip_films) > 1:
+        raise ValueError("Checkpoint ablation metadata is inconsistent")
+    return {
+        "tiny": tiny,
+        "detail_input": detail_inputs.pop() if detail_inputs else "image",
+        "refiner_mode": refiner_modes.pop() if refiner_modes else "residual",
+        "skip_film": skip_films.pop() if skip_films else True,
+    }
 
 
 def load_model_weights(model, saved):

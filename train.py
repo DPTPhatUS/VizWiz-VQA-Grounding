@@ -13,12 +13,13 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.utils.data import DistributedSampler
+from torch.utils.data import DistributedSampler, Subset
 from tqdm.auto import tqdm
 
 from dataset import VizWizGroundingDataset, make_loader
 from losses import OBJECTIVE_VERSION, TRAINING_DEFAULTS, SegmentationObjective
-from models.model import DETAIL_INPUTS, GroundingModel
+from metrics import evaluate
+from models.model import DETAIL_INPUTS, REFINER_MODES, GroundingModel
 from training_options import (
     TrainingArgumentParser,
     TrainingControls,
@@ -71,6 +72,31 @@ def training_parser():
         default="image",
         help="Detail-pathway input; 'zeros' and 'low_res' are ablations",
     )
+    parser.add_argument(
+        "--refiner-mode",
+        choices=REFINER_MODES,
+        default="residual",
+        help="'none' is an ablation: 768 px logits are the upsampled 384 px decoder logits",
+    )
+    parser.add_argument(
+        "--skip-film",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="--no-skip-film is an ablation: CLIP skips are not modulated by the question",
+    )
+    parser.add_argument(
+        "--expect-overlap-loss",
+        choices=("dice", "tversky", "lovasz"),
+        help="Stop before training unless the resolved main overlap loss is this one",
+    )
+    parser.add_argument(
+        "--val-every",
+        type=int,
+        default=0,
+        help="Also log native-resolution validation mIoU every N epochs (0: off). "
+        "Logging only: it neither saves extra checkpoints nor changes training",
+    )
+    parser.add_argument("--val-batch-size", type=int, default=2)
     return parser
 
 
@@ -110,6 +136,8 @@ def check_arguments(args):
         min(args.num_epochs, args.batch_size, args.gradient_accumulation_steps) <= 0
         or args.save_every < 0
         or args.num_workers < 0
+        or args.val_every < 0
+        or args.val_batch_size <= 0
     ):
         raise ValueError("Invalid epoch, batch, save interval or worker count")
     if not math.isfinite(args.lr) or args.lr <= 0:
@@ -129,6 +157,25 @@ def seed_everything(seed):
 
 def unwrap(model):
     return model.module if hasattr(model, "module") else model
+
+
+def validate(model, dataset, args, rank, world, distributed, device):
+    """Native-resolution validation mIoU, sharded over ranks (same metric as eval.py)."""
+    shard = Subset(dataset, list(range(rank, len(dataset), world)))
+    scores = evaluate(model, make_loader(shard, args, args.val_batch_size), device)
+    parts = [None] * world
+    if distributed:
+        dist.all_gather_object(parts, scores)
+    else:
+        parts = [scores]
+    merged = {}
+    for part in parts:
+        if merged.keys() & part.keys():
+            raise ValueError("Validation shards overlap")
+        merged.update(part)
+    if len(merged) != len(dataset):
+        raise ValueError("Validation shards do not cover the split")
+    return sum(merged.values()) / len(merged), len(merged)
 
 
 def train_main(argv=None):
@@ -167,14 +214,21 @@ def _train(args, rank, world, distributed, device):
         read_checkpoint(args.resume_checkpoint) if args.resume_checkpoint else None
     )
     restore_control_arguments(args, checkpoint)
-    options = (
-        checkpoint_model_kwargs(checkpoint)
-        if checkpoint
-        else {"detail_input": args.detail_input}
-    )
-    if options.get("detail_input", "image") != args.detail_input:
-        raise ValueError("--detail-input must match the resumed checkpoint")
+    requested_model = {
+        "detail_input": args.detail_input,
+        "refiner_mode": args.refiner_mode,
+        "skip_film": args.skip_film,
+    }
+    options = checkpoint_model_kwargs(checkpoint) if checkpoint else requested_model
+    for key, value in requested_model.items():
+        if options.get(key) != value:
+            raise ValueError(f"--{key.replace('_', '-')} must match the resumed checkpoint")
     settings = resolve_training_arguments(args, checkpoint)
+    if args.expect_overlap_loss and settings["overlap_loss"] != args.expect_overlap_loss:
+        raise ValueError(
+            f"Resolved main overlap loss is {settings['overlap_loss']!r}, but "
+            f"--expect-overlap-loss {args.expect_overlap_loss} was given; nothing was trained"
+        )
     seed_everything(args.seed)
     out = Path(args.output_dir)
     history_path = out / "history.jsonl"
@@ -199,6 +253,13 @@ def _train(args, rank, world, distributed, device):
     ).to(device)
     train_set = VizWizGroundingDataset(
         args.data_root, "train", model.image_size, detail_size=model.detail_size
+    )
+    val_set = (
+        VizWizGroundingDataset(
+            args.data_root, "val", model.image_size, detail_size=model.detail_size
+        )
+        if args.val_every
+        else None
     )
     objective = SegmentationObjective(**settings)
     controls = TrainingControls(model, args, checkpoint)
@@ -383,6 +444,16 @@ def _train(args, rank, world, distributed, device):
                     checkpoint_path,
                 )
                 print(f"Checkpoint saved: {checkpoint_path}", flush=True)
+        if args.val_every and (epoch + 1) % args.val_every == 0:
+            # Runs after the epoch's checkpoint; the next epoch reseeds every RNG.
+            val_miou, count = validate(
+                unwrap(model), val_set, args, rank, world, distributed, device
+            )
+            if rank == 0:
+                entry = {"epoch": epoch + 1, "val_miou": val_miou, "num_samples": count}
+                print(json.dumps(entry), flush=True)
+                with (out / "val_curve.jsonl").open("a") as handle:
+                    handle.write(json.dumps(entry) + "\n")
     if rank == 0:
         final_path = out / f"model_final_epoch{args.num_epochs}.pt"
         save_checkpoint(unwrap(model).state_dict(), final_path)

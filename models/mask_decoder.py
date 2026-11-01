@@ -27,9 +27,16 @@ class SkipConditioner(nn.Module):
     """Nonlinear skip compression, Q-FiLM, then reduction to decoder width."""
 
     def __init__(
-        self, visual_dim: int, text_dim: int, width: int, hidden: int, reduction: int
+        self,
+        visual_dim: int,
+        text_dim: int,
+        width: int,
+        hidden: int,
+        reduction: int,
+        film: bool = True,
     ):
         super().__init__()
+        self.film = film
         self.projections = nn.ModuleList(
             [
                 nn.Sequential(
@@ -48,18 +55,26 @@ class SkipConditioner(nn.Module):
         for head in self.affine:
             nn.init.zeros_(head.weight)
             nn.init.zeros_(head.bias)
+        if not film:
+            # Ablation: skips are projected without question modulation. The FiLM layers stay
+            # for identical checkpoint keys but are never used, so never trained.
+            self.question.requires_grad_(False)
+            self.affine.requires_grad_(False)
 
     def forward(self, skips: tuple[Tensor, ...], question: Tensor) -> list[Tensor]:
         if len(skips) != 3:
             raise ValueError("Exactly three CLIP skips are required")
-        condition = self.question(question)
+        condition = self.question(question) if self.film else None
         result = []
         for skip, project, head, output in zip(
             skips, self.projections, self.affine, self.outputs
         ):
             feature = project(skip)
-            gamma, beta = head(condition).chunk(2, dim=-1)
-            feature = feature * (1 + gamma[:, :, None, None]) + beta[:, :, None, None]
+            if self.film:
+                gamma, beta = head(condition).chunk(2, dim=-1)
+                feature = (
+                    feature * (1 + gamma[:, :, None, None]) + beta[:, :, None, None]
+                )
             result.append(output(feature))
         return result
 
@@ -92,13 +107,17 @@ class QuestionDetailFusion(nn.Module):
 class DetailDecoder(nn.Module):
     """Fuse three CLIP skips, then upsample through four detail-supported stages."""
 
-    def __init__(self, visual_dim: int, text_dim: int, *, tiny: bool = False):
+    def __init__(
+        self, visual_dim: int, text_dim: int, *, tiny: bool = False, skip_film: bool = True
+    ):
         super().__init__()
         width, hidden, reduction = (16, 32, 16) if tiny else (128, 256, 64)
         detail_dim = 8 if tiny else 16
         channels = (8, 8, 4, 4) if tiny else (64, 32, 16, 16)
         self.bottleneck = nn.Conv2d(visual_dim, width, 1)
-        self.skips = SkipConditioner(visual_dim, text_dim, width, hidden, reduction)
+        self.skips = SkipConditioner(
+            visual_dim, text_dim, width, hidden, reduction, film=skip_film
+        )
         self.skip_fusion = nn.ModuleList(
             [conv_block(width, width, separable=True) for _ in range(3)]
         )

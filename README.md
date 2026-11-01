@@ -7,12 +7,22 @@ Branch: `exp/aciids-revision-controls` (from `exp/size-weighted-pyramid`). This 
 | `--sampling uniform` | `train_group.py` | Size-agnostic control for the continuation stage. Same 1,083 steps per epoch, global batch 6, frozen encoders, Adam, clipping and evaluation as the stratified runs, but the 6 images of each step are drawn uniformly from the whole training set and averaged into one gradient. |
 | `--detail-input zeros` | `train.py` (also `preflight.py`) | Detail-pathway ablation. Every QGDP-Net module is kept, but the five detail maps are zero. The 0.31M pyramid weights stay in the checkpoint, are never used and are excluded from optimisation. This removes the 768 px pathway's information; it does **not** isolate input resolution. |
 | `--detail-input low_res` | `train.py` | Optional resolution-controlled ablation. The CNN sees the 336 px view upsampled to 768 px, so only image resolution changes. |
+| `--refiner-mode none` | `train.py`, `preflight.py` | Decoder ablation (Session I). No 768 px refiner: the output is the 384 px decoder logits upsampled bilinearly, which is the refiner's own starting point. The refiner weights stay in the checkpoint, unused and untrained. |
+| `--no-skip-film` | `train.py`, `preflight.py` | Decoder ablation (Session I). The CLIP skips from blocks 4, 7 and 9 are used without question modulation. The FiLM layers stay in the checkpoint, unused and untrained. The question still enters through cross-attention, the gates and the refiner. |
+| `--expect-overlap-loss dice` | `train.py` | Guard: stop before training unless the resolved main loss is the given one. |
+| `--val-every N` | `train.py` | Also log validation mIoU every N epochs to `val_curve.jsonl`, sharded over both GPUs (same metric as `eval.py`). Logging only: no extra checkpoint, no effect on training. |
+
+**Default main loss is Dice since 2026-11-01.** That is the published QGDP-Net objective. Sessions B, E and F ran with the earlier Lovász default (see Session F).
 
 Helper scripts in `revision/`:
 - `dump_checkpoint_config.py` prints a checkpoint's saved `run_config` on CPU.
 - `cost.py` reports FLOPs and GPU latency.
 
-Local checks (kept outside Git, like other tests in this repo): `tests/test_revision_controls.py`, which covers the new options with the tiny model, including a CPU preflight of both sampling modes.
+Local checks (kept outside Git, like other tests in this repo):
+- `tests/test_revision_controls.py` covers the new options with the tiny model, including a CPU preflight of both sampling modes.
+- `tests/test_session_g.py` covers the Dice default, the loss guard, the two decoder ablations (checkpoint round trip, frozen unused weights, resume), and validation logging. For the logging it checks that weights are bit-identical with and without it, and that the logged mIoU equals `eval.py`'s on the same checkpoint.
+
+A two-process CPU `torchrun` run (gloo backend) also confirmed the sharded validation: the two shards cover the split without overlap and match a single-process evaluation exactly.
 
 Select checkpoints by validation only; test metrics are reported, never used for selection. Do not modify or delete existing checkpoints or result archives.
 
@@ -31,6 +41,10 @@ Select checkpoints by validation only; test metrics are reported, never used for
 | A5 | D | `revision/question_sensitivity.py` on the published epoch-20 QGDP-Net | How much the predicted mask depends on the question |
 | E (priority) | E | `train.py --detail-input {image,zeros}`, seeds 43 and 44, 20 epochs | Seed repeats for the detail-pathway conclusion |
 | A6 | C or D (CPU) | `revision/mask_resolution_audit.py` on the training masks | Target information lost by resizing; grid IoU ceilings |
+| F | — | superseded by G (its runs used Lovász) | — |
+| G | G | `train.py`, Dice, `--detail-input {image, zeros}`, seeds 42–44 | Multi-seed headline and Dice-matched detail-pathway comparison |
+| H | H | Baseline commit `2079c8a`, published recipe, seeds 43, 44 | Multi-seed single-scale baseline |
+| I (optional) | I | `train.py --detail-input zeros` with `--refiner-mode none`, `--no-skip-film` or zero auxiliary weights, seeds 42, 43 | Which decoder components matter |
 
 Each continuation run takes about as long as one run of the previous one-session A/B guide, so plan two or three runs per Session A. Run the seven continuation runs over several sessions by changing `RUNS` in Cell A2.
 
@@ -347,51 +361,97 @@ done
 
 If the session ends early, resume with the same command plus `--resume-checkpoint "$run_dir/checkpoint_epoch10.pt"` (same `--num-epochs 20`) and then run the evaluation loop. Then run Cell Z.
 
-## Session F: Dice-matched detail-pathway runs (after the ACIIDS deadline)
+## Session F: superseded, do not run
 
-**Why.** Sessions B and E used the Lovász main loss, so none of them is matched to the published Dice QGDP-Net. With `{"overlap_loss": "dice"}` this branch's objective equals the published one: BCE averaged over pixels plus 0.5 per-image Dice at 768 px, and Dice auxiliary terms at 96, 192 and 384 px with weights 0.1, 0.2 and 0.3. The published model is the `image` run at seed 42.
+Session F was meant to repeat the detail-pathway runs with the Dice loss. Its four runs (`dice_zeros_s42`, `dice_image_s43`, `dice_zeros_s43`, `dice_low_res_s42`) recorded `"overlap_loss": "lovasz"` in `history.jsonl`: the `--config` flag never reached `train.py`. They are kept as same-seed Lovász repeats. **Session G replaces Session F.** Three changes make the mistake impossible to repeat:
 
-| Order | `DETAIL_INPUT` | `SEED` | Output folder | Purpose |
-|---|---|---|---|---|
-| 1 | `zeros` | 42 | `outputs/dice_zeros_s42` | Pairs with the published model |
-| 2 | `image` | 43 | `outputs/dice_image_s43` | Second Dice pair |
-| 3 | `zeros` | 43 | `outputs/dice_zeros_s43` | Second Dice pair |
-| 4 | `low_res` | 42 | `outputs/dice_low_res_s42` | Resolution-only control, paired with the published model |
+- Dice is now the default main loss of `train.py`. It is the published QGDP-Net objective: pixel-averaged BCE plus 0.5 × per-image Dice at 768 px, with Dice auxiliary terms at 96, 192 and 384 px, weights 0.1, 0.2 and 0.3.
+- Every new cell passes `--expect-overlap-loss dice`. `train.py` stops **before training** if the resolved loss is anything else.
+- After training, each cell checks `history.jsonl` again and stops before evaluation if any epoch is not Dice.
 
-Each row is one session of about 8 hours. Rows can run in parallel in separate sessions.
+Old Lovász checkpoints still resume with Lovász, because a resume always uses the loss saved in the checkpoint.
 
-### Cell F1: choose the run and write the loss config
+## Sessions G, H and I: multi-seed, Dice-matched experiments
+
+The paper's headline (QGDP-Net vs. the single-scale baseline) and its detail-pathway result each rest on one run, or on Lovász runs. Same-seed repeats showed that identical runs can differ by up to 2.9 validation points. These sessions repeat the key comparison over three seeds, all with the published recipe.
+
+| Priority | `RUN` | Model | Seed | Session | Pairs with |
+|---|---|---|---|---|---|
+| 1 | `g_image_s43` | QGDP-Net (full) | 43 | G | `h_single_s43`, `g_zeros_s43` |
+| 1 | `h_single_s43` | single-scale baseline | 43 | H | `g_image_s43` |
+| 2 | `g_image_s44` | QGDP-Net (full) | 44 | G | `h_single_s44`, `g_zeros_s44` |
+| 2 | `h_single_s44` | single-scale baseline | 44 | H | `g_image_s44` |
+| 3 | `g_zeros_s42` | QGDP-Net, detail maps zeroed | 42 | G | published QGDP-Net (seed 42) |
+| 3 | `g_zeros_s43` | QGDP-Net, detail maps zeroed | 43 | G | `g_image_s43` |
+| 3 | `g_zeros_s44` | QGDP-Net, detail maps zeroed | 44 | G | `g_image_s44` |
+| 4 (optional) | `i_norefiner_s42`, `i_norefiner_s43` | zeroed model, no refiner | 42, 43 | I | `g_zeros_s42/43` |
+| 4 (optional) | `i_nofilm_s42`, `i_nofilm_s43` | zeroed model, no FiLM on the skips | 42, 43 | I | `g_zeros_s42/43` |
+| 4 (optional) | `i_noaux_s42`, `i_noaux_s43` | zeroed model, no auxiliary losses | 42, 43 | I | `g_zeros_s42/43` |
+| 5 (optional) | `g_low_res_s42` | QGDP-Net, low-res detail input | 42 | G | published QGDP-Net (seed 42) |
+
+Seed 42 of QGDP-Net and of the baseline already exist (the published runs), so priorities 1–3 complete three seeds of every arm. A third seed of each Session I ablation (`_s44`) is supported, but only after `g_zeros_s44`.
+
+Each row is one Kaggle session: about 8 h of training, plus validation logging and evaluation (budget 9–10 h; Kaggle's limit is 12 h). Rows are independent and can run in parallel in separate sessions. Run priorities 1 and 2 first.
+
+**Protocol (identical for every run and seed).** 20 epochs; checkpoints at epochs 10 and 20, both evaluated on validation and test; the reported checkpoint is the one with the higher **validation** mIoU. `--val-every 2` also logs validation mIoU every two epochs to `val_curve.jsonl`. That log never selects a checkpoint, saves nothing extra and does not change training (tested). The analysis is fixed in advance in `analyze_sessions_ghi.py` (kept with the paper's analysis scripts).
+
+### Cell G1 (Sessions G and I): choose the run
+
+Run Cell 1 first. Then set `RUN` to one row of the table:
 
 ```python
-os.environ['DETAIL_INPUT'] = 'zeros'   # 'image', 'zeros' or 'low_res'
-os.environ['SEED'] = '42'              # '42' or '43'
-os.environ['RUN_NAME'] = f"dice_{os.environ['DETAIL_INPUT']}_s{os.environ['SEED']}"
-Path('dice_config.json').write_text('{"overlap_loss": "dice"}\n')
+RUN = 'g_image_s43'   # one row of the table above
+
+SPEC = {  # RUN: (detail input, seed, model flags, loss config)
+    'g_image_s43': ('image', 43, '', ''),
+    'g_image_s44': ('image', 44, '', ''),
+    'g_zeros_s42': ('zeros', 42, '', ''),
+    'g_zeros_s43': ('zeros', 43, '', ''),
+    'g_zeros_s44': ('zeros', 44, '', ''),
+    'g_low_res_s42': ('low_res', 42, '', ''),
+    **{f'i_norefiner_s{s}': ('zeros', s, '--refiner-mode none', '') for s in (42, 43, 44)},
+    **{f'i_nofilm_s{s}': ('zeros', s, '--no-skip-film', '') for s in (42, 43, 44)},
+    **{f'i_noaux_s{s}': ('zeros', s, '', 'noaux_config.json') for s in (42, 43, 44)},
+}
+detail, seed, model_flags, loss_config = SPEC[RUN]
+Path('noaux_config.json').write_text('{"aux96_weight": 0, "aux192_weight": 0, "aux384_weight": 0}\n')
+os.environ.update(RUN_NAME=RUN, DETAIL_INPUT=detail, SEED=str(seed), MODEL_FLAGS=model_flags,
+                  LOSS_CONFIG=loss_config, RESUME_FROM='')
+print(RUN, '| detail input:', detail, '| seed:', seed, '| model flags:', model_flags or '-',
+      '| loss config:', loss_config or 'default (Dice)')
 ```
 
-### Cell F2: train and evaluate (complete cell; do not reuse Cell E2)
+### Cell G2 (Sessions G and I): train, check the loss, evaluate
 
-> **Result of the first attempt (2026-11-01).** All four Session F runs recorded `"overlap_loss": "lovasz"` in `history.jsonl`, so `--config dice_config.json` did not reach `train.py`. Cell F2 previously said "use Cell E2 and add the flag"; this complete cell replaces that instruction. Those four runs are kept as same-seed Lovász repeats (see the paper and `analyze_replicates.py`).
+Do not edit this cell; everything run-specific comes from Cell G1.
 
 ```bash
 %%bash
 set -euo pipefail
 run_dir="$RUN_ROOT/$RUN_NAME"
-if [[ -e "$run_dir" ]]; then echo "Refusing to reuse $run_dir"; exit 1; fi
-grep -q '"dice"' dice_config.json || { echo "dice_config.json missing or wrong"; exit 1; }
+if [[ -e "$run_dir" && -z "$RESUME_FROM" ]]; then echo "Refusing to reuse $run_dir"; exit 1; fi
 uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
     --data-root "$DATA_ROOT" --batch-size 2 --num-workers 0 --steps 3 \
-    --gradient-checkpointing --detail-input "$DETAIL_INPUT"
+    --gradient-checkpointing --detail-input "$DETAIL_INPUT" $MODEL_FLAGS
 uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
     --data-root "$DATA_ROOT" --output-dir "$run_dir" \
     --num-epochs 20 --batch-size 2 --gradient-accumulation-steps 2 \
     --gradient-checkpointing --num-workers 2 --lr 0.00001 --seed "$SEED" \
     --optimizer adam --weight-decay 0 --lr-scheduler none --warmup-ratio 0 \
-    --save-every 10 --detail-input "$DETAIL_INPUT" --config dice_config.json
-# Stop before evaluation if the run did not use Dice.
-python -c "import json,sys; h=[json.loads(l) for l in open('$run_dir/history.jsonl')]; \
-losses={r['training_config']['overlap_loss'] for r in h}; print('overlap_loss:', losses); \
-sys.exit(0 if losses == {'dice'} else 1)"
+    --save-every 10 --detail-input "$DETAIL_INPUT" $MODEL_FLAGS \
+    ${LOSS_CONFIG:+--config "$LOSS_CONFIG"} --expect-overlap-loss dice \
+    --val-every 2 --val-batch-size 2 \
+    ${RESUME_FROM:+--resume-checkpoint "$RESUME_FROM"}
+# Stop before evaluation unless every epoch used Dice (and, for no-aux runs, zero auxiliary weights).
+uv run --frozen python - "$run_dir/history.jsonl" "$LOSS_CONFIG" <<'PY'
+import json, sys
+hist = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+losses = {h["training_config"]["overlap_loss"] for h in hist}
+aux = {tuple(h["training_config"][k] for k in ("aux96_weight", "aux192_weight", "aux384_weight")) for h in hist}
+want_aux = {(0, 0, 0)} if sys.argv[2] else {(0.1, 0.2, 0.3)}
+print("epochs:", len(hist), "| overlap_loss:", losses, "| auxiliary weights:", aux)
+assert len(hist) == 20 and losses == {"dice"} and aux == want_aux, "WRONG RECIPE: do not use this run"
+PY
 for epoch in 10 20; do
     for split in val test; do
         uv run --frozen python eval.py \
@@ -403,9 +463,109 @@ for epoch in 10 20; do
         --predictions "$run_dir/eval_val_ep${epoch}" --data-root "$DATA_ROOT" \
         --output-dir "$run_dir/diagnostic_ep${epoch}"
 done
+cat "$run_dir/val_curve.jsonl"
 ```
 
-To check early, look at the first line of `$run_dir/history.jsonl` after epoch 1 (about 25 minutes): it must contain `"overlap_loss": "dice"`. If the session ends early, resume with the same command plus `--resume-checkpoint "$run_dir/checkpoint_epoch10.pt"`, keeping `--config dice_config.json`. Then run Cell Z.
+What to look for:
+- Before training, `train.py` prints a JSON line containing `"training_config": {"overlap_loss": "dice", ...}`. With the wrong loss it stops with "nothing was trained".
+- A `{"epoch": N, "val_miou": ...}` line every two epochs.
+- After training, the line `overlap_loss: {'dice'}`. If you see `WRONG RECIPE` instead, do not send that run.
+
+**If the session ends early**, start a new session with Cell 1, keep the same `RUN` in Cell G1, and before Cell G2 run:
+
+```python
+os.environ['RESUME_FROM'] = f"{os.environ['RUN_ROOT']}/{os.environ['RUN_NAME']}/checkpoint_epoch10.pt"
+```
+
+This needs the epoch-10 checkpoint, `history.jsonl` and `val_curve.jsonl` from the first session in the same folder. If the first session got past epoch 10, first cut both logs back to epoch 10, because `train.py` resumes only where its history ends:
+
+```python
+import json
+run_dir = Path(os.environ['RUN_ROOT']) / os.environ['RUN_NAME']
+for name in ('history.jsonl', 'val_curve.jsonl'):
+    path = run_dir / name
+    if path.exists():
+        kept = [l for l in path.read_text().splitlines() if l.strip() and json.loads(l)['epoch'] <= 10]
+        path.write_text(''.join(l + '\n' for l in kept))
+        print(name, 'now ends at epoch', json.loads(kept[-1])['epoch'] if kept else None)
+```
+
+The loss, seed and ablation switches are restored from the checkpoint, and a mismatch stops the run. Then run Cell Z with `RUN_NAME` unchanged.
+
+### Session H: single-scale baseline, seeds 43 and 44
+
+The baseline must be trained with its own code, commit `2079c8a` (as in Session D), using exactly the recipe of the published seed-42 run (`spatial_alignment_frozen`). From that run's history:
+- `training_recipe` `alignment` and `loss_version` `stable`;
+- Dice weight 0.5 and answer-alignment weight 0.5;
+- frozen text encoder;
+- batch 4 on two GPUs, learning rate $10^{-5}$, 20 epochs.
+
+Only the seed changes. Run Cell 1 first (for `DATA_ROOT` and `RUN_ROOT`).
+
+#### Cell H1: baseline code and run choice
+
+```python
+SEED = 43   # 43 or 44
+os.environ.update(SEED=str(SEED), RUN_NAME=f'h_single_s{SEED}')
+```
+
+```bash
+%%bash
+set -euo pipefail
+cd /kaggle/working
+rm -rf baseline_code
+git clone https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git baseline_code
+cd baseline_code
+git checkout --detach 2079c8a   # commit that trained the published single-scale baseline
+uv sync --frozen
+```
+
+#### Cell H2: train, check the recipe, evaluate
+
+```bash
+%%bash
+set -euo pipefail
+cd /kaggle/working/baseline_code
+run_dir="/kaggle/working/VizWiz-VQA-Grounding/$RUN_ROOT/$RUN_NAME"
+if [[ -e "$run_dir" ]]; then echo "Refusing to reuse $run_dir"; exit 1; fi
+echo '{"freeze_text_encoder": true, "dice_weight": 0.5, "latent_weight": 0.5}' > spatial_alignment_frozen.json
+uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
+    --data-root "$DATA_ROOT" --num-epochs 20 --batch-size 4 --num-workers 2 \
+    --lr 0.00001 --seed "$SEED" --save-every 10 \
+    --training-recipe alignment --loss-version stable --config spatial_alignment_frozen.json \
+    --output-dir "$run_dir"
+# Stop before evaluation unless the saved recipe equals the published seed-42 baseline's.
+uv run --frozen python - "$run_dir" "$SEED" <<'PY'
+import json, sys, torch
+run_dir, seed = sys.argv[1], int(sys.argv[2])
+expected = {"training_recipe": "alignment", "loss_version": "stable", "detach_predicted_answer": False,
+            "dice_weight": 0.5, "latent_weight": 0.5, "oracle_weight": 0.5, "question_weight": 0.5,
+            "kd_weight": 1.0, "attn_weight": 0.2, "gain_mix": 0.75, "warmup_epochs": 0,
+            "answer_transition_epochs": 0, "freeze_text_encoder": True, "question_only": False}
+hist = [json.loads(line) for line in open(f"{run_dir}/history.jsonl") if line.strip()]
+run = torch.load(f"{run_dir}/checkpoint_epoch20.pt", map_location="cpu", weights_only=False)["run_config"]  # file written by this run; the baseline code loads it the same way
+checks = {"20 epochs": len(hist) == 20,
+          "training_config": all(h["training_config"] == expected for h in hist),
+          "seed": run["seed"] == seed, "lr": run["lr"] == 1e-5, "batch_size": run["batch_size"] == 4,
+          "world_size": run["world_size"] == 2, "spatial_evidence": run.get("spatial_evidence") is True}
+print(checks)
+assert all(checks.values()), "WRONG RECIPE: do not use this run"
+PY
+for epoch in 10 20; do
+    for split in val test; do
+        uv run --frozen python eval.py \
+            --checkpoint "$run_dir/checkpoint_epoch${epoch}.pt" --dataset "$split" \
+            --data-root "$DATA_ROOT" --device cuda --batch-size 4 --num-workers 2 \
+            --output-dir "$run_dir/eval_${split}_ep${epoch}"
+    done
+done
+```
+
+Each `metrics.json` should say `"grounding_mode": "predicted_answer"`, as for the published baseline: it predicts an answer embedding from the image and question and never receives the answer. Then run Cell Z (the output folder is in the main repository, so Cell Z includes it). If the session ends early, rerun the training command with `--resume-checkpoint "$run_dir/checkpoint_epoch10.pt"` added (remove the `Refusing to reuse` line for that one run), then the check and the evaluation.
+
+### After each run
+
+Run Cell Z and send the ZIP, named `RUN_NAME.zip`. Checkpoints are not in the ZIP. Keep `checkpoint_epoch20.pt` of every G run (Kaggle dataset or download), because a later threshold sweep or figure may need it.
 
 ## Session T: mask-threshold sweep (inference only, about 30–60 min)
 
