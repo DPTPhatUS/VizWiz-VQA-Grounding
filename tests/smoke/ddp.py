@@ -1,14 +1,10 @@
-"""Run with torchrun --standalone --nproc_per_node=2 tests/ddp_smoke.py DATA_ROOT."""
+"""Run with torchrun --standalone --nproc_per_node=2 --module tests.smoke.ddp DATA_ROOT."""
 import argparse
 import json
-import os
-from pathlib import Path
-import sys
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import torch
 import torch.distributed as dist
 from dataset import VizWizGroundingDataset
-from models.model import build_model
+from models.factory import build_model
 from validation import validation_iou
 
 parser=argparse.ArgumentParser();parser.add_argument('root');args=parser.parse_args()

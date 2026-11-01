@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from models.mask_decoder import SkipConditioner, separable
-from models.model import GroundingModel
+from models.cm import GroundingModel
 from models.image_encoder import ImageEncoder, TinyVision
 from models.text_encoder import TextEncoder
 

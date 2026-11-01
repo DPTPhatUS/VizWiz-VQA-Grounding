@@ -14,9 +14,11 @@ from torch import nn
 from torch.utils.data import DistributedSampler
 from tqdm.auto import tqdm
 from dataset import VizWizGroundingDataset, make_loader
-from utils import (to_device, read_checkpoint, load_model_weights, model_options,
-                   CHECKPOINT_VERSION, parameter_counts, environment, save_checkpoint, sha256_file, write_json)
-from models.model import GroundingModel, build_model
+from runtime import to_device, parameter_counts, environment
+from checkpoints import read_checkpoint, load_model_weights, model_options, CHECKPOINT_VERSION, save_checkpoint
+from artifacts import sha256_file, write_json
+from models.cm import GroundingModel
+from models.factory import build_model
 from losses import SupervisedObjective
 from validation import validation_iou
 

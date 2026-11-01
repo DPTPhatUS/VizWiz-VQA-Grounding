@@ -40,7 +40,7 @@ The launcher creates the public model repository if it does not exist and verifi
 %%bash
 set -euo pipefail
 uv run --frozen python -m unittest discover -s tests -v
-uv run --frozen python -m revision.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs context_only_s42 membership_only_s42 --dry-run
+uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs context_only_s42 membership_only_s42 --dry-run
 ```
 
 ## 3. Launch selected runs
@@ -48,7 +48,7 @@ uv run --frozen python -m revision.launch --data-root "$CM_DATA_ROOT" --processe
 ```bash
 %%bash
 set -euo pipefail
-uv run --frozen python -m revision.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs context_only_s42 membership_only_s42
+uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs context_only_s42 membership_only_s42
 ```
 
 Other IDs: `ftc_s42`, `ftc_s123`, `ftc_s456`, `cm_separate_s42`, `cm_separate_s123`, `cm_separate_s456`, `cm_noaux_s42`, and `ftc_capacity_s42`.
@@ -62,7 +62,7 @@ For an unfinished run, stop training after an epoch completes and upload its sta
 ```bash
 %%bash
 set -euo pipefail
-uv run --frozen python -m revision.hub upload --run-dir outputs/revision/context_only_s42 --path-in-repo matched-20ep-v1/context_only_s42
+uv run --frozen python -m experiments.hub upload --run-dir outputs/revision/context_only_s42 --path-in-repo matched-20ep-v1/context_only_s42
 ```
 
 In a new session, repeat setup and authentication, then download that backup. This also works when the previous session ran on Vast.ai:
@@ -70,7 +70,7 @@ In a new session, repeat setup and authentication, then download that backup. Th
 ```bash
 %%bash
 set -euo pipefail
-uv run --frozen python -m revision.hub download --path-in-repo matched-20ep-v1/context_only_s42 --run-dir outputs/revision/context_only_s42
+uv run --frozen python -m experiments.hub download --path-in-repo matched-20ep-v1/context_only_s42 --run-dir outputs/revision/context_only_s42
 ```
 
 The downloader pins one remote commit and verifies hashes before exposing the restored folder. It refuses nonempty local directories. If the original working folder survived, skip the download and resume it directly:
@@ -78,7 +78,7 @@ The downloader pins one remote commit and verifies hashes before exposing the re
 ```bash
 %%bash
 set -euo pipefail
-uv run --frozen python -m revision.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs context_only_s42 --resume
+uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs context_only_s42 --resume
 ```
 
 Retain the two-process setting. `best.pt` is inference-only; resume uses `latest.pt`. After a failed upload, both local checkpoints remain available. If training already completed, the launcher's `--resume` retries the final upload without retraining. An unfinished run has no remote checkpoint until explicitly backed up; local-only work is lost if the session storage is lost.
@@ -97,9 +97,9 @@ assert Path(os.environ['CM_CKPT']).is_file()
 %%bash
 set -euo pipefail
 base="outputs/diagnostics/$CM_LABEL"
-uv run --frozen python -m revision.thresholds validation --checkpoint "$CM_CKPT" --data-root "$CM_DATA_ROOT" --output-dir "${base}_val_thresholds"
-uv run --frozen python -m revision.thresholds test --checkpoint "$CM_CKPT" --data-root "$CM_DATA_ROOT" --selection "${base}_val_thresholds/selection.json" --output-dir "${base}_test_thresholds"
-uv run --frozen python -m revision.questions --checkpoint "$CM_CKPT" --data-root "$CM_DATA_ROOT" --donors outputs/diagnostics/donors_val_s2027.json --output-dir "${base}_questions"
+uv run --frozen python -m diagnostics.thresholds validation --checkpoint "$CM_CKPT" --data-root "$CM_DATA_ROOT" --output-dir "${base}_val_thresholds"
+uv run --frozen python -m diagnostics.thresholds test --checkpoint "$CM_CKPT" --data-root "$CM_DATA_ROOT" --selection "${base}_val_thresholds/selection.json" --output-dir "${base}_test_thresholds"
+uv run --frozen python -m diagnostics.questions --checkpoint "$CM_CKPT" --data-root "$CM_DATA_ROOT" --donors outputs/diagnostics/donors_val_s2027.json --output-dir "${base}_questions"
 ```
 
 For CM checkpoints only:
@@ -107,7 +107,7 @@ For CM checkpoints only:
 ```bash
 %%bash
 set -euo pipefail
-uv run --frozen python -m revision.roles --checkpoint "$CM_CKPT" --data-root "$CM_DATA_ROOT" --output-dir "outputs/diagnostics/${CM_LABEL}_roles"
+uv run --frozen python -m diagnostics.roles --checkpoint "$CM_CKPT" --data-root "$CM_DATA_ROOT" --output-dir "outputs/diagnostics/${CM_LABEL}_roles"
 ```
 
 ## 6. Benchmark and summarize
@@ -117,9 +117,9 @@ Run benchmarks once per GPU/precision combination, without concurrent training:
 ```bash
 %%bash
 set -euo pipefail
-uv run --frozen python -m revision.benchmark --device cuda --output outputs/benchmark_fp32.json
-uv run --frozen python -m revision.benchmark --device cuda --precision fp16 --output outputs/benchmark_fp16.json
-uv run --frozen python -m revision.summarize --root outputs/revision --output-dir outputs/study_summary
+uv run --frozen python -m diagnostics.benchmark --device cuda --output outputs/benchmark_fp32.json
+uv run --frozen python -m diagnostics.benchmark --device cuda --precision fp16 --output outputs/benchmark_fp16.json
+uv run --frozen python -m experiments.summarize --root outputs/revision --output-dir outputs/study_summary
 ```
 
 Gather completed run folders from all sessions before the final summary. Missing runs are listed; a partial summary is not a completed multi-seed experiment.
@@ -131,8 +131,8 @@ Hub backups include checkpoints and run/test metrics. Save diagnostic reports, p
 ```bash
 %%bash
 set -euo pipefail
-uv run --frozen python -m revision.export --root outputs --output /kaggle/working/cm_records.zip
-uv run --frozen python -m revision.export --root outputs/revision --output /kaggle/working/cm_resume.zip --include-checkpoints
+uv run --frozen python -m experiments.export --root outputs --output /kaggle/working/cm_records.zip
+uv run --frozen python -m experiments.export --root outputs/revision --output /kaggle/working/cm_resume.zip --include-checkpoints
 ```
 
 ```python
@@ -141,4 +141,4 @@ display(FileLink('/kaggle/working/cm_records.zip'))
 display(FileLink('/kaggle/working/cm_resume.zip'))
 ```
 
-Manual intermediate backups remain in Hub history. See the [backup/storage notes](README.md#hugging-face-backups-and-machine-transfers). Use [VAST.md](VAST.md) for the equivalent SSH workflow.
+Manual intermediate backups remain in Hub history. See the [backup/storage notes](../README.md#hugging-face-backups-and-machine-transfers). Use the [Vast.ai guide](vast.md) for the equivalent SSH workflow.

@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 import torch
 from dataset import VizWizGroundingDataset, make_loader
-from utils import read_checkpoint, model_from_checkpoint, sha256_file, environment
+from checkpoints import read_checkpoint, model_from_checkpoint
+from artifacts import sha256_file
+from runtime import environment
 from metrics import evaluate_counts, summarize_counts, sample_metrics
 
 

@@ -5,7 +5,7 @@ import torch
 from torch.nn import functional as F
 from torchvision.transforms.functional import to_tensor
 from PIL import Image, ImageOps
-from utils import read_checkpoint, model_from_checkpoint
+from checkpoints import read_checkpoint, model_from_checkpoint
 
 
 def prediction_parser(description=__doc__):

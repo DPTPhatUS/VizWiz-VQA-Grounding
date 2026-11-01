@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from tqdm.auto import tqdm
-from utils import to_device
+from runtime import to_device
 from losses import per_image_iou
 
 

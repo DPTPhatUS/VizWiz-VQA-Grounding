@@ -4,7 +4,8 @@ import csv
 import json
 from pathlib import Path
 import statistics
-from utils import write_json, sha256_file
+from artifacts import write_json, sha256_file, new_output
+from runtime import DEFAULT_MANIFEST
 
 METRICS=('mean_iou','acc50','macro_precision','macro_recall','severe_count')
 
@@ -49,10 +50,9 @@ def summarize(root,manifest):
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root',default='outputs/revision')
-    parser.add_argument('--manifest',default=str(Path(__file__).with_name('high_priority.json')))
+    parser.add_argument('--manifest',default=str(DEFAULT_MANIFEST))
     parser.add_argument('--output-dir',required=True)
     args=parser.parse_args(argv)
-    from revision.common import new_output
     result=summarize(args.root,json.loads(Path(args.manifest).read_text()))
     out=new_output(args.output_dir);write_json(out/'summary.json',result)
     with (out/'runs.csv').open('w',newline='') as stream:

@@ -5,8 +5,9 @@ import json
 import statistics
 import time
 import torch
-from models.model import build_model
-from utils import environment, parameter_counts, write_json
+from models.factory import build_model
+from runtime import environment, parameter_counts
+from artifacts import write_json
 
 
 @torch.inference_mode()

@@ -5,10 +5,11 @@ import sys
 from PIL import Image
 import torch
 from dataset import VizWizGroundingDataset, collate_samples
-from models.model import build_model
+from models.factory import build_model
 from losses import SupervisedObjective
 from train import training_parser, configure_run, seed_everything
-from utils import read_checkpoint, load_model_weights, parameter_counts, to_device
+from checkpoints import read_checkpoint, load_model_weights
+from runtime import parameter_counts, to_device
 
 
 def validate_data(root,splits=('train','val')):

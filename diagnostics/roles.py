@@ -4,8 +4,9 @@ import json
 import torch
 from losses import membership_targets, membership_loss
 from metrics import native_logits, overlap_counts, sample_metrics
-from utils import to_device, write_json
-from revision.common import inference_arguments, load_inference, new_output, size_bin
+from runtime import to_device
+from artifacts import write_json, new_output
+from diagnostics.common import inference_arguments, load_inference, size_bin
 
 
 def role_counts(output,mask):

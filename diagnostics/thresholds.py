@@ -5,8 +5,9 @@ import math
 from pathlib import Path
 import torch
 from metrics import native_logits, overlap_counts, summarize_counts
-from utils import to_device, write_json
-from revision.common import inference_arguments, load_inference, new_output, plot_lines
+from runtime import to_device
+from artifacts import write_json, new_output
+from diagnostics.common import inference_arguments, load_inference, plot_lines
 
 THRESHOLDS = [i/100 for i in range(10,91,5)]
 

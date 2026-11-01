@@ -3,11 +3,9 @@ data/
 outputs*/
 results*/
 __pycache__/
-models/__pycache__/
 *.pyc
 *.txt
 .omo
 !.omo/rules/
 !.omo/rules/**
 yolo*.pt
-docs/

@@ -7,7 +7,8 @@ from pathlib import Path, PurePosixPath
 import tempfile
 import time
 
-from utils import checkpoint_metadata, sha256_file, write_json
+from checkpoints import checkpoint_metadata
+from artifacts import sha256_file, write_json
 
 DEFAULT_REPO = 'Last-Bullet/vizwiz-cm-aciids-2027'
 RECORDS = ('run.json', 'history.jsonl', 'manifest_run.json', 'test/metrics.json',

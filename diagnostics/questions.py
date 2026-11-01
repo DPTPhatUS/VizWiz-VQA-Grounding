@@ -7,8 +7,9 @@ from pathlib import Path
 import torch
 from dataset import collate_samples
 from metrics import native_logits, overlap_counts, sample_metrics
-from utils import to_device, write_json
-from revision.common import inference_arguments, load_inference, new_output
+from runtime import to_device
+from artifacts import write_json, new_output
+from diagnostics.common import inference_arguments, load_inference
 
 CONDITIONS=('original','repeat','shuffled','generic','empty')
 

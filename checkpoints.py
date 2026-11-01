@@ -1,12 +1,6 @@
-"""Strict model reconstruction, checkpoint IO, and run provenance."""
-import hashlib
-import importlib.metadata
-import json
+"""Strict study-checkpoint reconstruction and resumable-state IO."""
 import os
 from pathlib import Path
-import platform
-import subprocess
-import sys
 import torch
 
 CHECKPOINT_VERSION = 1
@@ -19,10 +13,6 @@ def validate_checkpoint(saved):
         if not isinstance(saved.get(key), dict):
             raise ValueError(f'Checkpoint requires a {key} dictionary')
     return saved
-
-
-def to_device(batch, device):
-    return {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
 
 
 def read_checkpoint(path):
@@ -52,7 +42,7 @@ def load_model_weights(model, saved, assign=False):
 
 
 def model_from_checkpoint(saved):
-    from models.model import build_model
+    from models.factory import build_model
     options = model_options(saved)
     # Avoid allocating a second CLIP copy alongside optimizer-heavy resumable files.
     with torch.device('meta'):
@@ -63,7 +53,7 @@ def model_from_checkpoint(saved):
 
 
 def materialize_position_buffers(model):
-    """CLIP's nonpersistent position IDs are absent from state_dict, even in old files."""
+    """Reconstruct CLIP position IDs, which are nonpersistent and absent from state_dict."""
     device = next(model.parameters()).device
     for module in model.modules():
         for name, buffer in module._buffers.items():
@@ -72,48 +62,6 @@ def materialize_position_buffers(model):
                     raise ValueError(f'Unmaterialized nonpersistent buffer: {type(module).__name__}.{name}')
                 module._buffers[name] = torch.arange(buffer.shape[-1], dtype=buffer.dtype,
                                                      device=device).expand(buffer.shape)
-
-
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with Path(path).open('rb') as stream:
-        for chunk in iter(lambda: stream.read(8 << 20), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def environment():
-    versions = {}
-    for name in ('torch', 'torchvision', 'transformers', 'huggingface-hub', 'numpy', 'Pillow', 'matplotlib'):
-        try:
-            versions[name] = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
-            versions[name] = None
-    root = Path(__file__).resolve().parent
-    def git(*args):
-        result = subprocess.run(['git', '-C', str(root), *args], capture_output=True, text=True)
-        return result.stdout.strip() if result.returncode == 0 else None
-    digest = hashlib.sha256()
-    for path in sorted(root.rglob('*.py')):
-        if any(part in ('.venv', '__pycache__', 'tests', 'outputs', 'results') for part in path.relative_to(root).parts):
-            continue
-        digest.update(str(path.relative_to(root)).encode()); digest.update(path.read_bytes())
-    return {'python': sys.version, 'platform': platform.platform(), 'versions': versions,
-            'git_commit': git('rev-parse', 'HEAD'), 'git_dirty': bool(git('status', '--porcelain')),
-            'source_sha256': digest.hexdigest(), 'cuda_version': torch.version.cuda}
-
-
-def parameter_counts(model):
-    count = lambda module, trainable=False: sum(p.numel() for p in module.parameters() if not trainable or p.requires_grad)
-    return {'total': count(model), 'trainable': count(model, True),
-            'decoder_registered': count(model.decoder), 'decoder_trainable': count(model.decoder, True)}
-
-
-def write_json(path, value):
-    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + '.tmp')
-    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + '\n')
-    os.replace(temporary, path)
 
 
 def save_checkpoint(path, saved):

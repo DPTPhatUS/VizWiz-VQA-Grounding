@@ -11,12 +11,12 @@ import numpy as np
 from PIL import Image
 import torch
 
-from models.model import GroundingModel
+from models.cm import GroundingModel
 from models.connections import ConnectionNetwork, ContextMembership, neighborhood
 from models.text_encoder import TextFeatures
 from losses import SupervisedObjective, membership_loss
-from utils import load_model_weights, model_from_checkpoint, read_checkpoint
-import train
+from checkpoints import load_model_weights, model_from_checkpoint, read_checkpoint
+import train as train
 import eval as evaluation
 from predict_save import predict_image
 

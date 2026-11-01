@@ -1,6 +1,7 @@
 from .image_encoder import ImageEncoder
 from .text_encoder import TextEncoder
 from .mask_decoder import CompactDecoder
-from .model import GroundingModel, build_model
+from .cm import GroundingModel
+from .factory import build_model
 
 __all__ = ['ImageEncoder', 'TextEncoder', 'CompactDecoder', 'GroundingModel', 'build_model']

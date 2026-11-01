@@ -11,14 +11,14 @@ from unittest.mock import patch
 from huggingface_hub.errors import EntryNotFoundError
 import torch
 
-from support import fixture_data
+from tests.support import fixture_data
 import eval as evaluation
-from revision.hub import (backup_plan, check_destination, download_run, hub_path, upload_run)
-from revision.launch import commands
-from revision import launch
-from utils import read_checkpoint
-import train
-import preflight
+from experiments.hub import backup_plan, check_destination, download_run, hub_path, upload_run
+from experiments.launch import commands
+from experiments import launch
+from checkpoints import read_checkpoint
+import train as train
+import preflight as preflight
 
 
 class MemoryHub:
@@ -76,9 +76,9 @@ class HubWorkflow(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.data = fixture_data(self.root/'data')
         self.hub = MemoryHub(self.root)
-        for target, replacement in [('revision.hub._api',lambda:self.hub),
+        for target, replacement in [('experiments.hub._api',lambda:self.hub),
                                     ('huggingface_hub.hf_hub_download',self.hub.download),
-                                    ('revision.hub.time.sleep',lambda _:None)]:
+                                    ('experiments.hub.time.sleep',lambda _:None)]:
             mock = patch(target,replacement)
             mock.start()
             self.addCleanup(mock.stop)
@@ -173,7 +173,7 @@ class HubWorkflow(unittest.TestCase):
             upload_run(historical,self.repo,self.path)
 
     def test_launcher_uploads_once_after_training_and_test_and_resume_skips_training(self):
-        manifest=json.loads(Path('revision/high_priority.json').read_text())
+        manifest=json.loads(Path('configs/high_priority.json').read_text())
         cmds=commands(manifest,manifest['runs'][0],self.data,self.out,'cuda',2)
         self.assertTrue(all('--hf-repo' not in cmd for cmd in cmds))
         manifest['runs']=manifest['runs'][:1]
@@ -184,7 +184,8 @@ class HubWorkflow(unittest.TestCase):
         def execute(command,**kwargs):
             self.assertEqual(self.hub.calls,0)
             calls.append(command[1])
-            {'preflight.py':preflight.main,'train.py':train.train_main,'eval.py':evaluation.eval_main}[command[1]](command[2:])
+            {'preflight.py':preflight.main,'train.py':train.train_main,
+             'eval.py':evaluation.eval_main}[command[1]](command[2:])
         argv=['--manifest',str(path),'--data-root',str(self.data),'--device','cpu',
               '--output-root',str(self.root/'campaign')]
         with contextlib.redirect_stdout(io.StringIO()),patch.object(launch,'subprocess',SimpleNamespace(run=execute)):

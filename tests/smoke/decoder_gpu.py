@@ -1,10 +1,7 @@
 """Opt-in full-resolution decoder smoke test; does not train a CLIP backbone."""
 import json
-from pathlib import Path
-import sys
 import time
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 from models.mask_decoder import CompactDecoder
 from models.text_encoder import TextFeatures

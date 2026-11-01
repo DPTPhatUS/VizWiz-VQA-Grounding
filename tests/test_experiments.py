@@ -9,19 +9,20 @@ import unittest
 from unittest.mock import patch
 import torch
 from torch import nn
-from dataset import VizWizGroundingDataset,collate_samples
-from losses import SupervisedObjective,segmentation_loss,membership_targets
-from models.model import GroundingModel,build_model
+from dataset import VizWizGroundingDataset, collate_samples
+from losses import SupervisedObjective, segmentation_loss, membership_targets
+from models.cm import GroundingModel
+from models.factory import build_model
 from models.ftc import FTCDecoder
-from metrics import metric_samples,native_logits,overlap_counts,summarize_counts
-from utils import model_from_checkpoint,read_checkpoint,load_model_weights,materialize_position_buffers
-from revision.questions import donor_mapping,get_donors,analyze as question_analysis
-from revision.roles import role_counts,aggregate
-from revision.thresholds import THRESHOLDS,select_threshold
-from revision.launch import commands
-from support import fixture_data
-import train
-import preflight
+from metrics import metric_samples, native_logits, overlap_counts, summarize_counts
+from checkpoints import model_from_checkpoint, read_checkpoint, load_model_weights, materialize_position_buffers
+from diagnostics.questions import donor_mapping, get_donors, analyze as question_analysis
+from diagnostics.roles import role_counts, aggregate
+from diagnostics.thresholds import THRESHOLDS, select_threshold
+from experiments.launch import commands
+from tests.support import fixture_data
+import train as train
+import preflight as preflight
 
 FIXTURES=Path(__file__).parent/'fixtures'
 
@@ -216,8 +217,8 @@ class RevisionPipeline(unittest.TestCase):
             data=fixture_data(Path(tmp)/'data');self.assertEqual(preflight.validate_data(data),{'train':4,'val':3})
             for options in [[],['--disable-context'],['--disable-membership'],['--model','ftc'],['--model','ftc-capacity']]:
                 result=preflight.main(['--tiny','--device','cpu','--data-root',str(data),*options]);self.assertTrue(math.isfinite(result['losses'][0]))
-            manifest=json.loads(Path('revision/high_priority.json').read_text());self.assertEqual(len(manifest['runs']),10)
-            from revision.launch import main
+            manifest=json.loads(Path('configs/high_priority.json').read_text());self.assertEqual(len(manifest['runs']),10)
+            from experiments.launch import main
             absent=Path(tmp)/'never-created';main(['--data-root',str(data),'--output-root',str(absent),'--runs','ftc_s42','--dry-run'])
             self.assertFalse(absent.exists());cmds=commands(manifest,manifest['runs'][0],data,absent,'cpu',2)
             self.assertIn('torch.distributed.run',cmds[1]);self.assertIn('--val-every',cmds[1])

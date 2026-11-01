@@ -4,9 +4,8 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-from utils import write_json
-
-ROOT=Path(__file__).resolve().parents[1]
+from artifacts import write_json
+from runtime import DEFAULT_MANIFEST, PROJECT_ROOT
 
 
 def run_arguments(common,run,data_root,out,device):
@@ -34,7 +33,7 @@ def commands(manifest,run,data_root,out,device,processes,resume=False):
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--manifest',default=str(ROOT/'revision/high_priority.json'))
+    parser.add_argument('--manifest',default=str(DEFAULT_MANIFEST))
     parser.add_argument('--runs',nargs='+',help='Run IDs; omitted means all runs sequentially')
     parser.add_argument('--data-root',required=True);parser.add_argument('--output-root',default='outputs/revision')
     parser.add_argument('--device',choices=('cpu','cuda'),default='cuda')
@@ -49,7 +48,7 @@ def main(argv=None):
     if args.no_hub and (args.hf_repo or args.hf_prefix):
         raise ValueError('Cannot combine --no-hub with Hub destination options')
     if (args.hf_repo or args.hf_prefix) and not hub:
-        from revision.hub import DEFAULT_REPO
+        from experiments.hub import DEFAULT_REPO
         hub = {'repo_id':DEFAULT_REPO,'prefix':manifest['name'],'private':False}
     if args.hf_repo:
         hub['repo_id'] = args.hf_repo
@@ -70,14 +69,14 @@ def main(argv=None):
         steps=commands(manifest,run,data_root,out,args.device,args.processes,args.resume)
         destination = None
         if hub:
-            from revision.hub import hub_path
+            from experiments.hub import hub_path
             destination = {'repo_id':hub['repo_id'], 'path':hub_path(f'{hub["prefix"]}/{run["id"]}'),
                            'private':hub.get('private',False), 'when':'after-training-and-test'}
         print(json.dumps({'run':run['id'],'commands':steps,'huggingface':destination}),flush=True)
         if args.dry_run:continue
         complete=False
         if args.resume:
-            from utils import checkpoint_metadata
+            from checkpoints import checkpoint_metadata
             saved=checkpoint_metadata(out/'latest.pt')
             desired=dict(manifest['common'],**{k:v for k,v in run.items() if k!='id'})
             for key,value in desired.items():
@@ -85,22 +84,22 @@ def main(argv=None):
                     raise ValueError(f'Resume manifest conflicts on {key}')
             complete=saved['epoch']==manifest['common']['num_epochs']
         if hub:
-            from revision.hub import check_destination
+            from experiments.hub import check_destination
             _, previous, _ = check_destination(hub['repo_id'],destination['path'],
                 saved['run_config']['run_uuid'] if args.resume else None,hub.get('private',False))
             if previous is not None and previous['epoch'] > saved['epoch']:
                 raise ValueError('Hub backup is newer than local progress; download before resuming')
         if not complete:
-            for command in steps[:2]:subprocess.run(command,cwd=ROOT,check=True)
-        if not (out/'test/metrics.json').exists():subprocess.run(steps[2],cwd=ROOT,check=True)
+            for command in steps[:2]:subprocess.run(command,cwd=PROJECT_ROOT,check=True)
+        if not (out/'test/metrics.json').exists():subprocess.run(steps[2],cwd=PROJECT_ROOT,check=True)
         else:
-            from utils import sha256_file
+            from artifacts import sha256_file
             previous=json.loads((out/'test/metrics.json').read_text())
             if previous['summary'].get('checkpoint_sha256')!=sha256_file(out/'best.pt'):
                 raise ValueError('Existing test evaluation is for a different checkpoint')
         write_json(out/'manifest_run.json',{'cohort':manifest['name'],'run':run,'common':manifest['common']})
         if hub:
-            from revision.hub import upload_run
+            from experiments.hub import upload_run
             result=upload_run(out,hub['repo_id'],f'{hub["prefix"]}/{run["id"]}',hub.get('private',False))
             print(json.dumps({'huggingface_final':result}),flush=True)
 

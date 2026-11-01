@@ -1,9 +1,9 @@
 """Shared inference arguments, outputs, and provenance."""
-from pathlib import Path
 import torch
 from dataset import VizWizGroundingDataset, make_loader
-from utils import (read_checkpoint, model_from_checkpoint, sha256_file, environment,
-                   parameter_counts, write_json)
+from checkpoints import read_checkpoint, model_from_checkpoint
+from artifacts import sha256_file
+from runtime import environment, parameter_counts
 
 
 def inference_arguments(parser):
@@ -15,13 +15,6 @@ def inference_arguments(parser):
     parser.add_argument('--limit', type=int, default=0, help='Smoke tests only; never use for publication results')
     parser.add_argument('--output-dir', required=True)
 
-
-def new_output(path):
-    path = Path(path)
-    if path.exists() and any(path.iterdir()):
-        raise ValueError(f'Refusing to reuse nonempty output: {path}')
-    path.mkdir(parents=True, exist_ok=True)
-    return path
 
 
 def load_inference(args, split):
