@@ -45,6 +45,7 @@ Select checkpoints by validation only; test metrics are reported, never used for
 | G | G | `train.py`, Dice, `--detail-input {image, zeros}`, seeds 42–44 | Multi-seed headline and Dice-matched detail-pathway comparison |
 | H | H | Baseline commit `2079c8a`, published recipe, seeds 43, 44 | Multi-seed single-scale baseline |
 | I (optional) | I | `train.py --detail-input zeros` with `--refiner-mode none`, `--no-skip-film` or zero auxiliary weights, seeds 42, 43 | Which decoder components matter |
+| J | J | QGDP-Net (Session G cells) and the baseline (Session H cells), seeds 45, 46 | Two more seeds for the headline comparison |
 
 Each continuation run takes about as long as one run of the previous one-session A/B guide, so plan two or three runs per Session A. Run the seven continuation runs over several sessions by changing `RUNS` in Cell A2.
 
@@ -409,6 +410,7 @@ SPEC = {  # RUN: (detail input, seed, model flags, loss config)
     'g_zeros_s43': ('zeros', 43, '', ''),
     'g_zeros_s44': ('zeros', 44, '', ''),
     'g_low_res_s42': ('low_res', 42, '', ''),
+    **{f'g_image_s{s}': ('image', s, '', '') for s in (45, 46)},  # Session J
     **{f'i_norefiner_s{s}': ('zeros', s, '--refiner-mode none', '') for s in (42, 43, 44)},
     **{f'i_nofilm_s{s}': ('zeros', s, '--no-skip-film', '') for s in (42, 43, 44)},
     **{f'i_noaux_s{s}': ('zeros', s, '', 'noaux_config.json') for s in (42, 43, 44)},
@@ -505,7 +507,7 @@ Only the seed changes. Run Cell 1 first (for `DATA_ROOT` and `RUN_ROOT`).
 #### Cell H1: baseline code and run choice
 
 ```python
-SEED = 43   # 43 or 44
+SEED = 43   # 43 or 44 (Session H); 45 or 46 (Session J)
 os.environ.update(SEED=str(SEED), RUN_NAME=f'h_single_s{SEED}')
 ```
 
@@ -566,6 +568,19 @@ Each `metrics.json` should say `"grounding_mode": "predicted_answer"`, as for th
 ### After each run
 
 Run Cell Z and send the ZIP, named `RUN_NAME.zip`. Checkpoints are not in the ZIP. Keep `checkpoint_epoch20.pt` of every G run (Kaggle dataset or download), because a later threshold sweep or figure may need it.
+
+## Session J: two more seeds for the headline (45, 46)
+
+Why: the seed-42 pair has the largest gap (+2.16 test, against +0.91 and +0.78 at seeds 43 and 44). Code, recipe and evaluation are the same for all three seeds (checked 2026-11-02), so seed 42 was a favourable draw, and a rerun of seed 42 would not settle anything (same-seed reruns differ by up to 2.9 points). More seeds make the headline less dependent on any single draw. These runs use the existing cells; only the run choice changes.
+
+| Priority | Run | Cells | Setting |
+|---|---|---|---|
+| 1 | `g_image_s45` | G1, G2 | `RUN = 'g_image_s45'` |
+| 1 | `h_single_s45` | H1, H2 | `SEED = 45` |
+| 2 | `g_image_s46` | G1, G2 | `RUN = 'g_image_s46'` |
+| 2 | `h_single_s46` | H1, H2 | `SEED = 46` |
+
+Run the two rows of a seed together; a seed without its partner is not used in the paired comparison. Session J and Session I are independent, so they can run in parallel. If sessions are limited, use this order: `g_image_s45` and `h_single_s45`, then Session I seeds 42 and 43, then `g_image_s46` and `h_single_s46`. The protocol, recipe checks and Cell Z are unchanged, and the analysis was fixed before these runs (`analyze_sessions_ghi.py`, section "Session J").
 
 ## Session T: mask-threshold sweep (inference only, about 30–60 min)
 
