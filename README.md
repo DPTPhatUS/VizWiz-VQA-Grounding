@@ -46,6 +46,9 @@ Select checkpoints by validation only; test metrics are reported, never used for
 | H | H | Baseline commit `2079c8a`, published recipe, seeds 43, 44 | Multi-seed single-scale baseline |
 | I (optional) | I | `train.py --detail-input zeros` with `--refiner-mode none`, `--no-skip-film` or zero auxiliary weights, seeds 42, 43 | Which decoder components matter |
 | J | J | QGDP-Net (Session G cells) and the baseline (Session H cells), seeds 45, 46 | Two more seeds for the headline comparison |
+| L1 | L | Baseline commit `2079c8a`, question-only recipe (as A2), seeds 43, 44 | Answer-alignment loss on three seeds; cleanest single-scale baseline |
+| L2 | L | `train.py --freeze-vision-encoder --freeze-text-encoder`, seeds 43, 44 | Encoder adaptation on three seeds |
+| L3 | L | `clipseg_baseline.py` (CLIPSeg, frozen CLIP, trained decoder), learning rate chosen on seed 42, then seeds 43, 44 | External baseline |
 
 Each continuation run takes about as long as one run of the previous one-session A/B guide, so plan two or three runs per Session A. Run the seven continuation runs over several sessions by changing `RUNS` in Cell A2.
 
@@ -581,6 +584,188 @@ Why: the seed-42 pair has the largest gap (+2.16 test, against +0.91 and +0.78 a
 | 2 | `h_single_s46` | H1, H2 | `SEED = 46` |
 
 Run the two rows of a seed together; a seed without its partner is not used in the paired comparison. Session J and Session I are independent, so they can run in parallel. If sessions are limited, use this order: `g_image_s45` and `h_single_s45`, then Session I seeds 42 and 43, then `g_image_s46` and `h_single_s46`. The protocol, recipe checks and Cell Z are unchanged, and the analysis was fixed before these runs (`analyze_sessions_ghi.py`, section "Session J").
+
+## Session L: extra controls (question-only baseline, frozen encoder, CLIPSeg)
+
+Each control below exists for seed 42 only, or not at all. These sessions give three seeds of each, with the analysis fixed in advance (`analyze_session_l.py`). Run Cell 1 first in every session, and Cell Z at the end with `os.environ['RUN_NAME']` set as shown.
+
+| Priority | Run(s) | Cells | Kaggle sessions | Time (estimate) |
+|---|---|---|---|---|
+| 1 | `l_qonly_s43`, `l_qonly_s44` | L1a, L1b | one per seed | about 8–9 h (same model as Session H) |
+| 2 | `l_frozen_s43`, `l_frozen_s44` | L2a, L2b | one per seed | about 5–8 h (no backward pass through the ViT) |
+| 3 | all four CLIPSeg runs | L3a, L3b | one session (both GPUs), or one per phase | about 2–4 h per phase |
+
+The removed-detail-pathway model (item 7) needs no GPU. With zeroed detail maps, every weight that touches the detail pathway multiplies zeros and receives exactly zero gradient; changing those weights changes the output by exactly 0.0 (`tests/test_zero_equivalence.py`). The trained zeroed models (`g_zeros_s42/43/44`) are therefore the model without the pathway.
+
+### Session L1: question-only baseline, seeds 43 and 44
+
+Same code (`2079c8a`) and command as the seed-42 question-only run (Cell D2); only the seed changes.
+
+#### Cell L1a
+
+```python
+SEED = 43   # 43 or 44
+os.environ.update(SEED=str(SEED), RUN_NAME=f'l_qonly_s{SEED}')
+```
+
+#### Cell L1b: train, check the recipe, evaluate
+
+```bash
+%%bash
+set -euo pipefail
+cd /kaggle/working
+rm -rf baseline_code
+git clone https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git baseline_code
+cd baseline_code
+git checkout --detach 2079c8a   # commit that trained the seed-42 question-only baseline
+uv sync --frozen
+run_dir="/kaggle/working/VizWiz-VQA-Grounding/$RUN_ROOT/$RUN_NAME"
+if [[ -e "$run_dir" ]]; then echo "Refusing to reuse $run_dir"; exit 1; fi
+echo '{"freeze_text_encoder": true, "question_only": true, "dice_weight": 0.5}' > a2_config.json
+uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
+    --data-root "$DATA_ROOT" --num-epochs 20 --batch-size 4 --num-workers 2 \
+    --lr 0.00001 --seed "$SEED" --save-every 10 \
+    --training-recipe grounding-only --config a2_config.json \
+    --output-dir "$run_dir"
+# Stop before evaluation unless the recipe equals the seed-42 question-only run's.
+uv run --frozen python - "$run_dir" "$SEED" <<'PY'
+import json, sys, torch
+run_dir, seed = sys.argv[1], int(sys.argv[2])
+expected = {"training_recipe": "grounding-only", "loss_version": "legacy", "detach_predicted_answer": False,
+            "dice_weight": 0.5, "latent_weight": 0.5, "oracle_weight": 0.5, "question_weight": 0.5,
+            "kd_weight": 1.0, "attn_weight": 0.2, "gain_mix": 0.75, "warmup_epochs": 0,
+            "answer_transition_epochs": 0, "freeze_text_encoder": True, "question_only": True}
+hist = [json.loads(line) for line in open(f"{run_dir}/history.jsonl") if line.strip()]
+run = torch.load(f"{run_dir}/checkpoint_epoch20.pt", map_location="cpu", weights_only=False)["run_config"]  # file written by this run
+checks = {"20 epochs": len(hist) == 20,
+          "training_config": all(h["training_config"] == expected for h in hist),
+          "seed": run["seed"] == seed, "lr": run["lr"] == 1e-5, "batch_size": run["batch_size"] == 4,
+          "world_size": run["world_size"] == 2}
+print(checks)
+assert all(checks.values()), "WRONG RECIPE: do not use this run"
+PY
+for epoch in 10 20; do
+    for split in val test; do
+        uv run --frozen python eval.py \
+            --checkpoint "$run_dir/checkpoint_epoch${epoch}.pt" --dataset "$split" \
+            --data-root "$DATA_ROOT" --device cuda --batch-size 4 --num-workers 2 \
+            --output-dir "$run_dir/eval_${split}_ep${epoch}"
+    done
+done
+```
+
+### Session L2: QGDP-Net with frozen encoders, seeds 43 and 44
+
+The seed-42 run (`question_guided_detail_pyramid_frozen_backbone_ep20_seed42`) recorded: Adam, lr $10^{-5}$, no weight decay or schedule, vision and text encoders frozen, batch 2 × accumulation 2 on two GPUs, gradient checkpointing, Dice, 6,649,101 trainable parameters. The current code reproduces exactly this with the flags below (the same count is printed before training as `"trainable_parameters": 6649101`).
+
+#### Cell L2a
+
+```python
+SEED = 43   # 43 or 44
+os.environ.update(SEED=str(SEED), RUN_NAME=f'l_frozen_s{SEED}')
+```
+
+#### Cell L2b: train, check the recipe, evaluate
+
+```bash
+%%bash
+set -euo pipefail
+run_dir="$RUN_ROOT/$RUN_NAME"
+if [[ -e "$run_dir" ]]; then echo "Refusing to reuse $run_dir"; exit 1; fi
+FREEZE="--freeze-vision-encoder --freeze-text-encoder"
+uv run --frozen torchrun --standalone --nproc_per_node=2 preflight.py \
+    --data-root "$DATA_ROOT" --batch-size 2 --num-workers 0 --steps 3 \
+    --gradient-checkpointing $FREEZE
+uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
+    --data-root "$DATA_ROOT" --output-dir "$run_dir" \
+    --num-epochs 20 --batch-size 2 --gradient-accumulation-steps 2 \
+    --gradient-checkpointing --num-workers 2 --lr 0.00001 --seed "$SEED" \
+    --optimizer adam --weight-decay 0 --lr-scheduler none --warmup-ratio 0 $FREEZE \
+    --save-every 10 --expect-overlap-loss dice --val-every 2 --val-batch-size 2
+# Stop before evaluation unless every epoch used Dice and both encoders were frozen.
+uv run --frozen python - "$run_dir" <<'PY'
+import json, sys, torch
+run_dir = sys.argv[1]
+hist = [json.loads(line) for line in open(f"{run_dir}/history.jsonl") if line.strip()]
+run = torch.load(f"{run_dir}/checkpoint_epoch20.pt", map_location="cpu", weights_only=False)["run_config"]  # file written by this run
+opt = run["optimization_config"]
+cfg = {(h["training_config"]["overlap_loss"], h["training_config"]["aux96_weight"], h["training_config"]["aux192_weight"],
+        h["training_config"]["aux384_weight"]) for h in hist}
+checks = {"20 epochs": len(hist) == 20, "dice and default auxiliary weights": cfg == {("dice", 0.1, 0.2, 0.3)},
+          "vision frozen": opt["freeze_vision_encoder"] is True, "text frozen": opt["freeze_text_encoder"] is True,
+          "adam, lr 1e-5, no weight decay": (opt["optimizer"], opt["lr"], opt["weight_decay"]) == ("adam", 1e-5, 0.0)}
+print(checks)
+assert all(checks.values()), "WRONG RECIPE: do not use this run"
+PY
+for epoch in 10 20; do
+    for split in val test; do
+        uv run --frozen python eval.py \
+            --checkpoint "$run_dir/checkpoint_epoch${epoch}.pt" --dataset "$split" \
+            --data-root "$DATA_ROOT" --device cuda --batch-size "$EVAL_BATCH" --num-workers 2 \
+            --output-dir "$run_dir/eval_${split}_ep${epoch}"
+    done
+done
+cat "$run_dir/val_curve.jsonl"
+```
+
+### Session L3: CLIPSeg external baseline (one session, both GPUs)
+
+CLIPSeg (`CIDAS/clipseg-rd64-refined`, CLIP ViT-B/16) as published: the CLIP encoders stay frozen and only the decoder (1.13M parameters, from the released weights) is trained, with the question as the prompt. Recipe as close to ours as the method allows: full-frame resize, BCE + 0.5 Dice at 768 px, Adam, constant learning rate, clipping 1.0, batch 4, 20 epochs, evaluation at epochs 10 and 20 with our metric code, selection by validation. The protocol is fixed in the header of `clipseg_baseline.py`. Phase 1 trains seed 42 with learning rates $10^{-4}$ and $10^{-5}$ in parallel (one per GPU); the cell then picks the rate with the higher validation mIoU; phase 2 trains seeds 43 and 44 with that rate in parallel.
+
+#### Cell L3a: phase 1, learning rate chosen on validation (seed 42)
+
+```bash
+%%bash
+set -euo pipefail
+root="$RUN_ROOT"; py="$PWD/.venv/bin/python"
+for d in l_clipseg_lr1e-4_s42 l_clipseg_lr1e-5_s42; do
+    if [[ -e "$root/$d" ]]; then echo "Refusing to reuse $root/$d"; exit 1; fi
+done
+"$py" -c "from transformers import CLIPSegForImageSegmentation as M, CLIPSegProcessor as P; M.from_pretrained('CIDAS/clipseg-rd64-refined'); P.from_pretrained('CIDAS/clipseg-rd64-refined')"
+run() {  # GPU, run name, seed, learning rate
+    mkdir -p "$root/$2"
+    CUDA_VISIBLE_DEVICES=$1 "$py" clipseg_baseline.py train --data-root "$DATA_ROOT" \
+        --output-dir "$root/$2" --seed "$3" --lr "$4" > "$root/$2/train.log" 2>&1 &&
+    CUDA_VISIBLE_DEVICES=$1 "$py" clipseg_baseline.py eval --data-root "$DATA_ROOT" \
+        --run-dir "$root/$2" > "$root/$2/eval.log" 2>&1
+}
+run 0 l_clipseg_lr1e-4_s42 42 0.0001 & a=$!
+run 1 l_clipseg_lr1e-5_s42 42 0.00001 & b=$!
+wait $a; wait $b
+"$py" clipseg_baseline.py choose-lr "$root/l_clipseg_lr1e-4_s42" "$root/l_clipseg_lr1e-5_s42" > "$root/l_clipseg_chosen_lr.txt"
+echo "Learning rate chosen on validation: $(cat "$root/l_clipseg_chosen_lr.txt")"
+for d in l_clipseg_lr1e-4_s42 l_clipseg_lr1e-5_s42; do echo "== $d"; tail -n 4 "$root/$d/eval.log"; done
+```
+
+#### Cell L3b: phase 2, seeds 43 and 44 with the chosen rate
+
+In the same session this cell needs no edit. In a new session, first run `os.environ['CLIPSEG_LR'] = '...'` with the rate Cell L3a printed.
+
+```bash
+%%bash
+set -euo pipefail
+root="$RUN_ROOT"; py="$PWD/.venv/bin/python"
+LR="${CLIPSEG_LR:-$(cat "$root/l_clipseg_chosen_lr.txt" 2>/dev/null || true)}"
+if [[ "$LR" != "0.0001" && "$LR" != "1e-05" && "$LR" != "1e-5" && "$LR" != "0.00001" ]]; then
+    echo "Set CLIPSEG_LR to the rate printed by Cell L3a (got '$LR')"; exit 1
+fi
+for d in l_clipseg_s43 l_clipseg_s44; do
+    if [[ -e "$root/$d" ]]; then echo "Refusing to reuse $root/$d"; exit 1; fi
+done
+run() {  # GPU, run name, seed, learning rate
+    mkdir -p "$root/$2"
+    CUDA_VISIBLE_DEVICES=$1 "$py" clipseg_baseline.py train --data-root "$DATA_ROOT" \
+        --output-dir "$root/$2" --seed "$3" --lr "$4" > "$root/$2/train.log" 2>&1 &&
+    CUDA_VISIBLE_DEVICES=$1 "$py" clipseg_baseline.py eval --data-root "$DATA_ROOT" \
+        --run-dir "$root/$2" > "$root/$2/eval.log" 2>&1
+}
+run 0 l_clipseg_s43 43 "$LR" & a=$!
+run 1 l_clipseg_s44 44 "$LR" & b=$!
+wait $a; wait $b
+for d in l_clipseg_s43 l_clipseg_s44; do echo "== $d"; tail -n 4 "$root/$d/eval.log"; done
+```
+
+After Cell L3a, run `os.environ['RUN_NAME'] = 'l_clipseg_phase1'` and Cell Z; after Cell L3b, `os.environ['RUN_NAME'] = 'l_clipseg_phase2'` and Cell Z. Send both ZIPs. While a phase runs, `!tail -n 3 outputs/l_clipseg_s43/train.log` (or the phase-1 run name) shows one line per epoch with its duration; about 10 minutes per epoch means about 4 h per phase.
 
 ## Session T: mask-threshold sweep (inference only, about 30–60 min)
 
