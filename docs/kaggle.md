@@ -19,13 +19,13 @@ os.environ['HF_TOKEN'] = UserSecretsClient().get_secret('HF_TOKEN')
 os.environ['CM_DATA_ROOT'] = '/kaggle/input/YOUR_DATASET/vizwiz'
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MPLBACKEND'] = 'Agg'
+os.environ['PYTHONUNBUFFERED'] = '1'
 ```
 
 Launch fresh runs; use `--processes 2` when two GPUs are enabled, or `1` for one GPU:
 
-```bash
-%%bash
-uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs ftc_s42 cm_shared_s42 cm_separate_s42
+```python
+!uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs ftc_s42 cm_shared_s42 cm_separate_s42
 ```
 
 Omit `--runs` for all thirteen experiments. Every invocation creates `outputs/<timestamp>/` and starts each selected model from scratch. The protocol is 30 epochs, global batch 4, Adam at 1e-5, and per-epoch validation. Only the validation-selected model is saved. Both validation/test metrics and lossless logits are exported, then the completed run uploads to the public repository `Last-Bullet/vizwiz-cm-aciids-2027`. The summary uploads when all selected runs finish.
