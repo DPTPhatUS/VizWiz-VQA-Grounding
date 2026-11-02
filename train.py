@@ -62,10 +62,13 @@ def parse_args():
     parser.add_argument("--attention-residual-init", type=float, default=ModelConfig.attention_residual_init)
     parser.add_argument("--stage-attention", action=argparse.BooleanOptionalAction, default=ModelConfig.stage_attention,
                         help="Question attention in decoder stages 48/96/192 px (default); off = no such modules")
+    parser.add_argument("--max-steps", type=int, default=0,
+                        help="Probe mode: stop after N optimiser steps and write probe.json (peak GPU memory, "
+                             "seconds per step); no checkpoints, history or validation")
     parser.add_argument("--expect", action="append", default=[], metavar="KEY=VALUE",
                         help="Stop before training unless the resolved recipe has this value (repeatable)")
     args = parser.parse_args()
-    if min(args.num_epochs, args.batch_size) <= 0 or min(args.num_workers, args.validate_every, args.save_every) < 0:
+    if min(args.num_epochs, args.batch_size) <= 0 or min(args.num_workers, args.validate_every, args.save_every, args.max_steps) < 0:
         parser.error("Epochs and batch size must be positive; workers and intervals nonnegative")
     if args.dice_weight < 0 or (args.grad_clip_norm is not None and args.grad_clip_norm <= 0):
         parser.error("--dice-weight must be nonnegative and --grad-clip-norm positive")
@@ -91,13 +94,15 @@ def save_atomically(state: dict, path: Path):
     os.replace(tmp, path)
 
 
-def train_one_epoch(model, loader, controls, scaler, device, args, show_progress):
-    """One pass over loader. Returns (sum of batch losses, number of batches) as one device tensor,
-    and the seconds spent waiting for data. No per-step GPU-to-CPU synchronisation."""
+def train_one_epoch(model, loader, controls, scaler, device, args, show_progress, max_steps=0):
+    """One pass over loader (or its first max_steps batches). Returns (sum of batch losses, number of
+    batches) as one device tensor, and the seconds spent waiting for data. No per-step GPU-to-CPU sync."""
     optimizer = controls.optimizer
     totals = torch.zeros(2, device=device, dtype=torch.float64)  # (loss sum, batches)
     data_wait, waited_from = 0.0, time.perf_counter()
-    for batch in tqdm(loader, disable=not show_progress, dynamic_ncols=True, leave=False):
+    for step, batch in enumerate(tqdm(loader, disable=not show_progress, dynamic_ncols=True, leave=False)):
+        if max_steps and step >= max_steps:
+            break
         data_wait += time.perf_counter() - waited_from
         images = batch["image"].to(device, non_blocking=True)  # (B, 3, S, S)
         masks = batch["mask"].to(device, non_blocking=True)  # (B, 1, S, S)
@@ -115,6 +120,36 @@ def train_one_epoch(model, loader, controls, scaler, device, args, show_progress
         totals[1] += 1
         waited_from = time.perf_counter()
     return totals, data_wait
+
+
+def probe(model, loader, controls, scaler, device, args, run_config, out, rank, world_size):
+    """Run the first args.max_steps training steps of epoch 1 and report peak memory and speed."""
+    model.train()
+    controls.set_encoder_modes()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    totals, data_wait = train_one_epoch(model, loader, controls, scaler, device, args, rank == 0, args.max_steps)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    seconds = time.perf_counter() - started
+    peak = torch.tensor([torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else 0.0], device=device)
+    peaks = [torch.zeros_like(peak) for _ in range(world_size)]
+    if world_size > 1:
+        dist.all_gather(peaks, peak)
+    else:
+        peaks = [peak]
+    if rank == 0:
+        steps = int(totals[1].item())
+        report = {"steps": steps, "images_per_gpu": args.batch_size // world_size, "seconds": seconds,
+                  "seconds_per_step": seconds / max(1, steps), "data_wait_seconds": data_wait,
+                  "peak_memory_gib_per_gpu": [round(p.item(), 2) for p in peaks],
+                  "gpu_memory_gib": (round(torch.cuda.get_device_properties(device).total_memory / 2**30, 2)
+                                     if device.type == "cuda" else None),
+                  "loss_mean": (totals[0] / totals[1]).item(), "run_config": run_config}
+        (out / "probe.json").write_text(json.dumps(report, indent=1))
+        print("Probe:", json.dumps({k: v for k, v in report.items() if k != "run_config"}), flush=True)
 
 
 def main():
@@ -183,7 +218,8 @@ def main():
             model = nn.SyncBatchNorm.convert_sync_batchnorm(model)  # no-op for the GroupNorm decoder
             # Every trainable parameter is used in each step, so DDP needs no unused-parameter search
             # (it raises if that ever stops being true).
-            model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
+            # gradient_as_bucket_view: gradients live in DDP's buckets, saving one gradient-sized copy.
+            model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None, gradient_as_bucket_view=True)
         core = model.module if world_size > 1 else model
         controls.configure_schedule(args.num_epochs, len(train_loader), start_epoch)
 
@@ -196,6 +232,10 @@ def main():
             run_config["versions"]["transformers"] = transformers.__version__
             print("Run config:", json.dumps(run_config), flush=True)
             (out / f"run_config_from_epoch{start_epoch}.json").write_text(json.dumps(run_config, indent=1))
+
+        if args.max_steps:
+            probe(model, train_loader, controls, scaler, device, args, run_config, out, rank, world_size)
+            return
 
         for epoch in range(start_epoch + 1, args.num_epochs + 1):
             if world_size > 1:

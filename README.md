@@ -56,3 +56,136 @@ Offline (tiny random encoders, cached CLIP tokenizer), including two-process CPU
 ## Origin
 
 Research fork of [yjh9929/VizWiz-VQA-Grounding](https://github.com/yjh9929/VizWiz-VQA-Grounding) (CVPR 2025 VizWiz workshop spotlight), via `exp/baseline-fixes`. Licensed under [Creative Commons Attribution 4.0 International](http://creativecommons.org/licenses/by/4.0/).
+
+## Kaggle: B0, seed 42 (first run)
+
+Enable Internet and **two T4 GPUs**. Attach the VizWiz dataset (`vizwiz-vqa-grounding`). Run the cells in order. Every cell stops loudly when something is wrong; send its output instead of working around it. The recipe is decision D017 in the project log.
+
+| Cell | What | Time (estimate) |
+|---|---|---|
+| 1 | Setup: clone `ocrg/main`, install, check GPUs and data | ~5 min |
+| 2 | Offline tests | ~2 min |
+| 3 | Memory probe: 4 images per GPU fit? Speed? | ~5 min |
+| 4 | Train B0 (20 epochs) | from Cell 3's estimate |
+| 5 | Evaluate epochs 10 and 20 on val and test | ~20 min |
+| Z | ZIP the results (no checkpoints) | ~1 min |
+
+### Cell 1: setup
+
+```python
+!git clone --single-branch --branch ocrg/main https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+%cd /kaggle/working/VizWiz-VQA-Grounding
+!git log --oneline -1
+!uv sync --frozen
+```
+
+```python
+import json, os, subprocess
+from pathlib import Path
+
+os.environ['DATA_ROOT'] = '/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz'
+os.environ['RUN_NAME'] = 'ocrg_b0_s42'
+os.environ['OUT'] = f"outputs/{os.environ['RUN_NAME']}"
+os.environ['OMP_NUM_THREADS'] = '1'
+
+data = Path(os.environ['DATA_ROOT'])
+for split, n in (('train', 6494), ('val', 1131), ('test', 2373)):
+    records = json.loads((data / f'{split}_grounding.json').read_text())
+    masks = len(list((data / 'binary_masks_png' / split).glob('*.png')))
+    assert len(records) == n and masks == n, (split, len(records), masks)
+print(subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv'], capture_output=True, text=True).stdout)
+assert not Path(os.environ['OUT']).exists(), 'Output folder exists: choose a new RUN_NAME'
+```
+
+### Cell 2: offline tests
+
+Downloads the CLIP tokenizer once, then runs the 24 tests (tiny random models, including a two-process run).
+
+```bash
+%%bash
+uv run --frozen python -c "from transformers import CLIPTokenizer; CLIPTokenizer.from_pretrained('openai/clip-vit-large-patch14-336')"
+HF_HUB_OFFLINE=1 uv run --frozen python -m unittest discover -s tests -p "test_*.py" 2>&1 | tail -5
+```
+
+The last line must be `OK`.
+
+### Cell 3: memory probe
+
+Runs the real B0 training path (both GPUs, real data, mixed precision, full optimiser) for 30 steps with 4 images per GPU, then reports peak memory and speed. No checkpoint is written.
+
+```bash
+%%bash
+uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
+  --data-root "$DATA_ROOT" --output-dir outputs/probe_bs8 --batch-size 8 --num-workers 4 --max-steps 30 \
+  --dice-weight 0.5 --freeze-text-encoder --no-freeze-vision-encoder \
+  --optimizer adamw --weight-decay 0.05 --lr 1e-4 --backbone-lr 1e-5 --lr-scheduler cosine --warmup-ratio 0.05 \
+  --grad-clip-norm 1.0 2>&1 | grep -E "Probe:|Error|error" 
+```
+
+```python
+probe = json.loads(Path('outputs/probe_bs8/probe.json').read_text())
+peak, total = max(probe['peak_memory_gib_per_gpu']), probe['gpu_memory_gib']
+steps_per_epoch = 6494 // 8 + (6494 % 8 > 0)
+hours = probe['seconds_per_step'] * steps_per_epoch * 20 / 3600
+print(f'peak {peak:.1f} of {total:.1f} GiB per GPU; {probe["seconds_per_step"]:.2f} s/step; '
+      f'data wait {probe["data_wait_seconds"]:.0f} s of {probe["seconds"]:.0f} s; training ~{hours:.1f} h + validation')
+os.environ['BATCH'] = '8' if peak <= total - 1.0 else '4'
+print('Use batch size', os.environ['BATCH'])
+```
+
+- **Out-of-memory error, or `Use batch size 4`:** rerun the probe with `--batch-size 4 --output-dir outputs/probe_bs4`, then set `os.environ['BATCH'] = '4'`.
+- **Training estimate above ~10.5 h:** the run will not fit in one 12-hour session. Run Cell 4 anyway; it saves a checkpoint at epoch 10, and the resume note below continues from there.
+- **Send the printed line in any case:** the speed and data-wait numbers go into the decision log.
+
+### Cell 4: train B0
+
+```bash
+%%bash
+uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
+  --data-root "$DATA_ROOT" --output-dir "$OUT" --num-epochs 20 --batch-size "$BATCH" --num-workers 4 \
+  --dice-weight 0.5 --freeze-text-encoder --no-freeze-vision-encoder \
+  --optimizer adamw --weight-decay 0.05 --lr 1e-4 --backbone-lr 1e-5 --lr-scheduler cosine --warmup-ratio 0.05 \
+  --grad-clip-norm 1.0 --validate-every 2 --save-every 10 --seed 42 \
+  --expect text_mode=question --expect dice_weight=0.5 --expect freeze_text_encoder=true \
+  --expect freeze_vision_encoder=false --expect optimizer=adamw --expect lr_scheduler=cosine \
+  --expect decoder=fusion --expect attention_residual=true --expect stage_attention=true \
+  --expect grad_clip_norm=1.0 --expect world_size=2 2>&1 | grep -v "it/s\]"
+```
+
+Progress: one line per epoch (loss, seconds, seconds waiting for data) and validation mIoU every 2 epochs. Checkpoints (about 4 GB each) are written at epochs 10 and 20.
+
+**If the session ends before epoch 20:**
+1. Keep `checkpoint_epoch10.pt`: save the notebook version with its output, and attach that output to a new session.
+2. Rerun Cells 1–2.
+3. Run Cell 4 again with `--resume-checkpoint /kaggle/input/<attached output>/.../checkpoint_epoch10.pt` added. Everything else stays identical; the run refuses to resume if anything in the recipe differs.
+
+### Cell 5: evaluate
+
+Validation chooses between epochs 10 and 20; test is reported for both but chooses nothing.
+
+```bash
+%%bash
+for ep in 10 20; do
+  for split in val test; do
+    uv run --frozen torchrun --standalone --nproc_per_node=2 eval.py --checkpoint "$OUT/checkpoint_epoch${ep}.pt" \
+      --split "$split" --data-root "$DATA_ROOT" --output-dir "$OUT/eval_${split}_ep${ep}" --batch-size 8 --num-workers 4 \
+      2>&1 | grep "mean IoU"
+  done
+done
+```
+
+### Cell Z: ZIP results (no checkpoints)
+
+```python
+from zipfile import ZIP_DEFLATED, ZipFile
+
+archive = Path('/kaggle/working') / f"{os.environ['RUN_NAME']}.zip"
+with ZipFile(archive, 'w', compression=ZIP_DEFLATED) as bundle:
+    for root in (Path(os.environ['OUT']), Path('outputs/probe_bs8'), Path('outputs/probe_bs4')):
+        for path in sorted(root.rglob('*')) if root.exists() else []:
+            if path.is_file() and path.suffix.lower() not in {'.pt', '.tmp', '.zip'}:
+                bundle.write(path, path.relative_to('outputs'))
+print('Download:', archive)
+```
+
+Send `ocrg_b0_s42.zip`. It holds the run config, history, validation curve, `probe.json` and the four `metrics.json` files, and is analysed read-only.

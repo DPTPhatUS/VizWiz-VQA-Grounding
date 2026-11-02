@@ -403,6 +403,12 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(sum(len(g["params"]) for g in groups if g["weight_decay"] == 0), expected_no_decay)
         self.assertEqual(sum(n.endswith("gamma") or n == "attention_scale" for n, _ in trainable), 4)
 
+    def test_probe_mode(self):
+        self.run_train("--max-steps", "1")
+        report = json.loads((self.out / "probe.json").read_text())
+        self.assertEqual((report["steps"], report["images_per_gpu"]), (1, 2))
+        self.assertFalse((self.out / "history.jsonl").exists() or list(self.out.glob("*.pt")))
+
     def test_expect_mismatch_stops_before_training(self):
         with self.assertRaisesRegex(ValueError, "nothing was trained"):
             self.run_train("--expect", "dice_weight=0")
