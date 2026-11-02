@@ -1,153 +1,79 @@
-"""Evaluate a trained model on val or test set.
+"""Evaluate a checkpoint on val or test with the official native-resolution mIoU.
 
 Usage:
-    uv run eval.py --checkpoint outputs/checkpoint_epoch20.pt --dataset val
-    uv run eval.py --checkpoint outputs/checkpoint_epoch20.pt --dataset test
+    uv run eval.py --checkpoint OUT/checkpoint_epoch20.pt --split val --data-root DATA --output-dir OUT/eval_val_ep20
+    torchrun --nproc_per_node 2 eval.py ...        # images are split across GPUs, scored once each
+
+Writes OUTPUT_DIR/metrics.json ({"summary": ..., "per_sample": {filename: IoU}}) and, with
+--save-masks, the predicted masks as PNGs at native resolution. Refuses to overwrite results.
 """
 
 import argparse
 import json
-import os
+from pathlib import Path
+
 import torch
-from datetime import datetime
-from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from torchvision.transforms.functional import to_pil_image
 
-from dataset import VizWizGroundingDataset, collate_eval_samples
+from dataset import VizWizGroundingDataset, collate
+from evaluation import ShardSampler, evaluate, gather_scores, mean_iou
 from models import GroundingModel
-from evaluation import score_sample
-from utils import align_state_dict
+from utils import cleanup_distributed, setup_distributed
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--split", choices=("val", "test"), default="val")
+    parser.add_argument("--data-root", default="data/vizwiz")
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--batch-size", type=int, default=8, help="Images per GPU")
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--save-masks", action="store_true", help="Also save predicted masks as PNGs")
+    args = parser.parse_args(argv)
+    if args.batch_size <= 0 or args.num_workers < 0:
+        parser.error("--batch-size must be positive and --num-workers nonnegative")
+    if not Path(args.checkpoint).is_file():
+        parser.error(f"Checkpoint is not a file: {args.checkpoint}")
+    return args
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--dataset", type=str, default="val", choices=["val", "test"])
-    parser.add_argument("--data-root", type=str, default="data/vizwiz")
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--output-dir", type=str, default=None)
-    parser.add_argument("--text-mode", choices=["qa", "question"], default="qa")
-    parser.add_argument("--metric-resolution", choices=["original", "resized"], default="original",
-                        help="Native GT scoring (default); resized reproduces the legacy 336-pixel protocol")
-    args = parser.parse_args(argv)
+    args = parse_args(argv)
+    out = Path(args.output_dir)
+    if (out / "metrics.json").exists():
+        raise FileExistsError(f"Refusing to overwrite {out / 'metrics.json'}")
+    rank, world_size, _, device = setup_distributed()
+    try:
+        model, metadata = GroundingModel.from_checkpoint(args.checkpoint, device)
+        dataset = VizWizGroundingDataset(args.data_root, args.split, native_mask=True)
+        loader = DataLoader(dataset, batch_size=args.batch_size, sampler=ShardSampler(len(dataset), rank, world_size),
+                            num_workers=args.num_workers, pin_memory=device.type == "cuda", collate_fn=collate)
+        save = None
+        if args.save_masks:
+            (out / "masks").mkdir(parents=True, exist_ok=True)
 
-    if args.batch_size <= 0 or args.num_workers < 0:
-        parser.error("Batch size must be positive and worker count nonnegative")
+            def save(name, mask):
+                to_pil_image(mask.to("cpu", torch.uint8) * 255).save(out / "masks" / f"{Path(name).stem}.png")
 
-    if not os.path.isfile(args.checkpoint):
-        parser.error(f"Checkpoint is not a file: {args.checkpoint}")
-
-    device = torch.device(args.device)
-    image_size = (336, 336)
-
-    # --- Dataset paths ---
-    if args.dataset == "val":
-        json_path = os.path.join(args.data_root, "val_grounding.json")
-        image_root = os.path.join(args.data_root, "val")
-        mask_root = os.path.join(args.data_root, "binary_masks_png", "val")
-    else:  # test
-        json_path = os.path.join(args.data_root, "test_grounding.json")
-        image_root = os.path.join(args.data_root, "test")
-        mask_root = os.path.join(args.data_root, "binary_masks_png", "test")
-
-    # --- Dataset & Loader ---
-    dataset = VizWizGroundingDataset(
-        json_path=json_path,
-        image_root=image_root,
-        mask_root=mask_root,
-        image_size=image_size,
-        is_test=True,  # disable augmentation
-        text_mode=args.text_mode,
-        return_original_mask=args.metric_resolution == "original",
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        prefetch_factor=2 if args.num_workers > 0 else None,
-        collate_fn=collate_eval_samples,
-    )
-
-    # --- Model ---
-    model = GroundingModel()
-
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        state_dict = align_state_dict(checkpoint["model_state_dict"], model)
-        model.load_state_dict(state_dict)
-        print(f"Loaded checkpoint (epoch {checkpoint.get('epoch', '?')})")
-    else:
-        state_dict = align_state_dict(checkpoint, model)
-        model.load_state_dict(state_dict)
-        print("Loaded raw state dict")
-    del checkpoint
-    model = model.to(device).eval()
-
-    # --- Inference ---
-    per_sample_iou = {}
-
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-
-    loop = tqdm(loader, desc=f"Eval ({args.dataset})", dynamic_ncols=True)
-    with torch.no_grad():
-        for batch in loop:
-            images = batch["image"].to(device, non_blocking=True)  # (B, 3, H, W)
-            texts = batch["text"]
-            masks = batch["mask"].to(device, non_blocking=True)  # (B, 1, H, W)
-            filenames = batch["filename"]
-
-            pred = model(images, texts)  # (B, 1, 16*H_p, 16*W_p)
-            for i, fname in enumerate(filenames):
-                truth = (batch["original_mask"][i].unsqueeze(0).to(device)
-                         if args.metric_resolution == "original" else masks[i:i+1])
-                prediction, score = score_sample(pred[i:i+1], truth,
-                                                 legacy=args.metric_resolution == "resized")
-                per_sample_iou[fname] = round(score, 6) if args.metric_resolution == "resized" else score
-                if args.output_dir:
-                    mask_path = os.path.join(args.output_dir, os.path.splitext(fname)[0] + ".png")
-                    os.makedirs(os.path.dirname(mask_path), exist_ok=True)
-                    to_pil_image(prediction[0, 0].cpu()).save(mask_path)
-
-    if not per_sample_iou:
-        raise ValueError("Evaluation dataset is empty")
-
-    # --- Results JSON ---
-    if args.output_dir:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        results_file = os.path.join(args.output_dir, f"results_{args.dataset}_{timestamp}.json")
-        iou_values = list(per_sample_iou.values())
-        summary = {
-            "checkpoint": args.checkpoint,
-            "dataset": args.dataset,
-            "text_mode": args.text_mode,
-            "metric_resolution": args.metric_resolution,
-            "empty_union_score": 1.0 if args.metric_resolution == "original" else 0.0,
-            "num_samples": len(per_sample_iou),
-            "mean_iou": round(sum(iou_values) / len(iou_values), 6),
-            "min_iou": round(min(iou_values), 6),
-            "max_iou": round(max(iou_values), 6),
-        }
-        results = {
-            "summary": summary,
-            "per_sample": per_sample_iou,
-        }
-        with open(results_file, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"Results saved → {results_file}")
-
-    # --- Report ---
-    iou_values = list(per_sample_iou.values())
-    print(f"\nEvaluated {len(per_sample_iou)} samples on {args.dataset} set")
-    print(f"Mean IoU: {sum(iou_values) / len(iou_values):.4f}")
-    if args.output_dir:
-        print(f"Predicted masks saved to {args.output_dir}")
+        scores = gather_scores(evaluate(model, loader, device, save), world_size)
+        if rank == 0:
+            summary = {
+                "checkpoint": str(args.checkpoint),
+                "epoch": metadata.get("epoch"),
+                "split": args.split,
+                "num_samples": len(scores),
+                "mean_iou": mean_iou(scores, len(dataset)),
+                "protocol": "native resolution, bilinear logits, threshold 0, empty union = 1, FP32",
+                "model_config": metadata["model_config"],
+                "recipe": (metadata.get("run_config") or {}).get("recipe"),
+            }
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "metrics.json").write_text(json.dumps({"summary": summary, "per_sample": scores}, indent=1))
+            print(f"{args.split}: mean IoU {100 * summary['mean_iou']:.2f} over {len(scores)} images -> {out / 'metrics.json'}")
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":

@@ -1,131 +1,81 @@
+"""VizWiz-VQA-Grounding data: question-only inputs (the answer field is never read)."""
+
 import json
-import os
+from pathlib import Path
+
 import torch
-from PIL import Image, ImageOps
-from torch.utils.data import Dataset, default_collate
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
+from PIL import Image, ImageOps
+from torch.utils.data import Dataset
 
-CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
-CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
+CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+IMAGE_SIZE = 336  # CLIP ViT-L/14-336 input; the full frame is resized without keeping the aspect ratio
+
+
+def load_image(path) -> Image.Image:
+    """Upright RGB image: EXIF orientation applied, as the annotators saw it."""
+    with Image.open(path) as image:
+        return ImageOps.exif_transpose(image).convert("RGB")
+
+
+def preprocess_image(image: Image.Image, size: int = IMAGE_SIZE) -> torch.Tensor:
+    """PIL RGB -> (3, size, size) CLIP-normalised float tensor (bicubic, antialiased)."""
+    image = TF.resize(image, [size, size], interpolation=T.InterpolationMode.BICUBIC, antialias=True)
+    return TF.normalize(TF.to_tensor(image), CLIP_MEAN, CLIP_STD)  # (3, size, size)
+
+
+def question_text(question: str) -> str:
+    return f"Q: {str(question).strip()}"
 
 
 class VizWizGroundingDataset(Dataset):
-    def __init__(
-        self,
-        json_path,
-        image_root,
-        mask_root=None,
-        image_size=(336, 336),
-        is_test=False,
-        use_aug=False,
-        text_mode="qa",
-        return_original_mask=False,
-    ):
-        if text_mode not in {"qa", "question"}:
-            raise ValueError("text_mode must be qa or question")
-        if return_original_mask and use_aug:
-            raise ValueError("Original-mask evaluation cannot use augmentation")
-        with open(json_path, "r", encoding="utf-8") as f:
-            self.data = json.load(f)
+    """One split of VizWiz-VQA-Grounding under root: {split}_grounding.json, {split}/, binary_masks_png/{split}/.
 
-        self.image_root = image_root
-        self.mask_root = mask_root
-        self.is_test = is_test
-        self.use_aug = use_aug
-        self.text_mode = text_mode
-        self.return_original_mask = return_original_mask
-        self.image_size = (
-            (image_size, image_size)
-            if isinstance(image_size, int)
-            else tuple(image_size)
-        )
-        self.entries = list(self.data.items())
-        self.normalize = T.Normalize(mean=CLIP_MEAN, std=CLIP_STD)
+    Each sample: image (3, S, S) normalised, mask (1, S, S) float {0, 1} (nearest resize), text
+    "Q: <question>", filename; with native_mask=True also native_mask (1, H, W) bool at the original
+    image resolution, used by the official native-resolution metric.
+    """
 
-    def __len__(self):
-        return len(self.entries)
+    def __init__(self, root, split: str, *, image_size: int = IMAGE_SIZE, native_mask: bool = False):
+        self.root, self.split = Path(root), split
+        self.records = json.loads((self.root / f"{split}_grounding.json").read_text(encoding="utf-8"))
+        self.filenames = list(self.records)
+        self.image_size = image_size
+        self.native_mask = native_mask
 
-    def __getitem__(self, idx):
-        filename, meta = self.entries[idx]
+    def __len__(self) -> int:
+        return len(self.filenames)
 
-        # 1. Load image and apply EXIF orientation safely (closing file handle)
-        image_path = os.path.join(self.image_root, filename)
-        with Image.open(image_path) as img:
-            image = ImageOps.exif_transpose(img).convert("RGB")
-
-        # 2. Sanitize question and answer strings
-        question = str(meta.get("question", "")).strip()
-        answer = str(meta.get("most_common_answer", "")).strip()
-        text = f"Q: {question} A: {answer}" if answer and self.text_mode == "qa" else f"Q: {question}"
-
-        # 3. Load ground-truth mask safely
-        if self.mask_root:
-            mask_path = os.path.join(
-                self.mask_root, os.path.splitext(filename)[0] + ".png"
-            )
-            if os.path.exists(mask_path):
-                with Image.open(mask_path) as m:
-                    mask = m.convert("L")
-            else:
-                if self.return_original_mask:
-                    raise FileNotFoundError(f"Evaluation mask is missing: {mask_path}")
-                mask = Image.new("L", image.size, 0)
-        else:
-            if self.return_original_mask:
-                raise ValueError("Original-mask evaluation requires mask_root")
-            mask = Image.new("L", image.size, 0)
-
-        original_mask = None
-        if self.return_original_mask:
-            if image.size != mask.size:
-                raise ValueError(f"Image/mask dimensions differ for {filename}")
-            original_mask = (TF.to_tensor(mask) > 0.5).float()
-
-        # 4. Resize: BICUBIC for RGB image (CLIP standard), NEAREST for binary mask
-        image = TF.resize(
-            image,
-            self.image_size,
-            interpolation=T.InterpolationMode.BICUBIC,
-            antialias=True,
-        )
-        mask = TF.resize(
-            mask, self.image_size, interpolation=T.InterpolationMode.NEAREST
-        )
-
-        # 5. Apply same augmentation (rotation + flip) — currently disabled by default (use_aug=False)
-        if not self.is_test and self.use_aug:
-            # rotation
-            angle_idx = int(torch.randint(0, 4, (1,)).item())
-            angle = (0, 90, 180, 270)[angle_idx]
-            if angle != 0:
-                image = image.rotate(angle)
-                mask = mask.rotate(angle)
-
-            # horizontal flip
-            if torch.rand(1).item() > 0.5:
-                image = TF.hflip(image)
-                mask = TF.hflip(mask)
-
-        # 6. Convert to tensor and apply CLIP normalization
-        image_tensor = self.normalize(TF.to_tensor(image))  # (3, H, W)
-        mask_tensor = (TF.to_tensor(mask) > 0.5).float()  # (1, H, W)
-
+    def __getitem__(self, index: int) -> dict:
+        filename = self.filenames[index]
+        image = load_image(self.root / self.split / filename)
+        mask_path = self.root / "binary_masks_png" / self.split / f"{Path(filename).stem}.png"
+        with Image.open(mask_path) as m:  # FileNotFoundError if missing: never train on a made-up mask
+            mask = m.convert("L")
+        if mask.size != image.size:
+            raise ValueError(f"Image and mask sizes differ for {filename}: {image.size} vs {mask.size}")
+        size = [self.image_size, self.image_size]
         sample = {
-            "image": image_tensor,
-            "text": text,
-            "mask": mask_tensor,
+            "image": preprocess_image(image, self.image_size),  # (3, S, S)
+            "mask": (TF.to_tensor(TF.resize(mask, size, interpolation=T.InterpolationMode.NEAREST)) > 0.5).float(),  # (1, S, S)
+            "text": question_text(self.records[filename]["question"]),
             "filename": filename,
         }
-        if original_mask is not None:
-            sample["original_mask"] = original_mask
+        if self.native_mask:
+            sample["native_mask"] = TF.to_tensor(mask) > 0.5  # (1, H, W) bool
         return sample
 
 
-def collate_eval_samples(samples):
-    """Stack CLIP inputs while retaining variable-size native masks as a list."""
-    batch = default_collate([{k: v for k, v in sample.items() if k != "original_mask"}
-                             for sample in samples])
-    if "original_mask" in samples[0]:
-        batch["original_mask"] = [sample["original_mask"] for sample in samples]
+def collate(samples: list[dict]) -> dict:
+    """Stack fixed-size tensors; keep text, filenames and variable-size native masks as lists."""
+    batch = {
+        "image": torch.stack([s["image"] for s in samples]),  # (B, 3, S, S)
+        "mask": torch.stack([s["mask"] for s in samples]),  # (B, 1, S, S)
+        "text": [s["text"] for s in samples],
+        "filename": [s["filename"] for s in samples],
+    }
+    if "native_mask" in samples[0]:
+        batch["native_mask"] = [s["native_mask"] for s in samples]
     return batch

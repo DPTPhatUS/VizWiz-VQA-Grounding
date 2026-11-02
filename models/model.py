@@ -1,123 +1,107 @@
-import os
-import torch
-from torch import nn
-from PIL import Image, ImageOps
-import torchvision.transforms as T
-import torchvision.transforms.functional as TF
-from torchvision.transforms.functional import to_pil_image
+"""Question-only grounding model: CLIP encoders, question cross-attention, mask decoder."""
 
-from dataset import CLIP_MEAN, CLIP_STD
-from metrics import compute_iou
-from models import ImageEncoder, TextEncoder, UNetDecoder
+from dataclasses import asdict, dataclass
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from transformers import CLIPTextConfig, CLIPVisionConfig
+
+from dataset import IMAGE_SIZE, load_image, preprocess_image, question_text
+from models.image_encoder import ImageEncoder
+from models.mask_decoder import FusionDecoder, UNetDecoder
+from models.text_encoder import TextEncoder
 from utils import align_state_dict
+
+CLIP_NAME = "openai/clip-vit-large-patch14-336"
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    """Architecture; saved in every checkpoint so evaluation rebuilds exactly the trained model.
+
+    Defaults are B0 (ocrg decision D017). decoder="unet" with attention_residual=False is the
+    upstream baseline-fixes architecture.
+    """
+
+    decoder: str = "fusion"  # "fusion" (FusionDecoder) or "unet" (upstream UNetDecoder)
+    attention_residual: bool = True  # F = V + alpha * MHA(V, T); False: F = MHA(V, T) (upstream)
+    attention_residual_init: float = 0.01  # initial alpha (learnable), as in the ACIIDS models
+    clip_name: str = CLIP_NAME
+    tiny: bool = False  # randomly initialised tiny encoders, for offline tests only
+
+    def __post_init__(self):
+        if self.decoder not in {"fusion", "unet"}:
+            raise ValueError(f"Unknown decoder {self.decoder!r}")
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _tiny_configs():
+    vision = CLIPVisionConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=10,
+                              num_attention_heads=2, image_size=IMAGE_SIZE, patch_size=14)
+    text = CLIPTextConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=2, num_attention_heads=2)
+    return vision, text
 
 
 class GroundingModel(nn.Module):
-    def __init__(self, n_heads=8):
+    """(images (B, 3, 336, 336) CLIP-normalised, questions list[str]) -> mask logits (B, 1, 384, 384)."""
+
+    def __init__(self, config: ModelConfig | None = None, n_heads: int = 8):
         super().__init__()
-        self.image_encoder = ImageEncoder()
-        self.text_encoder = TextEncoder()
+        config = config or ModelConfig()
+        self.config = config
+        vision_config, text_config = _tiny_configs() if config.tiny else (None, None)
+        self.image_encoder = ImageEncoder(config.clip_name, vision_config)
+        self.text_encoder = TextEncoder(config.clip_name, text_config)
+        self.hidden_dim = self.image_encoder.out_channels  # 1024 for ViT-L
+        heads = 2 if config.tiny else n_heads
+        self.text_proj = nn.Linear(self.text_encoder.output_dim, self.hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(self.hidden_dim, heads, batch_first=True)
+        self.attention_scale = (nn.Parameter(torch.tensor(float(config.attention_residual_init)))
+                                if config.attention_residual else None)
+        self.decoder = (FusionDecoder(self.hidden_dim) if config.decoder == "fusion"
+                        else UNetDecoder(in_channels=self.hidden_dim))
 
-        # fixed based on image hidden dim (1024 for ViT-L/14-336)
-        self.hidden_dim = self.image_encoder.out_channels
+    def fuse(self, vision: torch.Tensor, tokens: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
+        """Patches attend to question tokens. vision (B, D_v, H_p, W_p), tokens (B, L, D_t), padding (B, L)."""
+        query = vision.flatten(2).transpose(1, 2)  # (B, N, D_v)
+        keys = self.text_proj(tokens)  # (B, L, D_v)
+        query = query.to(keys.dtype)
+        attended, _ = self.cross_attn(query, keys, keys, key_padding_mask=padding, need_weights=False)  # (B, N, D_v)
+        fused = query + self.attention_scale.to(attended.dtype) * attended if self.attention_scale is not None else attended
+        return fused.transpose(1, 2).reshape(vision.shape)  # (B, D_v, H_p, W_p)
 
-        # project text dim to match hidden dim
-        self.text_proj = nn.Linear(
-            self.text_encoder.output_dim, self.hidden_dim
-        )
-
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=self.hidden_dim, num_heads=n_heads, batch_first=True
-        )
-        self.decoder = UNetDecoder(in_channels=self.hidden_dim)
-
-    def forward(self, image, text):
-        enc_feat1, enc_feat2, enc_feat3, bottleneck = self.image_encoder(image)  # each (B, D_v, H_p, W_p)
-        B, D, H, W = bottleneck.shape
-        img_tokens = bottleneck.flatten(2).permute(0, 2, 1)  # (B, N, D_v), N = H_p * W_p
-
-        text_tokens, key_padding_mask = self.text_encoder(
-            text,
-            return_mask=True,
-        )  # (B, L, D_t), (B, L)
-        text_tokens = self.text_proj(text_tokens)  # (B, L, D_v)
-        img_tokens = img_tokens.to(text_tokens.dtype)
-
-        attn_output, _ = self.cross_attn(
-            query=img_tokens,
-            key=text_tokens,
-            value=text_tokens,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )  # (B, N, D_v)
-        fused = attn_output.view(B, H, W, D).permute(0, 3, 1, 2).contiguous()  # (B, D_v, H_p, W_p)
-
-        output = self.decoder(fused, enc_feat3, enc_feat2, enc_feat1)  # (B, 1, 16*H_p, 16*W_p)
-        return output
+    def forward(self, images: torch.Tensor, texts: list[str]) -> torch.Tensor:
+        s1, s2, s3, vision = self.image_encoder(images)  # each (B, D_v, H_p, W_p)
+        tokens, padding = self.text_encoder(texts)  # (B, L, D_t), (B, L)
+        fused = self.fuse(vision, tokens, padding)  # (B, D_v, H_p, W_p)
+        if isinstance(self.decoder, FusionDecoder):
+            return self.decoder(fused, s1, s2, s3)  # (B, 1, 16*H_p, 16*W_p)
+        return self.decoder(fused, s3, s2, s1)  # upstream argument order
 
     @classmethod
-    def from_checkpoint(cls, checkpoint_path, device=None, **kwargs):
-        device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        model = cls(**kwargs)
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
-        state_dict = align_state_dict(state_dict, model)
-        model.load_state_dict(state_dict)
-        return model.to(device).eval()
+    def from_checkpoint(cls, path, device="cpu"):
+        """Rebuild the trained architecture from the checkpoint's model_config and load its weights.
+
+        Returns (model in eval mode on device, metadata: the checkpoint without weights or optimizer state).
+        """
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(checkpoint, dict) or "model_config" not in checkpoint:
+            raise ValueError(f"{path} has no model_config; it was not written by this branch's train.py")
+        model = cls(ModelConfig(**checkpoint["model_config"]))
+        model.load_state_dict(align_state_dict(checkpoint["model_state_dict"], model))
+        metadata = {k: v for k, v in checkpoint.items()
+                    if k not in {"model_state_dict", "optimizer_state_dict", "scaler_state_dict"}}
+        return model.to(device).eval(), metadata
 
     @torch.no_grad()
-    def predict(
-        self,
-        image,
-        text=None,
-        question=None,
-        answer=None,
-        gt_mask=None,
-        threshold=0.5,
-        image_size=(336, 336),
-    ):
+    def predict(self, image, question: str) -> torch.Tensor:
+        """Single image (path or PIL) and question -> boolean mask (H, W) at the image's own resolution."""
         self.eval()
+        pil = load_image(image) if not hasattr(image, "size") else image.convert("RGB")
         device = next(self.parameters()).device
-        size = (image_size, image_size) if isinstance(image_size, int) else tuple(image_size)
-
-        if text is None:
-            q, a = str(question or "").strip(), str(answer or "").strip()
-            text = f"Q: {q} A: {a}" if a else f"Q: {q}"
-
-        if isinstance(image, (str, os.PathLike)):
-            with Image.open(image) as img:
-                pil_img = ImageOps.exif_transpose(img).convert("RGB")
-        else:
-            pil_img = ImageOps.exif_transpose(image).convert("RGB")
-
-        pil_img = TF.resize(pil_img, size, interpolation=T.InterpolationMode.BICUBIC, antialias=True)
-        img_tensor = TF.normalize(TF.to_tensor(pil_img), mean=CLIP_MEAN, std=CLIP_STD).unsqueeze(0).to(device)  # (1, 3, H, W)
-
-        logits = torch.nn.functional.interpolate(
-            self.forward(img_tensor, [text]).float(), size=size, mode="bilinear", align_corners=False
-        )  # (1, 1, H, W)
-        prob = torch.sigmoid(logits)  # (1, 1, H, W)
-        pred_bin = (prob > threshold).float()  # (1, 1, H, W)
-
-        iou, gt_out = None, None
-        if gt_mask is not None:
-            if isinstance(gt_mask, (str, os.PathLike)):
-                with Image.open(gt_mask) as m:
-                    gt_pil = m.convert("L")
-            else:
-                gt_pil = gt_mask.convert("L")
-            gt_pil = TF.resize(gt_pil, size, interpolation=T.InterpolationMode.NEAREST)
-            gt_4d = (TF.to_tensor(gt_pil) > 0.5).float().unsqueeze(0).to(device)  # (1, 1, H, W)
-            iou = round(compute_iou(pred_bin, gt_4d, threshold=0.5), 6)
-            gt_out = gt_4d[0, 0].cpu()  # (H, W)
-
-        pred_2d = pred_bin[0, 0].cpu()  # (H, W)
-        return {
-            "text": text,
-            "image_pil": pil_img,
-            "prob_map": prob[0, 0].cpu(),
-            "pred_mask": pred_2d,
-            "pred_pil": to_pil_image(pred_2d),
-            "gt_mask": gt_out,
-            "iou": iou,
-        }
+        logits = self(preprocess_image(pil).unsqueeze(0).to(device), [question_text(question)])  # (1, 1, h, w)
+        logits = F.interpolate(logits.float(), size=(pil.height, pil.width), mode="bilinear", align_corners=False)
+        return logits[0, 0] > 0  # (H, W)

@@ -261,9 +261,10 @@ class TrainingControls:
                     continue
                 module.requires_grad_(not policy)
                 # This CLIP layer only normalizes unused pooled CLS; keep it out of DDP.
+                # Matched by suffix: transformers 4.x nests it under vision_model, 5.x does not.
                 if not policy and kind == "vision":
                     for part_name, part in module.named_modules():
-                        if part_name.endswith("vision_model.post_layernorm"):
+                        if part_name.endswith("post_layernorm"):
                             part.requires_grad_(False)
                 if (
                     not policy

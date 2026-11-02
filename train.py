@@ -1,391 +1,223 @@
-from training_options import (
-    TrainingArgumentParser,
-    TrainingControls,
-    restore_control_arguments,
-    public_arguments,
-)
+"""Train the question-only grounding model. Defaults build B0 (ocrg decisions D016-D017).
+
+B0 on two GPUs (global batch 4 = 2 per GPU):
+    torchrun --nproc_per_node 2 train.py --data-root DATA --output-dir OUT --num-epochs 20 --batch-size 4 \
+        --dice-weight 0.5 --freeze-text-encoder --no-freeze-vision-encoder --validate-every 2 --save-every 10
+
+Outputs in OUTPUT_DIR: run_config_from_epoch<E>.json, history.jsonl (one line per epoch),
+val_curve.jsonl (native-resolution validation mIoU), checkpoint_epoch<E>.pt (always at the last epoch).
+"""
+
+import argparse
 import json
 import os
 import random
+import time
+from pathlib import Path
+
 import torch
 import torch.distributed as dist
+from torch import nn
+from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
-from torch.amp import autocast, GradScaler
-import torch.nn as nn
-from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from dataset import VizWizGroundingDataset, collate_eval_samples
-from evaluation import score_sample
+from dataset import VizWizGroundingDataset, collate
+from evaluation import ShardSampler, evaluate, gather_scores, mean_iou
 from losses import segmentation_loss
-from run_record import (
-    RECIPE_KEYS,
-    append_jsonl,
-    check_expectations,
-    check_resume_recipe,
-    git_state,
-    parse_expectations,
-)
-from utils import align_state_dict, to_device
-from models import GroundingModel
+from models import GroundingModel, ModelConfig
+from run_record import RECIPE_KEYS, append_jsonl, check_expectations, check_resume_recipe, git_state, parse_expectations
+from training_options import TrainingArgumentParser, TrainingControls, public_arguments, restore_control_arguments
+from utils import align_state_dict, cleanup_distributed, setup_distributed
 
 
-# ---------------------------------------------------------------------------
-# Distributed helpers
-# ---------------------------------------------------------------------------
-def setup_distributed():
-    """Initialize NCCL process group from torchrun env vars.
-    Returns (rank, world_size, local_rank, is_distributed).
-    Gracefully falls back to single-GPU when env vars are absent.
-    """
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
-        return rank, world_size, local_rank, True
-    else:
-        return 0, 1, 0, False
-
-
-def set_deterministic(seed: int = 42):
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def seed_worker(worker_id: int):
-    worker_seed = torch.initial_seed() % (2**32)
-    random.seed(worker_seed)
-
-
-def cleanup_distributed():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def main():
-    parser = TrainingArgumentParser()
-    parser.add_argument("--data-root", type=str, default="data/vizwiz")
-    parser.add_argument("--num-epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=0.00001)
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--resume-checkpoint", type=str, default=None)
-    parser.add_argument("--validate-every", type=int, default=0)
-    parser.add_argument("--save-every", type=int, default=10)
-    parser.add_argument("--output-dir", type=str, default="outputs")
+def parse_args():
+    parser = TrainingArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--data-root", default="data/vizwiz")
+    parser.add_argument("--output-dir", default="outputs")
+    parser.add_argument("--num-epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=4, help="Global batch size, split across GPUs")
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--num-workers", type=int, default=4, help="Data-loading workers per GPU process")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--text-mode", choices=["qa", "question"], default="qa",
-                        help="QA baseline (default) or a separately trained question-only control")
+    parser.add_argument("--resume-checkpoint", default=None)
+    parser.add_argument("--validate-every", type=int, default=0, help="Validation mIoU every N epochs (0 = never)")
+    parser.add_argument("--save-every", type=int, default=10, help="Checkpoint every N epochs; the last epoch is always saved")
     parser.add_argument("--dice-weight", type=float, default=0.0,
-                        help="Weight of the per-image soft Dice term added to BCE; 0 keeps the upstream BCE-only loss")
+                        help="Weight of the per-image soft Dice term added to BCE (0 = BCE only)")
+    parser.add_argument("--grad-clip-norm", type=float, default=None, help="Clip the gradient norm (off by default)")
+    parser.add_argument("--decoder", choices=("fusion", "unet"), default=ModelConfig.decoder)
+    parser.add_argument("--attention-residual", action=argparse.BooleanOptionalAction, default=ModelConfig.attention_residual,
+                        help="F = V + alpha * MHA(V, T) (default) instead of F = MHA(V, T)")
+    parser.add_argument("--attention-residual-init", type=float, default=ModelConfig.attention_residual_init)
     parser.add_argument("--expect", action="append", default=[], metavar="KEY=VALUE",
                         help="Stop before training unless the resolved recipe has this value (repeatable)")
     args = parser.parse_args()
-    if args.dice_weight < 0:
-        parser.error("--dice-weight must be nonnegative")
-    try:
-        expected = parse_expectations(args.expect)
-    except ValueError as error:
-        parser.error(str(error))
-
-    checkpoint = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False) if args.resume_checkpoint else None
-    restore_control_arguments(args, checkpoint)
-
+    if min(args.num_epochs, args.batch_size) <= 0 or min(args.num_workers, args.validate_every, args.save_every) < 0:
+        parser.error("Epochs and batch size must be positive; workers and intervals nonnegative")
+    if args.dice_weight < 0 or (args.grad_clip_norm is not None and args.grad_clip_norm <= 0):
+        parser.error("--dice-weight must be nonnegative and --grad-clip-norm positive")
     if args.resume_checkpoint is not None and not os.path.isfile(args.resume_checkpoint):
         parser.error(f"Resume checkpoint is not a file: {args.resume_checkpoint}")
-
-    # --- Distributed init ---
-    rank, world_size, local_rank, is_dist = setup_distributed()
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-
-    if args.batch_size < world_size or args.batch_size % world_size != 0:
-        parser.error(
-            f"--batch-size ({args.batch_size}) must be a positive multiple of world_size ({world_size})"
-        )
-
-    # Resolved recipe: checked against --expect and the resume checkpoint before anything is trained.
-    recipe = {key: getattr(args, key) for key in RECIPE_KEYS if key != "world_size"}
-    recipe["world_size"] = world_size
-    resolved = {**public_arguments(args), "world_size": world_size}
-    check_expectations(resolved, expected)
-    if checkpoint is not None:
-        check_resume_recipe(checkpoint, recipe)
-
-    # Deterministic mode  (before any model creation)
-    set_deterministic(args.seed)
-
-    # Only rank 0 writes to disk
-    if rank == 0:
-        os.makedirs(args.output_dir, exist_ok=True)
-
-    image_size = (336, 336)
-
-    # Per-GPU batch size  (keeps effective batch size == args.batch_size)
-    per_gpu_bs = args.batch_size // world_size
-
-    # --- Datasets ---
-    train_set = VizWizGroundingDataset(
-        json_path=os.path.join(args.data_root, "train_grounding.json"),
-        image_root=os.path.join(args.data_root, "train"),
-        mask_root=os.path.join(args.data_root, "binary_masks_png", "train"),
-        image_size=image_size,
-        text_mode=args.text_mode,
-    )
-    val_set = VizWizGroundingDataset(
-        json_path=os.path.join(args.data_root, "val_grounding.json"),
-        image_root=os.path.join(args.data_root, "val"),
-        mask_root=os.path.join(args.data_root, "binary_masks_png", "val"),
-        image_size=image_size,
-        is_test=True,  # validation must not use random training augmentation
-        text_mode=args.text_mode,
-        return_original_mask=True,  # validation mIoU uses the official native-resolution protocol
-    )
-
-    # --- Samplers & Loaders ---
-    loader_generator = torch.Generator()
-    loader_generator.manual_seed(args.seed + rank)
-
-    train_sampler = (
-        DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
-        if is_dist else None
-    )
-    train_loader = DataLoader(
-        train_set,
-        batch_size=per_gpu_bs,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        prefetch_factor=2 if args.num_workers > 0 else None,
-        worker_init_fn=seed_worker,
-        generator=loader_generator,
-    )
-
-    # Validation: run on EVERY rank with DistributedSampler so the union
-    # covers the full val set.  Loss is reduced across ranks below.
-    val_sampler = (
-        DistributedSampler(val_set, num_replicas=world_size, rank=rank, shuffle=False)
-        if is_dist else None
-    )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=per_gpu_bs,
-        shuffle=False,
-        sampler=val_sampler,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        prefetch_factor=2 if args.num_workers > 0 else None,
-        worker_init_fn=seed_worker,
-        collate_fn=collate_eval_samples,
-    )
-
-    # --- Model ---
-    model = GroundingModel().to(device)
-    controls = TrainingControls(model, args, checkpoint, include_frozen=True)
-
-    # SyncBatchNorm: makes per-GPU BatchNorm stats identical to single-GPU
-    if is_dist:
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-
-    # Wrap with DDP  (after SyncBN conversion)
-    if is_dist:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
-                find_unused_parameters=True)
-
-    # --- Optimizer / Loss / Scaler ---
-    use_amp = (device.type == "cuda")
-    optimizer = controls.optimizer
-    scaler = GradScaler("cuda", enabled=use_amp)
-
-    # --- Resume checkpoint ---
-    start_epoch = 0
-
-    if args.resume_checkpoint is not None:
-        # Always load into the *unwrapped* model so state-dict keys match
-        # regardless of DDP / SyncBN wrapping.
-        underlying_model = model.module if is_dist else model
-
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            state_dict = align_state_dict(checkpoint["model_state_dict"], underlying_model)
-            underlying_model.load_state_dict(state_dict)
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            for group in optimizer.param_groups:
-                group["lr"] = args.lr
-            if "scaler_state_dict" in checkpoint and checkpoint["scaler_state_dict"]:
-                scaler.load_state_dict(checkpoint["scaler_state_dict"])
-            start_epoch = checkpoint.get("epoch", 0)
-            if rank == 0:
-                print(f"✅ Resumed full training state from {args.resume_checkpoint} (epoch {start_epoch})")
-        else:
-            state_dict = align_state_dict(checkpoint, underlying_model)
-            underlying_model.load_state_dict(state_dict)
-            if rank == 0:
-                print(f"✅ Resumed model from {args.resume_checkpoint}")
-            try:
-                start_epoch = int(args.resume_checkpoint.split("epoch")[1].split(".")[0])
-            except Exception:
-                start_epoch = 0
-
-        del checkpoint
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    controls.configure_schedule(args.num_epochs, len(train_loader), start_epoch)
-
-    run_config = {
-        "recipe": recipe,
-        "arguments": resolved,
-        "training_controls": dict(controls.config),
-        "git": git_state(os.path.dirname(os.path.abspath(__file__))),
-        "versions": {"torch": str(torch.__version__)},
-        "start_epoch": start_epoch,
-    }
-    if rank == 0:
-        try:
-            import transformers
-            run_config["versions"]["transformers"] = str(transformers.__version__)
-        except ImportError:
-            run_config["versions"]["transformers"] = None
-        print("Run config:", json.dumps(run_config))
-        with open(os.path.join(args.output_dir, f"run_config_from_epoch{start_epoch}.json"), "w") as f:
-            json.dump(run_config, f, indent=1)
-
-    # --- Log file (rank 0 only) ---
-    log_file = None
-    log_path = None
-    if rank == 0:
-        log_name = f"train_loss_{start_epoch+1}_{args.num_epochs}.txt"
-        log_path = os.path.join(args.output_dir, log_name)
-        log_file = open(log_path, "w")
-
-    # Sync all ranks before starting training
-    if is_dist:
-        dist.barrier()
-
-    # ===================================================================
-    #  Training loop
-    # ===================================================================
     try:
-        for epoch in range(start_epoch, args.num_epochs):
-            # Shuffle partitions differently each epoch  (mandatory for DDP)
-            loader_generator.manual_seed(args.seed + epoch * world_size + rank)
-            if train_sampler is not None:
-                train_sampler.set_epoch(epoch)
+        args.expected = parse_expectations(args.expect)
+    except ValueError as error:
+        parser.error(str(error))
+    return args
 
-            # ---- Train ----
+
+def seed_everything(seed: int):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def save_atomically(state: dict, path: Path):
+    """Write to a temporary file, then rename, so an interrupted save never leaves a broken checkpoint."""
+    tmp = path.with_suffix(".tmp")
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+
+def train_one_epoch(model, loader, controls, scaler, device, args, show_progress):
+    """One pass over loader. Returns (sum of batch losses, number of batches) as one device tensor,
+    and the seconds spent waiting for data. No per-step GPU-to-CPU synchronisation."""
+    optimizer = controls.optimizer
+    totals = torch.zeros(2, device=device, dtype=torch.float64)  # (loss sum, batches)
+    data_wait, waited_from = 0.0, time.perf_counter()
+    for batch in tqdm(loader, disable=not show_progress, dynamic_ncols=True, leave=False):
+        data_wait += time.perf_counter() - waited_from
+        images = batch["image"].to(device, non_blocking=True)  # (B, 3, S, S)
+        masks = batch["mask"].to(device, non_blocking=True)  # (B, 1, S, S)
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(device.type, enabled=scaler.is_enabled()):
+            logits = model(images, batch["text"])  # (B, 1, h, w)
+            logits = nn.functional.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+            loss = segmentation_loss(logits, masks, args.dice_weight)  # ()
+        scaler.scale(loss).backward()
+        if args.grad_clip_norm is not None:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(controls.parameters, args.grad_clip_norm)
+        controls.step(scaler)
+        totals[0] += loss.detach()
+        totals[1] += 1
+        waited_from = time.perf_counter()
+    return totals, data_wait
+
+
+def main():
+    args = parse_args()
+    checkpoint = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False) if args.resume_checkpoint else None
+    restore_control_arguments(args, checkpoint)
+    rank, world_size, local_rank, device = setup_distributed()
+    try:
+        if args.batch_size % world_size:
+            raise ValueError(f"--batch-size {args.batch_size} must be a multiple of the {world_size} processes")
+
+        # Resolved recipe: checked against --expect and the resume checkpoint before anything is built.
+        model_config = ModelConfig(decoder=args.decoder, attention_residual=args.attention_residual,
+                                   attention_residual_init=args.attention_residual_init)
+        resolved = {**public_arguments(args), "world_size": world_size}
+        resolved.pop("expected", None)
+        recipe = {key: resolved[key] for key in RECIPE_KEYS}
+        check_expectations(resolved, args.expected)
+        if checkpoint is not None:
+            check_resume_recipe(checkpoint, recipe)
+            if checkpoint.get("model_config") != model_config.to_dict():
+                raise ValueError("Resume model_config differs from the checkpoint")
+
+        seed_everything(args.seed)
+        torch.backends.cudnn.benchmark = True  # fixed input sizes
+        out = Path(args.output_dir)
+        if rank == 0:
+            out.mkdir(parents=True, exist_ok=True)
+
+        # --- Data ---
+        pin = device.type == "cuda"
+        train_set = VizWizGroundingDataset(args.data_root, "train")
+        generator = torch.Generator()
+        sampler = (DistributedSampler(train_set, world_size, rank, shuffle=True, seed=args.seed) if world_size > 1
+                   else RandomSampler(train_set, generator=generator))
+        loader_options = dict(num_workers=args.num_workers, pin_memory=pin, collate_fn=collate,
+                              persistent_workers=args.num_workers > 0,
+                              prefetch_factor=4 if args.num_workers > 0 else None)
+        train_loader = DataLoader(train_set, batch_size=args.batch_size // world_size, sampler=sampler, **loader_options)
+        val_set = val_loader = None
+        if args.validate_every:
+            val_set = VizWizGroundingDataset(args.data_root, "val", native_mask=True)
+            val_loader = DataLoader(val_set, batch_size=args.batch_size // world_size,
+                                    sampler=ShardSampler(len(val_set), rank, world_size), **loader_options)
+
+        # --- Model and optimisation ---
+        model = GroundingModel(model_config).to(device)
+        controls = TrainingControls(model, args, checkpoint, include_frozen=True)
+        parameters = {"total": sum(p.numel() for p in model.parameters()),
+                      "trainable": sum(p.numel() for p in model.parameters() if p.requires_grad)}
+        scaler = GradScaler("cuda", enabled=device.type == "cuda")
+        start_epoch = 0
+        if checkpoint is not None:
+            model.load_state_dict(align_state_dict(checkpoint["model_state_dict"], model))
+            controls.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            start_epoch = checkpoint["epoch"]
+            del checkpoint
+        if world_size > 1:
+            model = nn.SyncBatchNorm.convert_sync_batchnorm(model)  # no-op for the GroupNorm decoder
+            # Every trainable parameter is used in each step, so DDP needs no unused-parameter search
+            # (it raises if that ever stops being true).
+            model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
+        core = model.module if world_size > 1 else model
+        controls.configure_schedule(args.num_epochs, len(train_loader), start_epoch)
+
+        run_config = {"recipe": recipe, "arguments": resolved, "model_config": model_config.to_dict(),
+                      "training_controls": dict(controls.config), "parameters": parameters,
+                      "git": git_state(Path(__file__).resolve().parent), "start_epoch": start_epoch,
+                      "versions": {"torch": torch.__version__}}
+        if rank == 0:
+            import transformers
+            run_config["versions"]["transformers"] = transformers.__version__
+            print("Run config:", json.dumps(run_config), flush=True)
+            (out / f"run_config_from_epoch{start_epoch}.json").write_text(json.dumps(run_config, indent=1))
+
+        for epoch in range(start_epoch + 1, args.num_epochs + 1):
+            if world_size > 1:
+                sampler.set_epoch(epoch)
+            else:
+                generator.manual_seed(args.seed + epoch)
             model.train()
             controls.set_encoder_modes()
-            controls.log_learning_rates(epoch + 1)
-            train_loss_sum = torch.zeros(1, device=device, dtype=torch.float64)  # (1,)
-
-            loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} (Train)", disable=(rank != 0), dynamic_ncols=True)
-            for batch in loop:
-                batch = to_device(batch, device)
-                images, masks, texts = batch["image"], batch["mask"], batch["text"]  # (B, 3, H, W), (B, 1, H, W), list[str]
-
-                optimizer.zero_grad(set_to_none=True)
-                with autocast(device.type, enabled=use_amp):
-                    pred = model(images, texts)  # (B, 1, 16*H_p, 16*W_p)
-                    pred = nn.functional.interpolate(
-                        pred, size=masks.shape[-2:], mode="bilinear", align_corners=False
-                    )  # (B, 1, H, W)
-                    loss = segmentation_loss(pred, masks, args.dice_weight)  # ()
-
-                scaler.scale(loss).backward()
-                controls.step(scaler)
-
-                train_loss_sum += loss.detach().to(torch.float64)
-
-            # Reduce train loss across all ranks once per epoch (avoids per-batch CPU-GPU syncs)
-            if is_dist:
-                dist.all_reduce(train_loss_sum, op=dist.ReduceOp.SUM)
-            avg_train_loss = (train_loss_sum / (len(train_loader) * world_size)).item()
-
+            controls.log_learning_rates(epoch)
+            started = time.perf_counter()
+            totals, data_wait = train_one_epoch(model, train_loader, controls, scaler, device, args, rank == 0)
+            if world_size > 1:
+                dist.all_reduce(totals)
+            train_loss = (totals[0] / totals[1]).item()  # one synchronisation per epoch
             if rank == 0:
-                print(f"[Epoch {epoch+1}] Average Training Loss: {avg_train_loss:.4f}")
-                log_file.write(f"train epoch={epoch+1} loss={avg_train_loss:.6f}\n")
-                log_file.flush()
-                append_jsonl(os.path.join(args.output_dir, "history.jsonl"), {
-                    "epoch": epoch + 1, "train_loss": avg_train_loss,
-                    "lr": [group["lr"] for group in optimizer.param_groups],
-                    "training_config": recipe})
+                record = {"epoch": epoch, "train_loss": train_loss, "lr": [g["lr"] for g in controls.optimizer.param_groups],
+                          "seconds": time.perf_counter() - started, "data_wait_seconds": data_wait,
+                          "training_config": recipe}
+                append_jsonl(out / "history.jsonl", record)
+                print(f"[epoch {epoch}] train loss {train_loss:.4f}, {record['seconds']:.0f} s "
+                      f"({data_wait:.0f} s waiting for data)", flush=True)
 
-            # ---- Validation ----
-            # FP32 forward, scored with the same function as eval.py, so the logged mIoU equals a
-            # later eval.py run on the saved checkpoint. DistributedSampler pads with repeated
-            # images; scores are keyed by filename, so the repeats are counted once.
-            if args.validate_every > 0 and (epoch + 1) % args.validate_every == 0:
-                model.eval()
-                val_loss_sum = torch.zeros(1, device=device, dtype=torch.float64)  # (1,)
-                scores = {}
-
-                loop = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} (Val)", disable=(rank != 0), dynamic_ncols=True)
-                with torch.no_grad():
-                    for batch in loop:
-                        images = batch["image"].to(device, non_blocking=True)  # (B, 3, H, W)
-                        masks = batch["mask"].to(device, non_blocking=True)  # (B, 1, H, W)
-                        pred = model(images, batch["text"])  # (B, 1, 16*H_p, 16*W_p)
-                        resized = nn.functional.interpolate(
-                            pred, size=masks.shape[-2:], mode="bilinear", align_corners=False
-                        )  # (B, 1, H, W)
-                        val_loss_sum += segmentation_loss(resized, masks, args.dice_weight).detach().to(torch.float64)
-                        for i, fname in enumerate(batch["filename"]):
-                            truth = batch["original_mask"][i].unsqueeze(0).to(device)  # (1, 1, H_i, W_i)
-                            scores[fname] = score_sample(pred[i:i+1], truth)[1]
-
-                if is_dist:
-                    dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
-                    gathered = [None] * world_size
-                    dist.all_gather_object(gathered, scores)
-                    scores = {k: v for part in gathered for k, v in part.items()}
-                avg_val_loss = (val_loss_sum / (len(val_loader) * world_size)).item()
-
+            if args.validate_every and epoch % args.validate_every == 0:
+                scores = gather_scores(evaluate(core, val_loader, device), world_size)
                 if rank == 0:
-                    if len(scores) != len(val_set):
-                        raise RuntimeError(f"Validation scored {len(scores)} of {len(val_set)} images")
-                    val_miou = sum(scores.values()) / len(scores)
-                    print(f"[Epoch {epoch+1}] Validation loss {avg_val_loss:.4f}, mIoU {100 * val_miou:.2f}")
-                    log_file.write(f"val epoch={epoch+1} loss={avg_val_loss:.6f} miou={val_miou:.6f}\n")
-                    log_file.flush()
-                    append_jsonl(os.path.join(args.output_dir, "val_curve.jsonl"), {
-                        "epoch": epoch + 1, "val_loss": avg_val_loss, "val_miou": val_miou,
-                        "num_images": len(scores), "training_config": recipe})
+                    val_miou = mean_iou(scores, len(val_set))
+                    append_jsonl(out / "val_curve.jsonl", {"epoch": epoch, "val_miou": val_miou,
+                                                           "num_images": len(scores), "training_config": recipe})
+                    print(f"[epoch {epoch}] validation mIoU {100 * val_miou:.2f}", flush=True)
 
-            # ---- Checkpoint (rank 0 only) ----
-            if rank == 0 and args.save_every > 0 and (epoch + 1) % args.save_every == 0:
-                ckpt_path = os.path.join(args.output_dir, f"checkpoint_epoch{epoch+1}.pt")
-                underlying_model = model.module if is_dist else model
-                ckpt = {
-                    "epoch": epoch + 1,
-                    "model_state_dict": underlying_model.state_dict(),
-                    "training_controls": controls.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "run_config": run_config,
-                    "scaler_state_dict": scaler.state_dict(),
-                    "loss": avg_train_loss,
-                }
-                torch.save(ckpt, ckpt_path, _use_new_zipfile_serialization=False)
-                print(f"✅ Checkpoint saved at {ckpt_path}")
-
-        # ---- Final model (rank 0 only) ----
-        if rank == 0:
-            underlying_model = model.module if is_dist else model
-            final_path = os.path.join(args.output_dir, f"model_final_epoch{args.num_epochs}.pt")
-            torch.save(underlying_model.state_dict(), final_path, _use_new_zipfile_serialization=False)
-            print(f"🔚 Final model saved → {final_path}")
+            if rank == 0 and ((args.save_every and epoch % args.save_every == 0) or epoch == args.num_epochs):
+                save_atomically({"epoch": epoch, "model_state_dict": core.state_dict(),
+                                 "model_config": model_config.to_dict(), "run_config": run_config,
+                                 "training_controls": controls.state_dict(),
+                                 "optimizer_state_dict": controls.optimizer.state_dict(),
+                                 "scaler_state_dict": scaler.state_dict()}, out / f"checkpoint_epoch{epoch}.pt")
+                print(f"[epoch {epoch}] checkpoint saved", flush=True)
     finally:
-        if log_file is not None:
-            log_file.close()
-            if rank == 0:
-                print(f"📝 Training log saved → {log_path}")
         cleanup_distributed()
 
 

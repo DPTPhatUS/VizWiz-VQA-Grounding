@@ -115,3 +115,71 @@ class UNetDecoder(nn.Module):
         x = self.dec_blocks[3](x)  # (B, 128, 16*H_p, 16*W_p)
 
         return self.final_conv(x)  # (B, 1, 16*H_p, 16*W_p)
+
+
+def _groups(channels: int) -> int:
+    """GroupNorm groups: 8 channels per group (a documented choice; GroupNorm does not depend on
+    the per-GPU batch, which is 2 images in the reference recipe)."""
+    return max(1, channels // 8)
+
+
+def conv_gn_gelu(in_channels: int, out_channels: int, kernel_size: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size // 2, bias=False),
+        nn.GroupNorm(_groups(out_channels), out_channels),
+        nn.GELU(),
+    )
+
+
+class Bottleneck(nn.Module):
+    """Residual branch 1x1 (C -> C/4) -> 3x3 -> 1x1 (C/4 -> C) with GroupNorm after each conv.
+
+    The last GroupNorm starts with zero scale, so the branch outputs exactly zero at initialisation
+    and every skip fusion x <- x + branch(x + s) starts as the identity.
+    """
+
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        mid = channels // reduction
+        self.branch = nn.Sequential(
+            conv_gn_gelu(channels, mid, 1),
+            conv_gn_gelu(mid, mid, 3),
+            nn.Conv2d(mid, channels, 1, bias=False),
+            nn.GroupNorm(_groups(channels), channels),
+        )
+        nn.init.zeros_(self.branch[-1].weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.branch(x)
+
+
+class FusionDecoder(nn.Module):
+    """B0 decoder (ocrg D017): fuse the ViT skips at the patch grid, then upsample.
+
+    All ViT features share one resolution (24x24 for ViT-L/14-336), so the skips are fused there:
+        x = P(F);  x <- x + Bottleneck_j(x + P_j(s_j))  for j = 3, 2, 1
+    followed by four stages of bilinear x2 upsampling and a double 3x3 conv block, and a 1x1 head:
+        24 -> 48 -> 96 -> 192 -> 384 pixels, width 256 -> 128 -> 64 -> 32 -> 16 -> 1 logit.
+    The upsampling stages carry no ViT skips; they are where higher-resolution evidence can enter later.
+    """
+
+    def __init__(self, in_channels: int = 1024, width: int = 256, stage_channels=(128, 64, 32, 16)):
+        super().__init__()
+        self.input_proj = nn.Conv2d(in_channels, width, 1)
+        self.skip_proj = nn.ModuleList(nn.Conv2d(in_channels, width, 1) for _ in range(3))
+        self.fusion = nn.ModuleList(Bottleneck(width) for _ in range(3))
+        channels = (width, *stage_channels)
+        self.stages = nn.ModuleList(
+            nn.Sequential(conv_gn_gelu(c_in, c_out, 3), conv_gn_gelu(c_out, c_out, 3))
+            for c_in, c_out in zip(channels[:-1], channels[1:], strict=True)
+        )
+        self.head = nn.Conv2d(channels[-1], 1, 1)
+
+    def forward(self, fused: torch.Tensor, s1: torch.Tensor, s2: torch.Tensor, s3: torch.Tensor) -> torch.Tensor:
+        """fused, s1, s2, s3: (B, D_v, H_p, W_p) -> logits (B, 1, 16*H_p, 16*W_p)."""
+        x = self.input_proj(fused)  # (B, W, H_p, W_p)
+        for proj, block, skip in zip(self.skip_proj, self.fusion, (s3, s2, s1), strict=True):  # deepest first
+            x = x + block(x + proj(skip))  # (B, W, H_p, W_p)
+        for stage in self.stages:
+            x = stage(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False))  # 2x per stage
+        return self.head(x)  # (B, 1, 16*H_p, 16*W_p)

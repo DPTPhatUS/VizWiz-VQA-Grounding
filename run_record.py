@@ -13,11 +13,13 @@ from pathlib import Path
 
 # Keys that define what is being trained. Paths, worker counts, logging cadence and the epoch
 # budget may change on resume; these may not.
-RECIPE_KEYS = ("text_mode", "dice_weight", "lr", "batch_size", "seed", "world_size")
+RECIPE_KEYS = ("dice_weight", "lr", "batch_size", "seed", "world_size", "grad_clip_norm",
+               "freeze_vision_encoder", "freeze_text_encoder",
+               "decoder", "attention_residual", "attention_residual_init")
 
 
 def parse_expectations(items):
-    """['dice_weight=0.5', 'text_mode=question'] -> {'dice_weight': 0.5, 'text_mode': 'question'}."""
+    """['dice_weight=0.5', 'decoder=fusion'] -> {'dice_weight': 0.5, 'decoder': 'fusion'} (values parsed as JSON when possible)."""
     expected = {}
     for item in items or ():
         if "=" not in item:
