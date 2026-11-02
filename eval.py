@@ -9,7 +9,6 @@ import argparse
 import json
 import os
 import torch
-import torch.nn.functional as F
 from datetime import datetime
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
@@ -17,7 +16,7 @@ from torchvision.transforms.functional import to_pil_image
 
 from dataset import VizWizGroundingDataset, collate_eval_samples
 from models import GroundingModel
-from metrics import compute_iou_per_sample
+from evaluation import score_sample
 from utils import align_state_dict
 
 
@@ -108,11 +107,8 @@ def main(argv=None):
             for i, fname in enumerate(filenames):
                 truth = (batch["original_mask"][i].unsqueeze(0).to(device)
                          if args.metric_resolution == "original" else masks[i:i+1])
-                logits = F.interpolate(pred[i:i+1].float(), size=truth.shape[-2:],
-                                       mode="bilinear", align_corners=False)
-                prediction = (logits > 0).float()
-                score = compute_iou_per_sample(prediction, truth,
-                                               legacy=args.metric_resolution == "resized").item()
+                prediction, score = score_sample(pred[i:i+1], truth,
+                                                 legacy=args.metric_resolution == "resized")
                 per_sample_iou[fname] = round(score, 6) if args.metric_resolution == "resized" else score
                 if args.output_dir:
                     mask_path = os.path.join(args.output_dir, os.path.splitext(fname)[0] + ".png")

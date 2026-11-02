@@ -2,7 +2,9 @@ from training_options import (
     TrainingArgumentParser,
     TrainingControls,
     restore_control_arguments,
+    public_arguments,
 )
+import json
 import os
 import random
 import torch
@@ -14,7 +16,17 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from dataset import VizWizGroundingDataset
+from dataset import VizWizGroundingDataset, collate_eval_samples
+from evaluation import score_sample
+from losses import segmentation_loss
+from run_record import (
+    RECIPE_KEYS,
+    append_jsonl,
+    check_expectations,
+    check_resume_recipe,
+    git_state,
+    parse_expectations,
+)
 from utils import align_state_dict, to_device
 from models import GroundingModel
 
@@ -72,7 +84,17 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--text-mode", choices=["qa", "question"], default="qa",
                         help="QA baseline (default) or a separately trained question-only control")
+    parser.add_argument("--dice-weight", type=float, default=0.0,
+                        help="Weight of the per-image soft Dice term added to BCE; 0 keeps the upstream BCE-only loss")
+    parser.add_argument("--expect", action="append", default=[], metavar="KEY=VALUE",
+                        help="Stop before training unless the resolved recipe has this value (repeatable)")
     args = parser.parse_args()
+    if args.dice_weight < 0:
+        parser.error("--dice-weight must be nonnegative")
+    try:
+        expected = parse_expectations(args.expect)
+    except ValueError as error:
+        parser.error(str(error))
 
     checkpoint = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False) if args.resume_checkpoint else None
     restore_control_arguments(args, checkpoint)
@@ -88,6 +110,14 @@ def main():
         parser.error(
             f"--batch-size ({args.batch_size}) must be a positive multiple of world_size ({world_size})"
         )
+
+    # Resolved recipe: checked against --expect and the resume checkpoint before anything is trained.
+    recipe = {key: getattr(args, key) for key in RECIPE_KEYS if key != "world_size"}
+    recipe["world_size"] = world_size
+    resolved = {**public_arguments(args), "world_size": world_size}
+    check_expectations(resolved, expected)
+    if checkpoint is not None:
+        check_resume_recipe(checkpoint, recipe)
 
     # Deterministic mode  (before any model creation)
     set_deterministic(args.seed)
@@ -116,6 +146,7 @@ def main():
         image_size=image_size,
         is_test=True,  # validation must not use random training augmentation
         text_mode=args.text_mode,
+        return_original_mask=True,  # validation mIoU uses the official native-resolution protocol
     )
 
     # --- Samplers & Loaders ---
@@ -153,6 +184,7 @@ def main():
         pin_memory=(device.type == "cuda"),
         prefetch_factor=2 if args.num_workers > 0 else None,
         worker_init_fn=seed_worker,
+        collate_fn=collate_eval_samples,
     )
 
     # --- Model ---
@@ -171,7 +203,6 @@ def main():
     # --- Optimizer / Loss / Scaler ---
     use_amp = (device.type == "cuda")
     optimizer = controls.optimizer
-    loss_fn = nn.BCEWithLogitsLoss()
     scaler = GradScaler("cuda", enabled=use_amp)
 
     # --- Resume checkpoint ---
@@ -208,6 +239,24 @@ def main():
             torch.cuda.empty_cache()
 
     controls.configure_schedule(args.num_epochs, len(train_loader), start_epoch)
+
+    run_config = {
+        "recipe": recipe,
+        "arguments": resolved,
+        "training_controls": dict(controls.config),
+        "git": git_state(os.path.dirname(os.path.abspath(__file__))),
+        "versions": {"torch": str(torch.__version__)},
+        "start_epoch": start_epoch,
+    }
+    if rank == 0:
+        try:
+            import transformers
+            run_config["versions"]["transformers"] = str(transformers.__version__)
+        except ImportError:
+            run_config["versions"]["transformers"] = None
+        print("Run config:", json.dumps(run_config))
+        with open(os.path.join(args.output_dir, f"run_config_from_epoch{start_epoch}.json"), "w") as f:
+            json.dump(run_config, f, indent=1)
 
     # --- Log file (rank 0 only) ---
     log_file = None
@@ -248,7 +297,7 @@ def main():
                     pred = nn.functional.interpolate(
                         pred, size=masks.shape[-2:], mode="bilinear", align_corners=False
                     )  # (B, 1, H, W)
-                    loss = loss_fn(pred, masks)  # ()
+                    loss = segmentation_loss(pred, masks, args.dice_weight)  # ()
 
                 scaler.scale(loss).backward()
                 controls.step(scaler)
@@ -264,34 +313,51 @@ def main():
                 print(f"[Epoch {epoch+1}] Average Training Loss: {avg_train_loss:.4f}")
                 log_file.write(f"train epoch={epoch+1} loss={avg_train_loss:.6f}\n")
                 log_file.flush()
+                append_jsonl(os.path.join(args.output_dir, "history.jsonl"), {
+                    "epoch": epoch + 1, "train_loss": avg_train_loss,
+                    "lr": [group["lr"] for group in optimizer.param_groups],
+                    "training_config": recipe})
 
             # ---- Validation ----
+            # FP32 forward, scored with the same function as eval.py, so the logged mIoU equals a
+            # later eval.py run on the saved checkpoint. DistributedSampler pads with repeated
+            # images; scores are keyed by filename, so the repeats are counted once.
             if args.validate_every > 0 and (epoch + 1) % args.validate_every == 0:
                 model.eval()
                 val_loss_sum = torch.zeros(1, device=device, dtype=torch.float64)  # (1,)
+                scores = {}
 
                 loop = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} (Val)", disable=(rank != 0), dynamic_ncols=True)
                 with torch.no_grad():
                     for batch in loop:
-                        batch = to_device(batch, device)
-                        images, masks, texts = batch["image"], batch["mask"], batch["text"]  # (B, 3, H, W), (B, 1, H, W), list[str]
-
-                        with autocast(device.type, enabled=use_amp):
-                            pred = model(images, texts)  # (B, 1, 16*H_p, 16*W_p)
-                            pred = nn.functional.interpolate(
-                                pred, size=masks.shape[-2:], mode="bilinear", align_corners=False
-                            )  # (B, 1, H, W)
-                            loss = loss_fn(pred, masks)  # ()
-                        val_loss_sum += loss.detach().to(torch.float64)
+                        images = batch["image"].to(device, non_blocking=True)  # (B, 3, H, W)
+                        masks = batch["mask"].to(device, non_blocking=True)  # (B, 1, H, W)
+                        pred = model(images, batch["text"])  # (B, 1, 16*H_p, 16*W_p)
+                        resized = nn.functional.interpolate(
+                            pred, size=masks.shape[-2:], mode="bilinear", align_corners=False
+                        )  # (B, 1, H, W)
+                        val_loss_sum += segmentation_loss(resized, masks, args.dice_weight).detach().to(torch.float64)
+                        for i, fname in enumerate(batch["filename"]):
+                            truth = batch["original_mask"][i].unsqueeze(0).to(device)  # (1, 1, H_i, W_i)
+                            scores[fname] = score_sample(pred[i:i+1], truth)[1]
 
                 if is_dist:
                     dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+                    gathered = [None] * world_size
+                    dist.all_gather_object(gathered, scores)
+                    scores = {k: v for part in gathered for k, v in part.items()}
                 avg_val_loss = (val_loss_sum / (len(val_loader) * world_size)).item()
 
                 if rank == 0:
-                    print(f"[Epoch {epoch+1}] Average Validation Loss: {avg_val_loss:.4f}")
-                    log_file.write(f"val epoch={epoch+1} loss={avg_val_loss:.6f}\n")
+                    if len(scores) != len(val_set):
+                        raise RuntimeError(f"Validation scored {len(scores)} of {len(val_set)} images")
+                    val_miou = sum(scores.values()) / len(scores)
+                    print(f"[Epoch {epoch+1}] Validation loss {avg_val_loss:.4f}, mIoU {100 * val_miou:.2f}")
+                    log_file.write(f"val epoch={epoch+1} loss={avg_val_loss:.6f} miou={val_miou:.6f}\n")
                     log_file.flush()
+                    append_jsonl(os.path.join(args.output_dir, "val_curve.jsonl"), {
+                        "epoch": epoch + 1, "val_loss": avg_val_loss, "val_miou": val_miou,
+                        "num_images": len(scores), "training_config": recipe})
 
             # ---- Checkpoint (rank 0 only) ----
             if rank == 0 and args.save_every > 0 and (epoch + 1) % args.save_every == 0:
@@ -301,7 +367,8 @@ def main():
                     "epoch": epoch + 1,
                     "model_state_dict": underlying_model.state_dict(),
                     "training_controls": controls.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "run_config": run_config,
                     "scaler_state_dict": scaler.state_dict(),
                     "loss": avg_train_loss,
                 }
