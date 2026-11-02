@@ -83,6 +83,16 @@ class DataTests(unittest.TestCase):
         self.assertEqual(tuple(batch["image"].shape), (2, 3, 336, 336))
         self.assertEqual([tuple(m.shape) for m in batch["native_mask"]], [(1, 9, 13), (1, 30, 40)])
 
+    def test_answer_only_with_explicit_qa_mode(self):
+        self.assertEqual(VizWizGroundingDataset(self.root, "val", text_mode="qa")[0]["text"],
+                         "Q: What is item 0? A: SECRET-ANSWER")
+        make_split(self.root, "test", [(8, 8)], with_answers=False)  # like the real test split
+        self.assertEqual(VizWizGroundingDataset(self.root, "test")[0]["text"], "Q: What is item 0?")
+        with self.assertRaisesRegex(ValueError, "needs an answer"):
+            VizWizGroundingDataset(self.root, "test", text_mode="qa")[0]
+        with self.assertRaisesRegex(ValueError, "Unknown text_mode"):
+            VizWizGroundingDataset(self.root, "val", text_mode="answer")
+
     def test_missing_or_misaligned_mask_fails(self):
         (self.root / "binary_masks_png" / "val" / "val_0.png").unlink()
         with self.assertRaises(FileNotFoundError):
@@ -301,6 +311,27 @@ class TrainingTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             evaluator.main(["--checkpoint", str(self.out / "checkpoint_epoch2.pt"), "--data-root", str(self.root),
                             "--output-dir", str(self.out / "eval"), "--num-workers", "0"])
+
+    def test_qa_mode_is_recorded_and_followed_by_eval(self):
+        self.run_train("--text-mode", "qa", "--expect", "text_mode=qa", epochs="1")
+        history = json.loads((self.out / "history.jsonl").read_text().splitlines()[0])
+        self.assertEqual(history["training_config"]["text_mode"], "qa")
+        ckpt = str(self.out / "checkpoint_epoch1.pt")
+        common = ["--checkpoint", ckpt, "--data-root", str(self.root), "--num-workers", "0"]
+        evaluator.main([*common, "--output-dir", str(self.out / "eval_default")])
+        default = json.loads((self.out / "eval_default" / "metrics.json").read_text())["summary"]
+        self.assertEqual((default["text_mode"], default["answer_in_input"]), ("qa", True))
+        curve = json.loads((self.out / "val_curve.jsonl").read_text().splitlines()[0])
+        self.assertEqual(default["mean_iou"], curve["val_miou"])  # validation used the same qa input
+        evaluator.main([*common, "--output-dir", str(self.out / "eval_q"), "--text-mode", "question"])
+        removed = json.loads((self.out / "eval_q" / "metrics.json").read_text())["summary"]
+        self.assertEqual((removed["text_mode"], removed["trained_text_mode"], removed["answer_in_input"]),
+                         ("question", "qa", False))
+
+    def test_default_is_question_only(self):
+        self.run_train(epochs="1")
+        record = json.loads((self.out / "history.jsonl").read_text().splitlines()[0])
+        self.assertEqual(record["training_config"]["text_mode"], "question")
 
     def test_expect_mismatch_stops_before_training(self):
         with self.assertRaisesRegex(ValueError, "nothing was trained"):

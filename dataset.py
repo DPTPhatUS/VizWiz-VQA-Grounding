@@ -1,4 +1,4 @@
-"""VizWiz-VQA-Grounding data: question-only inputs (the answer field is never read)."""
+"""VizWiz-VQA-Grounding data. Default input is the question only; text_mode="qa" (ablations) adds the answer."""
 
 import json
 from pathlib import Path
@@ -26,24 +26,45 @@ def preprocess_image(image: Image.Image, size: int = IMAGE_SIZE) -> torch.Tensor
     return TF.normalize(TF.to_tensor(image), CLIP_MEAN, CLIP_STD)  # (3, size, size)
 
 
+TEXT_MODES = ("question", "qa")
+
+
 def question_text(question: str) -> str:
     return f"Q: {str(question).strip()}"
+
+
+def model_text(record: dict, text_mode: str = "question", filename: str = "") -> str:
+    """Text input for one record. "question": "Q: <question>" (the task input; the answer is not read).
+    "qa": "Q: <question> A: <most common answer>" for answer-conditioned ablations; raises if the record
+    has no answer (e.g. the test split) instead of feeding an empty one."""
+    if text_mode == "question":
+        return question_text(record["question"])
+    if text_mode == "qa":
+        answer = str(record.get("most_common_answer") or "").strip()
+        if not answer:
+            raise ValueError(f"text_mode='qa' needs an answer, but {filename or 'a record'} has none")
+        return f"{question_text(record['question'])} A: {answer}"
+    raise ValueError(f"Unknown text_mode {text_mode!r}; use one of {TEXT_MODES}")
 
 
 class VizWizGroundingDataset(Dataset):
     """One split of VizWiz-VQA-Grounding under root: {split}_grounding.json, {split}/, binary_masks_png/{split}/.
 
     Each sample: image (3, S, S) normalised, mask (1, S, S) float {0, 1} (nearest resize), text
-    "Q: <question>", filename; with native_mask=True also native_mask (1, H, W) bool at the original
-    image resolution, used by the official native-resolution metric.
+    (see model_text; question only unless text_mode="qa"), filename; with native_mask=True also
+    native_mask (1, H, W) bool at the original image resolution, used by the official metric.
     """
 
-    def __init__(self, root, split: str, *, image_size: int = IMAGE_SIZE, native_mask: bool = False):
+    def __init__(self, root, split: str, *, image_size: int = IMAGE_SIZE, native_mask: bool = False,
+                 text_mode: str = "question"):
+        if text_mode not in TEXT_MODES:
+            raise ValueError(f"Unknown text_mode {text_mode!r}; use one of {TEXT_MODES}")
         self.root, self.split = Path(root), split
         self.records = json.loads((self.root / f"{split}_grounding.json").read_text(encoding="utf-8"))
         self.filenames = list(self.records)
         self.image_size = image_size
         self.native_mask = native_mask
+        self.text_mode = text_mode
 
     def __len__(self) -> int:
         return len(self.filenames)
@@ -60,7 +81,7 @@ class VizWizGroundingDataset(Dataset):
         sample = {
             "image": preprocess_image(image, self.image_size),  # (3, S, S)
             "mask": (TF.to_tensor(TF.resize(mask, size, interpolation=T.InterpolationMode.NEAREST)) > 0.5).float(),  # (1, S, S)
-            "text": question_text(self.records[filename]["question"]),
+            "text": model_text(self.records[filename], self.text_mode, filename),
             "filename": filename,
         }
         if self.native_mask:

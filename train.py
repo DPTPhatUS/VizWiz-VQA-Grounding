@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
-from dataset import VizWizGroundingDataset, collate
+from dataset import TEXT_MODES, VizWizGroundingDataset, collate
 from evaluation import ShardSampler, evaluate, gather_scores, mean_iou
 from losses import segmentation_loss
 from models import GroundingModel, ModelConfig
@@ -45,6 +45,8 @@ def parse_args():
     parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument("--validate-every", type=int, default=0, help="Validation mIoU every N epochs (0 = never)")
     parser.add_argument("--save-every", type=int, default=10, help="Checkpoint every N epochs; the last epoch is always saved")
+    parser.add_argument("--text-mode", choices=TEXT_MODES, default="question",
+                        help="question: the task input (default). qa: also feed the answer, for ablations only")
     parser.add_argument("--dice-weight", type=float, default=0.0,
                         help="Weight of the per-image soft Dice term added to BCE (0 = BCE only)")
     parser.add_argument("--grad-clip-norm", type=float, default=None, help="Clip the gradient norm (off by default)")
@@ -133,10 +135,12 @@ def main():
         out = Path(args.output_dir)
         if rank == 0:
             out.mkdir(parents=True, exist_ok=True)
+            if args.text_mode != "question":
+                print("WARNING: text_mode=qa feeds the ground-truth answer; ablation only, not the task input", flush=True)
 
         # --- Data ---
         pin = device.type == "cuda"
-        train_set = VizWizGroundingDataset(args.data_root, "train")
+        train_set = VizWizGroundingDataset(args.data_root, "train", text_mode=args.text_mode)
         generator = torch.Generator()
         sampler = (DistributedSampler(train_set, world_size, rank, shuffle=True, seed=args.seed) if world_size > 1
                    else RandomSampler(train_set, generator=generator))
@@ -146,7 +150,7 @@ def main():
         train_loader = DataLoader(train_set, batch_size=args.batch_size // world_size, sampler=sampler, **loader_options)
         val_set = val_loader = None
         if args.validate_every:
-            val_set = VizWizGroundingDataset(args.data_root, "val", native_mask=True)
+            val_set = VizWizGroundingDataset(args.data_root, "val", native_mask=True, text_mode=args.text_mode)
             val_loader = DataLoader(val_set, batch_size=args.batch_size // world_size,
                                     sampler=ShardSampler(len(val_set), rank, world_size), **loader_options)
 

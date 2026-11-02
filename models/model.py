@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import CLIPTextConfig, CLIPVisionConfig
 
-from dataset import IMAGE_SIZE, load_image, preprocess_image, question_text
+from dataset import IMAGE_SIZE, load_image, model_text, preprocess_image
 from models.image_encoder import ImageEncoder
 from models.mask_decoder import FusionDecoder, UNetDecoder
 from models.text_encoder import TextEncoder
@@ -97,11 +97,12 @@ class GroundingModel(nn.Module):
         return model.to(device).eval(), metadata
 
     @torch.no_grad()
-    def predict(self, image, question: str) -> torch.Tensor:
-        """Single image (path or PIL) and question -> boolean mask (H, W) at the image's own resolution."""
+    def predict(self, image, question: str, answer: str | None = None) -> torch.Tensor:
+        """Single image (path or PIL) and question -> boolean mask (H, W) at the image's own resolution.
+        Pass answer only for a model trained with text_mode="qa"."""
         self.eval()
         pil = load_image(image) if not hasattr(image, "size") else image.convert("RGB")
         device = next(self.parameters()).device
-        logits = self(preprocess_image(pil).unsqueeze(0).to(device), [question_text(question)])  # (1, 1, h, w)
+        logits = self(preprocess_image(pil).unsqueeze(0).to(device), [model_text({"question": question, "most_common_answer": answer}, "qa" if answer else "question")])  # (1, 1, h, w)
         logits = F.interpolate(logits.float(), size=(pil.height, pil.width), mode="bilinear", align_corners=False)
         return logits[0, 0] > 0  # (H, W)

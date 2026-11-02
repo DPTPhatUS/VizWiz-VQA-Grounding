@@ -19,7 +19,7 @@ Trainable: 310.3M (vision encoder 303.5M, attention 5.0M, decoder 1.85M); text e
 
 ## Data
 
-Point `--data-root` at a folder with `{train,val,test}_grounding.json`, `{train,val,test}/` images and `binary_masks_png/{train,val,test}/`. Images are EXIF-rotated, resized to 336×336 without keeping the aspect ratio (bicubic, antialiased) and CLIP-normalised; training masks use nearest resizing (no mask loses its foreground at 336 px). Only the question is read; a missing or misaligned mask is an error.
+Point `--data-root` at a folder with `{train,val,test}_grounding.json`, `{train,val,test}/` images and `binary_masks_png/{train,val,test}/`. Images are EXIF-rotated, resized to 336×336 without keeping the aspect ratio (bicubic, antialiased) and CLIP-normalised; training masks use nearest resizing (no mask loses its foreground at 336 px). By default only the question is read (the task input). `--text-mode qa` also feeds the most common answer (`Q: … A: …`) for ablations only: it is recorded in the recipe, `eval.py` follows the checkpoint's mode unless `--text-mode` overrides it (e.g. a qa-trained model scored with the question only), results report `answer_in_input`, and qa mode fails on records without an answer (the test split). A missing or misaligned mask is an error.
 
 ## Train
 

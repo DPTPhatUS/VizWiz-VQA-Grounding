@@ -16,7 +16,7 @@ import torch
 from torch.utils.data import DataLoader
 from torchvision.transforms.functional import to_pil_image
 
-from dataset import VizWizGroundingDataset, collate
+from dataset import TEXT_MODES, VizWizGroundingDataset, collate
 from evaluation import ShardSampler, evaluate, gather_scores, mean_iou
 from models import GroundingModel
 from utils import cleanup_distributed, setup_distributed
@@ -31,6 +31,9 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=8, help="Images per GPU")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--save-masks", action="store_true", help="Also save predicted masks as PNGs")
+    parser.add_argument("--text-mode", choices=TEXT_MODES, default=None,
+                        help="Default: the checkpoint's training text mode. Override for diagnostics, "
+                             "e.g. a qa-trained model evaluated with the question only")
     args = parser.parse_args(argv)
     if args.batch_size <= 0 or args.num_workers < 0:
         parser.error("--batch-size must be positive and --num-workers nonnegative")
@@ -47,7 +50,9 @@ def main(argv=None):
     rank, world_size, _, device = setup_distributed()
     try:
         model, metadata = GroundingModel.from_checkpoint(args.checkpoint, device)
-        dataset = VizWizGroundingDataset(args.data_root, args.split, native_mask=True)
+        trained_mode = ((metadata.get("run_config") or {}).get("recipe") or {}).get("text_mode", "question")
+        text_mode = args.text_mode or trained_mode
+        dataset = VizWizGroundingDataset(args.data_root, args.split, native_mask=True, text_mode=text_mode)
         loader = DataLoader(dataset, batch_size=args.batch_size, sampler=ShardSampler(len(dataset), rank, world_size),
                             num_workers=args.num_workers, pin_memory=device.type == "cuda", collate_fn=collate)
         save = None
@@ -66,6 +71,9 @@ def main(argv=None):
                 "num_samples": len(scores),
                 "mean_iou": mean_iou(scores, len(dataset)),
                 "protocol": "native resolution, bilinear logits, threshold 0, empty union = 1, FP32",
+                "text_mode": text_mode,
+                "trained_text_mode": trained_mode,
+                "answer_in_input": text_mode == "qa",
                 "model_config": metadata["model_config"],
                 "recipe": (metadata.get("run_config") or {}).get("recipe"),
             }
