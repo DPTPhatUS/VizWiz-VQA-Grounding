@@ -29,7 +29,13 @@ from evaluation import ShardSampler, evaluate, gather_scores, mean_iou
 from losses import segmentation_loss
 from models import GroundingModel, ModelConfig
 from run_record import RECIPE_KEYS, append_jsonl, check_expectations, check_resume_recipe, git_state, parse_expectations
-from training_options import TrainingArgumentParser, TrainingControls, public_arguments, restore_control_arguments
+from training_options import DEFAULTS as OPTIMIZATION_DEFAULTS
+from training_options import (
+    TrainingArgumentParser,
+    TrainingControls,
+    public_arguments,
+    restore_control_arguments,
+)
 from utils import align_state_dict, cleanup_distributed, setup_distributed
 
 
@@ -54,6 +60,8 @@ def parse_args():
     parser.add_argument("--attention-residual", action=argparse.BooleanOptionalAction, default=ModelConfig.attention_residual,
                         help="F = V + alpha * MHA(V, T) (default) instead of F = MHA(V, T)")
     parser.add_argument("--attention-residual-init", type=float, default=ModelConfig.attention_residual_init)
+    parser.add_argument("--stage-attention", action=argparse.BooleanOptionalAction, default=ModelConfig.stage_attention,
+                        help="Question attention in decoder stages 48/96/192 px (default); off = no such modules")
     parser.add_argument("--expect", action="append", default=[], metavar="KEY=VALUE",
                         help="Stop before training unless the resolved recipe has this value (repeatable)")
     args = parser.parse_args()
@@ -120,8 +128,12 @@ def main():
 
         # Resolved recipe: checked against --expect and the resume checkpoint before anything is built.
         model_config = ModelConfig(decoder=args.decoder, attention_residual=args.attention_residual,
-                                   attention_residual_init=args.attention_residual_init)
+                                   attention_residual_init=args.attention_residual_init,
+                                   stage_attention=args.stage_attention)
         resolved = {**public_arguments(args), "world_size": world_size}
+        for key, default in OPTIMIZATION_DEFAULTS.items():  # record what is used, not None
+            if key not in ("freeze_vision_encoder", "freeze_text_encoder", "backbone_lr") and resolved.get(key) is None:
+                resolved[key] = default
         resolved.pop("expected", None)
         recipe = {key: resolved[key] for key in RECIPE_KEYS}
         check_expectations(resolved, args.expected)

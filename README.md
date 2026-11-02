@@ -11,11 +11,12 @@ F = V + α · MHA(query=V, key=T, value=T)                      α learnable, in
 Decoder (FusionDecoder):
   x = Conv1x1(F) → 256;  x ← x + Bottleneck(x + Conv1x1(s_j))  for j = 3, 2, 1   (24x24; last GN starts at 0)
   4 × [bilinear ×2 → (Conv3x3 → GroupNorm → GELU) × 2]: 256→128→64→32→16, 24→384 px
+    stages 48², 96², 192² then: x ← x + γ_s · MHA(GN(x), T, T)    (T projected per stage; 4/2/1 heads of 32; γ_s init 0)
   Conv1x1 → 1 logit map (384x384)
 Loss: BCE + 0.5 · per-image soft Dice, on logits resized to the 336 px training mask
 ```
 
-Trainable: 310.3M (vision encoder 303.5M, attention 5.0M, decoder 1.85M); text encoder 123.1M frozen. The upstream architecture remains available with `--decoder unet --no-attention-residual`.
+Trainable: 310.6M (vision encoder 303.5M, attention 5.0M, decoder 2.11M of which stage attention 0.26M); text encoder 123.1M frozen. `--no-stage-attention` builds the decoder without the stage attentions (identical to B0 at initialisation, since every γ_s starts at 0). The upstream architecture remains available with `--decoder unet --no-attention-residual --no-stage-attention`.
 
 ## Data
 
@@ -24,12 +25,14 @@ Point `--data-root` at a folder with `{train,val,test}_grounding.json`, `{train,
 ## Train
 
 ```bash
-torchrun --nproc_per_node 2 train.py --data-root DATA --output-dir OUT --num-epochs 20 --batch-size 4 \
-  --dice-weight 0.5 --freeze-text-encoder --no-freeze-vision-encoder --validate-every 2 --save-every 10 \
-  --expect dice_weight=0.5 --expect freeze_text_encoder=true --expect decoder=fusion
+torchrun --nproc_per_node 2 train.py --data-root DATA --output-dir OUT --num-epochs 20 --batch-size 8 \
+  --dice-weight 0.5 --freeze-text-encoder --no-freeze-vision-encoder \
+  --optimizer adamw --weight-decay 0.05 --lr 1e-4 --backbone-lr 1e-5 --lr-scheduler cosine --warmup-ratio 0.05 \
+  --grad-clip-norm 1.0 --validate-every 2 --save-every 10 \
+  --expect dice_weight=0.5 --expect freeze_text_encoder=true --expect stage_attention=true --expect optimizer=adamw
 ```
 
-- `--batch-size` is global (split across GPUs); training uses FP16 autocast and Adam (lr 1e-5) by default.
+- This is the B0 recipe (decision D017): AdamW (no decay on norms, biases, embeddings, α, γ), learning rate 1e-4 for new layers and 1e-5 for the vision encoder, cosine schedule with 5% warmup, gradient clipping 1.0. Without these flags the defaults are Adam at 1e-5, constant. `--batch-size` is global (split across GPUs); training uses FP16 autocast.
 - `--expect KEY=VALUE` stops before training if the resolved recipe differs. Resuming (`--resume-checkpoint`) refuses a checkpoint with a different recipe or architecture.
 - Outputs: `run_config_from_epoch<E>.json`, `history.jsonl` (loss, learning rate, seconds, seconds waiting for data), `val_curve.jsonl` (validation mIoU) and `checkpoint_epoch<E>.pt` (every `--save-every` epochs and always at the last epoch; written atomically). Checkpoints store the architecture and the recipe.
 

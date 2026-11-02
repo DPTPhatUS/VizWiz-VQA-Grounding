@@ -20,19 +20,22 @@ CLIP_NAME = "openai/clip-vit-large-patch14-336"
 class ModelConfig:
     """Architecture; saved in every checkpoint so evaluation rebuilds exactly the trained model.
 
-    Defaults are B0 (ocrg decision D017). decoder="unet" with attention_residual=False is the
-    upstream baseline-fixes architecture.
+    Defaults are B0 (ocrg decision D017). decoder="unet" with attention_residual=False and
+    stage_attention=False is the upstream baseline-fixes architecture.
     """
 
     decoder: str = "fusion"  # "fusion" (FusionDecoder) or "unet" (upstream UNetDecoder)
     attention_residual: bool = True  # F = V + alpha * MHA(V, T); False: F = MHA(V, T) (upstream)
     attention_residual_init: float = 0.01  # initial alpha (learnable), as in the ACIIDS models
+    stage_attention: bool = True  # question attention in decoder stages 48/96/192 px (gamma init 0); fusion only
     clip_name: str = CLIP_NAME
     tiny: bool = False  # randomly initialised tiny encoders, for offline tests only
 
     def __post_init__(self):
         if self.decoder not in {"fusion", "unet"}:
             raise ValueError(f"Unknown decoder {self.decoder!r}")
+        if self.stage_attention and self.decoder != "fusion":
+            raise ValueError("stage_attention exists only in the fusion decoder; use stage_attention=False with unet")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -61,8 +64,9 @@ class GroundingModel(nn.Module):
         self.cross_attn = nn.MultiheadAttention(self.hidden_dim, heads, batch_first=True)
         self.attention_scale = (nn.Parameter(torch.tensor(float(config.attention_residual_init)))
                                 if config.attention_residual else None)
-        self.decoder = (FusionDecoder(self.hidden_dim) if config.decoder == "fusion"
-                        else UNetDecoder(in_channels=self.hidden_dim))
+        self.decoder = (FusionDecoder(self.hidden_dim, text_dim=self.text_encoder.output_dim,
+                                      stage_attention=config.stage_attention)
+                        if config.decoder == "fusion" else UNetDecoder(in_channels=self.hidden_dim))
 
     def fuse(self, vision: torch.Tensor, tokens: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
         """Patches attend to question tokens. vision (B, D_v, H_p, W_p), tokens (B, L, D_t), padding (B, L)."""
@@ -78,7 +82,7 @@ class GroundingModel(nn.Module):
         tokens, padding = self.text_encoder(texts)  # (B, L, D_t), (B, L)
         fused = self.fuse(vision, tokens, padding)  # (B, D_v, H_p, W_p)
         if isinstance(self.decoder, FusionDecoder):
-            return self.decoder(fused, s1, s2, s3)  # (B, 1, 16*H_p, 16*W_p)
+            return self.decoder(fused, s1, s2, s3, tokens, padding)  # (B, 1, 16*H_p, 16*W_p)
         return self.decoder(fused, s3, s2, s1)  # upstream argument order
 
     @classmethod

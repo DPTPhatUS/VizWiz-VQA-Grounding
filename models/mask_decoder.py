@@ -153,6 +153,29 @@ class Bottleneck(nn.Module):
         return self.branch(x)
 
 
+class StageAttention(nn.Module):
+    """Question attention inside an upsampling stage: x <- x + gamma * MHA(GN(x), T, T).
+
+    Queries are the stage's pixels (normalised), keys/values the frozen question tokens projected to
+    the stage width (own projection per stage). gamma is a learnable scalar initialised to 0, so the
+    block starts as the identity. Later OCR models append OCR tokens to the same keys/values.
+    """
+
+    def __init__(self, channels: int, text_dim: int, head_dim: int = 32):
+        super().__init__()
+        self.norm = nn.GroupNorm(_groups(channels), channels)
+        self.text_proj = nn.Linear(text_dim, channels)
+        self.attn = nn.MultiheadAttention(channels, max(1, channels // head_dim), batch_first=True)
+        self.gamma = nn.Parameter(torch.zeros(()))
+
+    def forward(self, x: torch.Tensor, tokens: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
+        """x (B, C, H, W), tokens (B, L, D_t), padding (B, L) with True = padding -> (B, C, H, W)."""
+        query = self.norm(x).flatten(2).transpose(1, 2)  # (B, H*W, C)
+        keys = self.text_proj(tokens).to(query.dtype)  # (B, L, C)
+        attended, _ = self.attn(query, keys, keys, key_padding_mask=padding, need_weights=False)  # (B, H*W, C)
+        return x + self.gamma.to(attended.dtype) * attended.transpose(1, 2).reshape(x.shape)
+
+
 class FusionDecoder(nn.Module):
     """B0 decoder (ocrg D017): fuse the ViT skips at the patch grid, then upsample.
 
@@ -160,10 +183,15 @@ class FusionDecoder(nn.Module):
         x = P(F);  x <- x + Bottleneck_j(x + P_j(s_j))  for j = 3, 2, 1
     followed by four stages of bilinear x2 upsampling and a double 3x3 conv block, and a 1x1 head:
         24 -> 48 -> 96 -> 192 -> 384 pixels, width 256 -> 128 -> 64 -> 32 -> 16 -> 1 logit.
-    The upsampling stages carry no ViT skips; they are where higher-resolution evidence can enter later.
+    With stage_attention, stages 1-3 (48, 96, 192 px) end with a StageAttention to the question tokens
+    (gamma = 0 at start, so the decoder starts exactly as without it). The upsampling stages carry no
+    ViT skips; they are where higher-resolution evidence (OCR tokens) can enter later.
     """
 
-    def __init__(self, in_channels: int = 1024, width: int = 256, stage_channels=(128, 64, 32, 16)):
+    ATTENTION_STAGES = 3  # stages 1-3; the 384 px stage (16 channels) has none
+
+    def __init__(self, in_channels: int = 1024, width: int = 256, stage_channels=(128, 64, 32, 16),
+                 text_dim: int = 768, stage_attention: bool = True):
         super().__init__()
         self.input_proj = nn.Conv2d(in_channels, width, 1)
         self.skip_proj = nn.ModuleList(nn.Conv2d(in_channels, width, 1) for _ in range(3))
@@ -174,12 +202,20 @@ class FusionDecoder(nn.Module):
             for c_in, c_out in zip(channels[:-1], channels[1:], strict=True)
         )
         self.head = nn.Conv2d(channels[-1], 1, 1)
+        self.stage_attention = (nn.ModuleList(StageAttention(c, text_dim) for c in stage_channels[:self.ATTENTION_STAGES])
+                                if stage_attention else None)
 
-    def forward(self, fused: torch.Tensor, s1: torch.Tensor, s2: torch.Tensor, s3: torch.Tensor) -> torch.Tensor:
-        """fused, s1, s2, s3: (B, D_v, H_p, W_p) -> logits (B, 1, 16*H_p, 16*W_p)."""
+    def forward(self, fused: torch.Tensor, s1: torch.Tensor, s2: torch.Tensor, s3: torch.Tensor,
+                tokens: torch.Tensor | None = None, padding: torch.Tensor | None = None) -> torch.Tensor:
+        """fused, s1, s2, s3: (B, D_v, H_p, W_p); tokens (B, L, D_t) and padding (B, L) are required
+        with stage attention -> logits (B, 1, 16*H_p, 16*W_p)."""
+        if self.stage_attention is not None and (tokens is None or padding is None):
+            raise ValueError("Stage attention needs the question tokens and their padding mask")
         x = self.input_proj(fused)  # (B, W, H_p, W_p)
         for proj, block, skip in zip(self.skip_proj, self.fusion, (s3, s2, s1), strict=True):  # deepest first
             x = x + block(x + proj(skip))  # (B, W, H_p, W_p)
-        for stage in self.stages:
+        for i, stage in enumerate(self.stages):
             x = stage(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False))  # 2x per stage
+            if self.stage_attention is not None and i < len(self.stage_attention):
+                x = self.stage_attention[i](x, tokens, padding)
         return self.head(x)  # (B, 1, 16*H_p, 16*W_p)

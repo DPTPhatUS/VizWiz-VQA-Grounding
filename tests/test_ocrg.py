@@ -134,18 +134,44 @@ class ModelTests(unittest.TestCase):
         cls.texts = ["Q: what is this?", "Q: what does the label on the bottle say?"]
 
     def test_fusion_decoder_shape_and_identity_start(self):
-        decoder = FusionDecoder(in_channels=32)
+        decoder = FusionDecoder(in_channels=32, stage_attention=False)
         feats = [torch.randn(2, 32, 24, 24) for _ in range(4)]
         self.assertEqual(tuple(decoder(*feats).shape), (2, 1, 384, 384))
         x = decoder.input_proj(feats[0])
         for block in decoder.fusion:  # every skip branch starts at exactly zero
             self.assertEqual(block(x + torch.randn_like(x)).abs().max().item(), 0.0)
 
+    def test_stage_attention_off_is_the_plain_decoder_and_starts_as_identity(self):
+        torch.manual_seed(0)
+        on = FusionDecoder(in_channels=32, text_dim=16, stage_attention=True)
+        off = FusionDecoder(in_channels=32, text_dim=16, stage_attention=False)
+        self.assertFalse(any("stage_attention" in k for k in off.state_dict()))
+        result = off.load_state_dict(on.state_dict(), strict=False)
+        self.assertEqual(result.missing_keys, [])
+        self.assertTrue(result.unexpected_keys and all(k.startswith("stage_attention.") for k in result.unexpected_keys))
+        self.assertEqual([a.attn.num_heads for a in on.stage_attention], [4, 2, 1])  # widths 128, 64, 32; head size 32
+        feats = [torch.randn(2, 32, 24, 24) for _ in range(4)]
+        tokens, padding = torch.randn(2, 5, 16), torch.tensor([[False] * 5, [False] * 3 + [True] * 2])
+        with torch.no_grad():
+            self.assertTrue(torch.equal(on(*feats, tokens, padding), off(*feats)))  # gamma = 0 -> identical
+            for block in on.stage_attention:
+                block.gamma.fill_(0.5)
+            out = on(*feats, tokens, padding)
+            self.assertFalse(torch.allclose(out, off(*feats)))
+            self.assertFalse(torch.allclose(on(*feats, torch.randn(2, 5, 16), padding), out))  # depends on the question
+            noisy = tokens.clone()
+            noisy[padding] = torch.randn_like(noisy[padding])
+            self.assertTrue(torch.allclose(on(*feats, noisy, padding), out, atol=1e-5))  # padding ignored
+        with self.assertRaisesRegex(ValueError, "needs the question tokens"):
+            on(*feats)
+
     def test_forward_shapes_and_upstream_variant(self):
         self.assertEqual(tuple(self.model(self.images, self.texts).shape), (2, 1, 384, 384))
-        upstream = GroundingModel(TinyConfig(decoder="unet", attention_residual=False))
+        upstream = GroundingModel(TinyConfig(decoder="unet", attention_residual=False, stage_attention=False))
         self.assertIsNone(upstream.attention_scale)
         self.assertEqual(tuple(upstream(self.images, self.texts).shape), (2, 1, 384, 384))
+        with self.assertRaisesRegex(ValueError, "only in the fusion decoder"):
+            TinyConfig(decoder="unet")
 
     def test_residual_attention(self):
         vision = torch.randn(2, 32, 24, 24)
@@ -168,6 +194,14 @@ class ModelTests(unittest.TestCase):
         loss.backward()
         missing = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
         self.assertEqual(missing, [])
+        # Stage attention starts with gamma = 0: only gamma learns at first, then the attention follows.
+        self.assertTrue(all(b.gamma.grad.abs() > 0 for b in model.decoder.stage_attention))
+        with torch.no_grad():
+            for b in model.decoder.stage_attention:
+                b.gamma.fill_(0.1)
+        model.zero_grad()
+        segmentation_loss(model(self.images, self.texts), torch.ones(2, 1, 384, 384), 0.5).backward()
+        self.assertTrue(all(b.attn.in_proj_weight.grad.abs().sum() > 0 for b in model.decoder.stage_attention))
         self.assertFalse(any(p.requires_grad for n, p in model.named_parameters() if "post_layernorm" in n))
 
 
@@ -332,6 +366,42 @@ class TrainingTests(unittest.TestCase):
         self.run_train(epochs="1")
         record = json.loads((self.out / "history.jsonl").read_text().splitlines()[0])
         self.assertEqual(record["training_config"]["text_mode"], "question")
+
+    def test_b0_training_recipe(self):
+        """AdamW + weight decay, encoder/head learning rates, cosine with warmup and clipping, together."""
+        clip = torch.nn.utils.clip_grad_norm_
+        with patch.object(train.nn.utils, "clip_grad_norm_", wraps=clip) as clipped:
+            self.run_train("--optimizer", "adamw", "--weight-decay", "0.05", "--lr", "1e-4", "--backbone-lr", "1e-5",
+                           "--lr-scheduler", "cosine", "--warmup-ratio", "0.25", "--grad-clip-norm", "1.0",
+                           "--expect", "optimizer=adamw", "--expect", "stage_attention=true", epochs="3")
+        self.assertEqual(clipped.call_count, 6)  # 2 steps x 3 epochs
+        self.assertEqual(clipped.call_args.args[1], 1.0)
+        history = [json.loads(line) for line in (self.out / "history.jsonl").read_text().splitlines()]
+        recipe = history[0]["training_config"]
+        self.assertEqual((recipe["optimizer"], recipe["weight_decay"], recipe["lr_scheduler"], recipe["backbone_lr"]),
+                         ("adamw", 0.05, "cosine", 1e-5))
+        checkpoint = torch.load(self.out / "checkpoint_epoch3.pt", map_location="cpu", weights_only=False)
+        groups = checkpoint["optimizer_state_dict"]["param_groups"]
+        names = {g["group_name"]: g for g in groups}
+        self.assertEqual(set(names), {"backbone_decay", "backbone_no_decay", "head_decay", "head_no_decay"})
+        self.assertEqual(names["head_no_decay"]["weight_decay"], 0.0)
+        self.assertEqual(names["head_decay"]["weight_decay"], 0.05)
+        # Learning rates per epoch: warm up, then decay; head / backbone ratio stays 10.
+        head = [h["lr"][[g["group_name"] for g in groups].index("head_decay")] for h in history]
+        back = [h["lr"][[g["group_name"] for g in groups].index("backbone_decay")] for h in history]
+        self.assertTrue(all(abs(h / b - 10) < 1e-9 for h, b in zip(head, back, strict=True)))
+        self.assertLess(head[-1], max(head))
+        model, _ = GroundingModel.from_checkpoint(self.out / "checkpoint_epoch3.pt")
+        self.assertTrue(model.config.stage_attention)
+        # Trainable = everything except the frozen text encoder and CLIP's unused post_layernorm. Every
+        # 0-/1-D trainable parameter (alpha, the three gammas, norms, biases) must sit in a no-decay group.
+        trainable = [(n, p) for n, p in model.named_parameters()
+                     if not n.startswith("text_encoder.") and "post_layernorm" not in n]
+        embedding = ("position_embedding", "token_embedding", "pos_embed", "class_embedding")  # excluded by name
+        expected_no_decay = sum(p.ndim <= 1 or n.endswith(".bias") or any(e in n for e in embedding) for n, p in trainable)
+        self.assertEqual(sum(len(g["params"]) for g in groups), len(trainable))
+        self.assertEqual(sum(len(g["params"]) for g in groups if g["weight_decay"] == 0), expected_no_decay)
+        self.assertEqual(sum(n.endswith("gamma") or n == "attention_scale" for n, _ in trainable), 4)
 
     def test_expect_mismatch_stops_before_training(self):
         with self.assertRaisesRegex(ValueError, "nothing was trained"):

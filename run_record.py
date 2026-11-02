@@ -13,9 +13,10 @@ from pathlib import Path
 
 # Keys that define what is being trained. Paths, worker counts, logging cadence and the epoch
 # budget may change on resume; these may not.
-RECIPE_KEYS = ("text_mode", "dice_weight", "lr", "batch_size", "seed", "world_size", "grad_clip_norm",
+RECIPE_KEYS = ("text_mode", "dice_weight", "lr", "backbone_lr", "optimizer", "weight_decay", "lr_scheduler",
+               "warmup_ratio", "batch_size", "seed", "world_size", "grad_clip_norm",
                "freeze_vision_encoder", "freeze_text_encoder",
-               "decoder", "attention_residual", "attention_residual_init")
+               "decoder", "attention_residual", "attention_residual_init", "stage_attention")
 
 
 def parse_expectations(items):
