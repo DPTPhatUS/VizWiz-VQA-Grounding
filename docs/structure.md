@@ -29,6 +29,6 @@ Implementation scripts and shared files live directly at the source root. There 
 | `docs/` | Vast/Kaggle setup and verification. |
 | `tests/` | Offline behavior tests, reference fixtures, optional hardware smoke tools. |
 
-Saved research artifacts are organized as `outputs/<timestamp>/<run-id>/`, with `best.pt`, `run.json`, `history.jsonl`, and `val/`/`test/` metrics and logits. Study summaries live at `outputs/<timestamp>/summary/`. Each NPZ holds logits and native image dimensions; the split index holds common interpretation settings and filename mapping. Results identify the model by its campaign/run name and selected epoch.
+Saved research artifacts are organized as `outputs/<timestamp>/<run-id>/`, with `best.pt`, `run.json`, `history.jsonl`, and `val/`/`test/` metrics and logits. Study summaries live at `outputs/<timestamp>/summary/`. Each split has one `logits.npz`, containing independent image arrays and JSON metadata for native dimensions, interpretation settings, and filename mapping. Results identify the model by its campaign/run name and selected epoch.
 
 Training always begins from the experiment's seeded initialization and pretrained encoders. The source commit and dependency versions support reproducibility. Only the selected model is retained; there is no optimizer-state saving or cross-attempt state. Existing datasets, model files, result archives, and paper sources are not moved or deleted by this refactor.

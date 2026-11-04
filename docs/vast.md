@@ -13,7 +13,7 @@ Settings:
 
 Setup always clones the source, installs Python 3.12 and locked dependencies, downloads the dataset ZIP, and extracts its `vizwiz/` directory. The ZIP is deleted after successful extraction. Models and data caches belong to this workspace. Nothing from an earlier experiment is restored or continued.
 
-Training runs one model at a time for 30 epochs, global batch 4. Each epoch validates at threshold 0.5; the highest validation mIoU selects `best.pt`. After training, that checkpoint produces validation/test metrics and float32 logits. Completed-model results upload before the next model starts. The study summary uploads when the queue finishes.
+Training runs one model at a time for 30 epochs, global batch 4. Each epoch validates at threshold 0.5; the highest validation mIoU selects `best.pt`. After training, that checkpoint produces validation/test metrics and float32 logits, with one `logits.npz` per split. Completed-model results upload before the next model starts. The study summary uploads when the queue finishes.
 
 ```text
 /workspace/
@@ -29,13 +29,13 @@ Training runs one model at a time for 30 epochs, global batch 4. Each epoch vali
         │   ├── best.pt
         │   ├── run.json
         │   ├── history.jsonl
-        │   ├── val/                # metrics.json + logits/index.json + *.npz
+        │   ├── val/                # metrics.json + logits.npz
         │   └── test/               # Same artifacts; optional PNGs
         └── summary/                # summary.json + runs.csv
 ```
 
-Hugging Face uses `matched-30ep-v1/<timestamp>/<run-id>/` and `<timestamp>/summary/`. A new timestamp separates each campaign from earlier results. Settings/history, selected model, metrics, logits, and summary are uploaded; optional PNGs remain local.
+Hugging Face uses `matched-30ep-v1/<timestamp>/<run-id>/` and `<timestamp>/summary/`. A new timestamp separates each campaign from earlier results. Settings/history, selected model, metrics, logits, and summary are uploaded; optional PNGs remain local. Each run uploads seven files, including the two split-level NPZs.
 
-If anything goes wrong, interrupt the run cell, **delete `/workspace/cm-study` yourself, and Run All from the beginning**. The notebook requires a new workspace and does not delete existing files for you. All selected models train again from scratch. There are no resume options, restoration, backup/status manifests, hashes, or automatic archives.
+If anything goes wrong, interrupt the run cell, **delete `/workspace/cm-study` yourself, and Run All from the beginning**. The notebook requires a new workspace and does not delete existing files for you. All selected models train again from scratch. There are no resume options, restoration, backup/status manifests, hashes, or automatic study-wide ZIPs.
 
 Research artifact definitions and optional diagnostics are in [README.md](../README.md).

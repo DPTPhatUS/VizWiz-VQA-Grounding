@@ -1,5 +1,6 @@
 """Validation threshold calibration and fixed-operating-point test evaluation."""
 import argparse
+from contextlib import nullcontext
 import json
 import math
 from pathlib import Path
@@ -92,8 +93,9 @@ def main(argv=None):
         raise ValueError('--selection is an input for test only')
     out=new_output(args.output_dir)
     thresholds=THRESHOLDS if selected is None else sorted(set([.5,selected]))
-    counts=(sweep_saved(saved,dataset,device,thresholds,args.limit) if saved is not None
-            else sweep(model,loader,device,thresholds))
+    with saved if saved is not None else nullcontext():
+        counts=(sweep_saved(saved,dataset,device,thresholds,args.limit) if saved is not None
+                else sweep(model,loader,device,thresholds))
     rows=[{'threshold':p,'metrics':summarize_counts(counts[f'{p:.2f}'])} for p in thresholds]
     report={**metadata,'thresholds':rows,'counts':counts}
     if args.action=='validation' and not args.limit:

@@ -62,9 +62,7 @@ outputs/<timestamp>/
 │   ├── history.jsonl
 │   ├── val/
 │   │   ├── metrics.json
-│   │   └── logits/
-│   │       ├── index.json
-│   │       └── <image>.npz
+│   │   └── logits.npz
 │   └── test/                       # Same result files as val/
 └── summary/
     ├── summary.json
@@ -75,10 +73,10 @@ outputs/<timestamp>/
 - `run.json`: resolved settings, model/component choice, seed, parameter counts, source commit, software versions, and selected epoch/score.
 - `history.jsonl`: per-epoch total/segmentation/membership losses and validation mIoU. Membership loss is logged unweighted.
 - `metrics.json`: native-resolution overall results and one record per image containing pixel counts, IoU, precision, recall, area ratio, and relative area error. It references the run record and identifies the selected experiment/epoch in plain text.
-- `.npz`: only losslessly compressed float32 logits at the model output resolution and original `[height, width]`. The split index maps filenames and records input size, split, selected model/epoch, dtype, and interpolation settings. Resize logits with bilinear interpolation and `align_corners=False` before applying a threshold.
+- `logits.npz`: one losslessly compressed archive per split. Each image has its own float32 array at model output resolution. The `metadata` array holds a JSON string mapping filenames to array keys and original `[height, width]`, plus input size, split, selected model/epoch, dtype, and interpolation settings. Read it with `np.load(..., allow_pickle=False)`; individual image arrays load on demand. Export streams one image at a time without stacking the entire split in memory. Resize logits with bilinear interpolation and `align_corners=False` before applying a threshold.
 - Summary JSON/CSV: individual test results, per-model means and sample standard deviations, missing runs, and paired CM-Separate-minus-FTC seed differences. Fractions remain in 0–1 units; severe failures are counts. Single-seed configurations have no estimated standard deviation.
 
-Completed-run uploads contain the checkpoint, settings/history, and validation/test metrics/logits. The summary folder uploads after all selected models finish. There are no continuation checkpoints, backup/status manifests, custom artifact versions, application hashes, or automatic ZIPs.
+Completed-run uploads contain seven files: the checkpoint, settings/history, and one metrics JSON and logit NPZ for each of validation and test. The summary folder uploads after all selected models finish (93 files total for thirteen runs and the two summary files). There are no continuation checkpoints, backup/status manifests, custom artifact versions, application hashes, or automatic study-wide ZIPs.
 
 PNG masks are optional (`SAVE_MASKS=True` in the notebook or `--save-masks` in the launcher/evaluator) and remain local. They can also be exported from saved logits without model inference or dataset access:
 

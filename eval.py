@@ -38,9 +38,8 @@ def eval_main(argv=None):
     dataset = VizWizGroundingDataset(args.data_root,args.dataset,config['image_size'])
     loader = make_loader(dataset,args,args.batch_size)
     out = Path(args.output_dir); out.mkdir(parents=True,exist_ok=True)
-    logits = LogitWriter(out/'logits', args.dataset, info, config['image_size'])
-    counts = evaluate_counts(model,loader,device,out if args.save_masks else None,logit_writer=logits)
-    logits.finish()
+    with LogitWriter(out/'logits.npz', args.dataset, info, config['image_size']) as logits:
+        counts = evaluate_counts(model,loader,device,out if args.save_masks else None,logit_writer=logits)
     summary = {**summarize_counts(counts),
                "dataset":args.dataset,"metric_resolution":"original",
                "text_mode":"question","checkpoint":info,
@@ -48,7 +47,7 @@ def eval_main(argv=None):
     write_json(out/'metrics.json', {'summary':summary,
         'run':os.path.relpath(record_path,out),
         'per_sample':{name:{**row, **sample_metrics(row)} for name,row in counts.items()},
-        'logits':'logits/index.json', 'masks':args.save_masks})
+        'logits':'logits.npz', 'masks':args.save_masks})
     print(json.dumps(summary),flush=True)
 
 

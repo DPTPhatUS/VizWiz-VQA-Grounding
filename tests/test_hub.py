@@ -82,8 +82,7 @@ class HubWorkflow(unittest.TestCase):
             names = {name[len(uploaded):] for name in self.hub.files if name.startswith(uploaded)}
             self.assertEqual(names,{'best.pt','run.json','history.jsonl', *[
                 value for split in ('val','test') for value in (
-                    f'{split}/metrics.json',f'{split}/logits/index.json',
-                    f'{split}/logits/0.npz',f'{split}/logits/1.npz',f'{split}/logits/2.npz')]})
+                    f'{split}/metrics.json',f'{split}/logits.npz')]})
             self.assertIn(f'study/{campaign.name}/summary/summary.json',self.hub.files)
             saved = read_checkpoint(folder/'best.pt')
             self.assertNotIn('optimizer_state_dict',saved)

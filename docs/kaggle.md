@@ -28,7 +28,7 @@ Launch fresh runs; use `--processes 2` when two GPUs are enabled, or `1` for one
 !uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs ftc_s42 cm_shared_s42 cm_separate_s42
 ```
 
-Omit `--runs` for all thirteen experiments. Every invocation creates `outputs/<timestamp>/` and starts each selected model from scratch. The protocol is 30 epochs, global batch 4, Adam at 1e-5, and per-epoch validation. Only the validation-selected model is saved. Both validation/test metrics and lossless logits are exported, then the completed run uploads to the public repository `Last-Bullet/vizwiz-cm-aciids-2027`. The summary uploads when all selected runs finish.
+Omit `--runs` for all thirteen experiments. Every invocation creates `outputs/<timestamp>/` and starts each selected model from scratch. The protocol is 30 epochs, global batch 4, Adam at 1e-5, and per-epoch validation. Only the validation-selected model is saved. Both validation/test metrics and lossless logits are exported, with one `logits.npz` per split, then the completed run uploads seven files to the public repository `Last-Bullet/vizwiz-cm-aciids-2027`. The summary uploads when all selected runs finish.
 
 There is no continuation from earlier sessions. Start a fresh checkout/session after failure. Previously uploaded results remain in their timestamped folders.
 

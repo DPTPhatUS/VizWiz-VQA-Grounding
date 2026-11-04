@@ -2,57 +2,84 @@
 import json
 import os
 from pathlib import Path, PurePosixPath
+from zipfile import ZipFile, ZIP_DEFLATED
 
 import numpy as np
 import torch
 from torch.nn import functional as F
 
-from artifacts import write_json
-
-
-def relative_logit_path(value):
+def relative_image_path(value):
     path = PurePosixPath(value)
     if path.is_absolute() or '\\' in value or any(part in ('', '.', '..') for part in value.split('/')):
         raise ValueError(f'Invalid prediction path: {value}')
-    if path.suffix != '.npz':
-        raise ValueError(f'Expected a compressed logit file: {value}')
     return path
 
 
 class LogitWriter:
-    def __init__(self, directory, split, checkpoint, image_size):
-        self.directory = Path(directory)
+    """Stream separate image arrays into one compressed NPZ per split."""
+    def __init__(self, path, split, checkpoint, image_size):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.temporary = self.path.with_suffix('.npz.tmp')
+        self.archive = ZipFile(self.temporary, 'w', compression=ZIP_DEFLATED)
         self.index = {'split': split,
                       'checkpoint': checkpoint, 'image_size': image_size,
                       'dtype': 'float32', 'resolution': 'model output',
                       'resize_mode': 'bilinear', 'align_corners': False, 'files': {}}
 
     def save(self, filename, logits, original_size):
-        relative = relative_logit_path(str(PurePosixPath(filename).with_suffix('.npz')))
-        path = self.directory/str(relative)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix('.npz.tmp')
-        with temporary.open('wb') as stream:
-            np.savez_compressed(stream, logits=logits.detach().float().cpu().numpy(),
-                                original_size=np.asarray(original_size, dtype=np.int64))
-        os.replace(temporary, path)
-        self.index['files'][filename] = str(relative)
+        filename = str(relative_image_path(filename))
+        if filename in self.index['files']:
+            raise ValueError(f'Duplicate prediction filename: {filename}')
+        key = f'logits_{len(self.index["files"]):06d}'
+        self._write_array(key, logits.detach().float().cpu().numpy())
+        self.index['files'][filename] = {'array': key,
+                                       'original_size': [int(v) for v in original_size]}
+
+    def _write_array(self, key, array):
+        with self.archive.open(f'{key}.npy', 'w', force_zip64=True) as stream:
+            np.lib.format.write_array(stream, array, allow_pickle=False)
 
     def finish(self):
-        write_json(self.directory/'index.json', self.index)
+        self._write_array('metadata', np.asarray(json.dumps(self.index)))
+        self.archive.close()
+        os.replace(self.temporary, self.path)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            if exc_type is None:
+                self.finish()
+        finally:
+            self.archive.close()
+            self.temporary.unlink(missing_ok=True)
 
 
 class SavedLogits:
     def __init__(self, split_directory):
-        self.directory = Path(split_directory)/'logits'
-        self.index = json.loads((self.directory/'index.json').read_text())
+        self.arrays = np.load(Path(split_directory)/'logits.npz', allow_pickle=False)
+        try:
+            self.index = json.loads(self.arrays['metadata'].item())
+        except Exception:
+            self.close()
+            raise
 
     def native(self, filename, device='cpu'):
-        path = self.directory/str(relative_logit_path(self.index['files'][filename]))
-        with np.load(path, allow_pickle=False) as saved:
-            logits = torch.from_numpy(saved['logits']).to(device=device, dtype=torch.float32)
-            size = tuple(int(v) for v in saved['original_size'])
+        entry = self.index['files'][filename]
+        logits = torch.from_numpy(self.arrays[entry['array']]).to(device=device, dtype=torch.float32)
+        size = tuple(entry['original_size'])
         return F.interpolate(logits[None, None], size=size, mode='bilinear', align_corners=False)[0, 0]
+
+    def close(self):
+        self.arrays.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
     def export_masks(self, output, threshold=.5):
         import math
@@ -61,7 +88,7 @@ class SavedLogits:
             raise ValueError('Probability threshold must be in (0, 1)')
         cutoff = math.log(threshold/(1-threshold))
         for filename in self.index['files']:
-            path = Path(output)/Path(filename).with_suffix('.png')
+            path = Path(output)/str(relative_image_path(filename).with_suffix('.png'))
             path.parent.mkdir(parents=True, exist_ok=True)
             mask = (self.native(filename) > cutoff).numpy().astype(np.uint8)*255
             Image.fromarray(mask).save(path)
@@ -74,7 +101,8 @@ def main(argv=None):
     parser.add_argument('--output-dir',required=True)
     parser.add_argument('--threshold',type=float,default=.5)
     args = parser.parse_args(argv)
-    SavedLogits(args.predictions).export_masks(args.output_dir,args.threshold)
+    with SavedLogits(args.predictions) as saved:
+        saved.export_masks(args.output_dir,args.threshold)
 
 
 if __name__ == '__main__':

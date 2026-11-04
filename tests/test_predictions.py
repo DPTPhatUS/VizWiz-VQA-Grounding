@@ -38,27 +38,56 @@ class SavedPredictions(unittest.TestCase):
                 return {'logits':raw}
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            writer = LogitWriter(root/'logits', 'val', 'test-sha', 336)
-            counts = evaluate_counts(Fixed(), [batch], torch.device('cpu'), root, logit_writer=writer)
-            writer.finish()
-            saved = SavedLogits(root)
-            with np.load(root/'logits/a.npz', allow_pickle=False) as arrays:
-                self.assertEqual(arrays['logits'].dtype, np.float32)
-                np.testing.assert_array_equal(arrays['logits'], raw[0,0].numpy())
-                np.testing.assert_array_equal(arrays['original_size'], [5,7])
-                self.assertEqual(set(arrays.files), {'logits','original_size'})
-            saved.export_masks(root/'exported')
-            for name, logits, truth in native_logits(raw, batch):
-                from PIL import Image
-                with Image.open(root/'exported'/Path(name).with_suffix('.png')) as image:
-                    np.testing.assert_array_equal(np.asarray(image)>0, saved.native(name).numpy()>0)
-                restored = saved.native(name)
-                torch.testing.assert_close(restored, logits, rtol=0, atol=0)
-                for p in thresholds.THRESHOLDS:
-                    cutoff = math.log(p/(1-p))
-                    self.assertEqual(overlap_counts(restored>cutoff, truth),
-                                     overlap_counts(logits>cutoff, truth))
-                self.assertEqual(counts[name], overlap_counts(restored>0, truth))
+            with LogitWriter(root/'logits.npz', 'val', 'test-sha', 336) as writer:
+                counts = evaluate_counts(Fixed(), [batch], torch.device('cpu'), root, logit_writer=writer)
+            self.assertEqual(list(root.glob('*.npz')), [root/'logits.npz'])
+            self.assertFalse((root/'logits').exists())
+            with SavedLogits(root) as saved, np.load(root/'logits.npz', allow_pickle=False) as arrays:
+                self.assertEqual(saved.index['split'], 'val')
+                self.assertEqual(saved.index['checkpoint'], 'test-sha')
+                self.assertEqual(saved.index['image_size'], 336)
+                self.assertEqual(saved.index['resize_mode'], 'bilinear')
+                self.assertFalse(saved.index['align_corners'])
+                self.assertEqual(len(arrays.files), 3)  # One metadata array and two independent images.
+                for i, name in enumerate(batch['filename']):
+                    entry = saved.index['files'][name]
+                    self.assertEqual(arrays[entry['array']].dtype, np.float32)
+                    np.testing.assert_array_equal(arrays[entry['array']], raw[i,0].numpy())
+                    self.assertEqual(entry['original_size'], list(batch['original_mask'][i].shape[-2:]))
+                saved.export_masks(root/'exported')
+                for name, logits, truth in native_logits(raw, batch):
+                    from PIL import Image
+                    with Image.open(root/'exported'/Path(name).with_suffix('.png')) as image:
+                        np.testing.assert_array_equal(np.asarray(image)>0, saved.native(name).numpy()>0)
+                    restored = saved.native(name)
+                    torch.testing.assert_close(restored, logits, rtol=0, atol=0)
+                    for p in thresholds.THRESHOLDS:
+                        cutoff = math.log(p/(1-p))
+                        self.assertEqual(overlap_counts(restored>cutoff, truth),
+                                         overlap_counts(logits>cutoff, truth))
+                    self.assertEqual(counts[name], overlap_counts(restored>0, truth))
+
+    def test_interrupted_export_does_not_publish_an_incomplete_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'logits.npz'
+            with self.assertRaisesRegex(RuntimeError, 'evaluation interrupted'):
+                with LogitWriter(path, 'val', 'checkpoint', 336) as writer:
+                    writer.save('a.jpg', torch.zeros(2, 2), (5, 7))
+                    raise RuntimeError('evaluation interrupted')
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    def test_independent_arrays_preserve_distinct_shapes_and_matching_stems(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expected = {'a.jpg': torch.tensor([[1.25, -2.5]]),
+                        'a.png': torch.tensor([[.125], [-.875], [3.5]])}
+            with LogitWriter(root/'logits.npz', 'test', 'checkpoint', 336) as writer:
+                for name, logits in expected.items():
+                    writer.save(name, logits, logits.shape)
+            with SavedLogits(root) as saved:
+                self.assertEqual(set(saved.index['files']), set(expected))
+                for name, logits in expected.items():
+                    torch.testing.assert_close(saved.native(name), logits, rtol=0, atol=0)
 
     def test_saved_calibration_matches_live_inference_without_loading_weights(self):
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
@@ -84,10 +113,13 @@ class SavedPredictions(unittest.TestCase):
                 self.assertIn('intersection',result['per_sample']['0.jpg'])
                 self.assertFalse((root/split/'0.png').exists())
                 self.assertTrue((root/split/result['run']).is_file())
+                self.assertEqual(result['logits'], 'logits.npz')
+                self.assertEqual({p.name for p in (root/split).iterdir()}, {'metrics.json', 'logits.npz'})
             dataset = VizWizGroundingDataset(data,'val',32)
             args = SimpleNamespace(num_workers=0,device='cpu')
             live = thresholds.sweep(model,make_loader(dataset,args,2),torch.device('cpu'),thresholds.THRESHOLDS)
-            cached = thresholds.sweep_saved(SavedLogits(root/'val'),dataset,'cpu',thresholds.THRESHOLDS)
+            with SavedLogits(root/'val') as saved:
+                cached = thresholds.sweep_saved(saved,dataset,'cpu',thresholds.THRESHOLDS)
             self.assertEqual(live,cached)
             with patch.object(thresholds,'load_inference',side_effect=AssertionError('must not load weights')):
                 common = ['--data-root',str(data),'--device','cpu']

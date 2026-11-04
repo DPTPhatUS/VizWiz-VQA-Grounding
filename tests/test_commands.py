@@ -60,7 +60,7 @@ class CommandTests(unittest.TestCase):
             run_command(*args)
             campaign=next((root/'runs').iterdir());folder=campaign/'context_only_s42'
             for name in ('best.pt','run.json','history.jsonl',
-                         'val/metrics.json','test/metrics.json','val/logits/index.json','test/logits/0.npz'):
+                         'val/metrics.json','test/metrics.json','val/logits.npz','test/logits.npz'):
                 self.assertTrue((folder/name).is_file(),name)
             self.assertFalse((folder/'manifest_run.json').exists())
             self.assertFalse(list(folder.glob('*.sha256.json')))

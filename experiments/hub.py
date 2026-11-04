@@ -7,7 +7,7 @@ from huggingface_hub import HfApi
 DEFAULT_REPO = 'Last-Bullet/vizwiz-cm-aciids-2027'
 RUN_FILES = ['best.pt','run.json','history.jsonl', *[
     pattern for split in ('val','test') for pattern in (
-        f'{split}/metrics.json',f'{split}/logits/index.json',f'{split}/logits/*.npz')]]
+        f'{split}/metrics.json',f'{split}/logits.npz')]]
 
 
 def upload_run(run_dir, repo_id, path):
