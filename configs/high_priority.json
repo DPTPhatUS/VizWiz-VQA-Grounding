@@ -89,6 +89,58 @@
       "id": "ftc_capacity_s42",
       "model": "ftc-capacity",
       "seed": 42
+    },
+    {
+      "id": "context_only_s123",
+      "model": "cm",
+      "connection_mode": "separate",
+      "disable_membership": true,
+      "seed": 123
+    },
+    {
+      "id": "membership_only_s123",
+      "model": "cm",
+      "connection_mode": "separate",
+      "disable_context": true,
+      "seed": 123
+    },
+    {
+      "id": "cm_noaux_s123",
+      "model": "cm",
+      "connection_mode": "separate",
+      "edge_loss_weight": 0,
+      "seed": 123
+    },
+    {
+      "id": "ftc_capacity_s123",
+      "model": "ftc-capacity",
+      "seed": 123
+    },
+    {
+      "id": "context_only_s456",
+      "model": "cm",
+      "connection_mode": "separate",
+      "disable_membership": true,
+      "seed": 456
+    },
+    {
+      "id": "membership_only_s456",
+      "model": "cm",
+      "connection_mode": "separate",
+      "disable_context": true,
+      "seed": 456
+    },
+    {
+      "id": "cm_noaux_s456",
+      "model": "cm",
+      "connection_mode": "separate",
+      "edge_loss_weight": 0,
+      "seed": 456
+    },
+    {
+      "id": "ftc_capacity_s456",
+      "model": "ftc-capacity",
+      "seed": 456
     }
   ]
 }
