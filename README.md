@@ -49,6 +49,7 @@ Select checkpoints by validation only; test metrics are reported, never used for
 | L1 | L | Baseline commit `2079c8a`, question-only recipe (as A2), seeds 43, 44 | Answer-alignment loss on three seeds; cleanest single-scale baseline |
 | L2 | L | `train.py --freeze-vision-encoder --freeze-text-encoder`, seeds 43, 44 | Encoder adaptation on three seeds |
 | L3 | L | `clipseg_baseline.py` (CLIPSeg, frozen CLIP, trained decoder), learning rate chosen on seed 42, then seeds 43, 44 | External baseline |
+| P | P | `revision/detail_intervention.py` on the selected checkpoint of each trained full QGDP-Net (inference only) | Does the trained model use its detail pathway? |
 
 Each continuation run takes about as long as one run of the previous one-session A/B guide, so plan two or three runs per Session A. Run the seven continuation runs over several sessions by changing `RUNS` in Cell A2.
 
@@ -828,6 +829,82 @@ done
 | A2 | 0.6347 | 0.6491 |
 
 If a value differs, the wrong checkpoint is attached. Then run Cell Z (the ZIP is named `threshold_sweep.zip`).
+
+## Session P: does the trained model use its detail pathway? (inference only, about 3–5 h)
+
+**Why.** The paper retrains QGDP-Net with zeroed detail maps and finds no loss. That shows the rest of the model does not need the pathway; it does not show whether the *trained* full model uses it. This session evaluates each trained full QGDP-Net under four inference-time conditions (`revision/detail_intervention.py`): `original`, `zeros` (all detail maps zero), `misaligned` (detail view rotated 180°, so the maps no longer line up with the ViT features) and `low_res` (the detail CNN sees the upsampled 336 px view). It also records the learned residual scales, the mean gates and the size of each detail residual relative to the decoder features. No training. The analysis is fixed in advance in `analyze_detail_intervention.py` (with the paper's analysis scripts).
+
+**Attach:**
+- the VizWiz dataset and the published epoch-20 checkpoint (Cell 1; this is run 1);
+- if you kept them, the selected checkpoints of the other full QGDP-Net runs: `g_image_s43/checkpoint_epoch20.pt`, `g_image_s44/checkpoint_epoch10.pt` (epoch 10 was selected for this run), `g_image_s45/checkpoint_epoch20.pt`, `g_image_s46/checkpoint_epoch20.pt`.
+
+Runs whose checkpoint is missing are skipped; the analysis reports how many runs it used. Run Cell 1 first.
+
+### Cell P1: checkpoint paths
+
+```python
+CKPTS = {  # run name: selected checkpoint ('' if not attached)
+    'image_s42': os.environ['PARENT_CKPT'],
+    'image_s43': '',   # .../g_image_s43/checkpoint_epoch20.pt
+    'image_s44': '',   # .../g_image_s44/checkpoint_epoch10.pt
+    'image_s45': '',   # .../g_image_s45/checkpoint_epoch20.pt
+    'image_s46': '',   # .../g_image_s46/checkpoint_epoch20.pt
+}
+EXPECTED = {  # published (val, test) mean IoU of each selected checkpoint; 'original' must reproduce them
+    'image_s42': (0.6577, 0.6722), 'image_s43': (0.6504, 0.6681), 'image_s44': (0.6499, 0.6635),
+    'image_s45': (0.6424, 0.6654), 'image_s46': (0.6513, 0.6662),
+}
+CKPTS = {k: v for k, v in CKPTS.items() if v}
+for name, path in CKPTS.items():
+    assert Path(path).is_file(), f'{name}: {path} not found'
+Path('p_runs.txt').write_text(''.join(f'{k} {v}\n' for k, v in CKPTS.items()))
+os.environ['RUN_NAME'] = 'p_detail_intervention'
+print('runs:', list(CKPTS))
+```
+
+### Cell P2: run the interventions (both GPUs)
+
+```bash
+%%bash
+set -euo pipefail
+out="$RUN_ROOT/$RUN_NAME"
+mkdir -p "$out"
+work() {  # $1: GPU, then the runs for that GPU
+    gpu=$1; shift
+    for run in "$@"; do
+        ckpt=$(awk -v r="$run" '$1 == r {print $2}' p_runs.txt)
+        for split in val test; do
+            [[ -f "$out/${run}_${split}.json" ]] && continue
+            CUDA_VISIBLE_DEVICES=$gpu uv run --frozen python revision/detail_intervention.py \
+                --checkpoint "$ckpt" --data-root "$DATA_ROOT" --dataset "$split" --device cuda \
+                --batch-size "$EVAL_BATCH" --num-workers 2 --output "$out/${run}_${split}.json" \
+                > "$out/${run}_${split}.log" 2>&1
+            tail -1 "$out/${run}_${split}.log"
+        done
+    done
+}
+mapfile -t runs < <(awk '{print $1}' p_runs.txt)
+work 0 "${runs[@]:0:3}" &
+work 1 "${runs[@]:3}" &
+wait
+```
+
+### Cell P3: check that `original` reproduces the published scores
+
+```python
+import json
+bad = []
+for name in CKPTS:
+    for split, expected in zip(('val', 'test'), EXPECTED[name]):
+        got = json.loads(Path(os.environ['RUN_ROOT'], os.environ['RUN_NAME'], f'{name}_{split}.json').read_text())['summary']['mean_iou']
+        print(f"{name} {split}: original {got['original']:.4f} (published {expected:.4f}) | " +
+              ' | '.join(f"{c} {v:.4f}" for c, v in got.items() if c != 'original'))
+        if abs(got['original'] - expected) > 5e-5:
+            bad.append((name, split))
+assert not bad, f'Wrong checkpoint attached for {bad}: do not send these files'
+```
+
+If the assertion fails, the attached file is not the selected checkpoint of that run. Then run Cell Z (the ZIP is named `p_detail_intervention.zip`).
 
 ## Cell Z: ZIP results, excluding checkpoints
 
