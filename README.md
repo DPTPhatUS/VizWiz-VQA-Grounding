@@ -950,6 +950,118 @@ for name in Path('p_verified.txt').read_text().split('\n'):
 
 Then run Cell Z (the ZIP is named `p_detail_intervention.zip`).
 
+## Session Q: are the intervened masks the same masks? (inference only, about 4 h)
+
+**Why.** Session P showed that zeroing the detail maps barely changes mean IoU. Similar means can hide different masks. This session compares the masks directly (`revision/mask_agreement.py`): for each image, the IoU between the unchanged and the intervened mask, the share of pixels where they differ, and IoU against the ground truth. Under the unchanged model it also measures how much of each detail residual depends on the detail map, by recomputing each fusion block (and the refiner) with the same inputs but a zero map. No training; Session P's files are not used or changed. The analysis is fixed in advance in `analyze_mask_agreement.py` (with the paper's analysis scripts).
+
+**Attach** the same checkpoints as Session P: the dataset, the published epoch-20 checkpoint (run 1, Cell 1), and `g_image_s43/checkpoint_epoch20.pt`, `g_image_s44/checkpoint_epoch10.pt`, `g_image_s45/checkpoint_epoch20.pt`, `g_image_s46/checkpoint_epoch20.pt`. Run Cell 1 first.
+
+### Cell Q1: checkpoint paths
+
+```python
+CKPTS = {  # run name: selected checkpoint ('' if not attached)
+    'image_s42': os.environ['PARENT_CKPT'],
+    'image_s43': '',   # .../g_image_s43/checkpoint_epoch20.pt
+    'image_s44': '',   # .../g_image_s44/checkpoint_epoch10.pt
+    'image_s45': '',   # .../g_image_s45/checkpoint_epoch20.pt
+    'image_s46': '',   # .../g_image_s46/checkpoint_epoch20.pt
+}
+EXPECTED = {  # published (val, test) mean IoU of each selected checkpoint
+    'image_s42': (0.6577, 0.6722), 'image_s43': (0.6504, 0.6681), 'image_s44': (0.6499, 0.6635),
+    'image_s45': (0.6424, 0.6654), 'image_s46': (0.6513, 0.6662),
+}
+CKPTS = {k: v for k, v in CKPTS.items() if v}
+for name, path in CKPTS.items():
+    assert Path(path).is_file(), f'{name}: {path} not found'
+Path('q_runs.txt').write_text(''.join(f'{k} {v}\n' for k, v in CKPTS.items()))
+os.environ['RUN_NAME'] = 'q_mask_agreement'
+print('attached runs:', list(CKPTS))
+if not set(CKPTS) - {'image_s42'}:
+    print('Only run 1 is attached: Session P excluded run 1, so the analysis will be descriptive only.')
+```
+
+### Cell Q2: verify every checkpoint before any intervention (both GPUs, about 1 h)
+
+```bash
+%%bash
+set -euo pipefail
+out="$RUN_ROOT/$RUN_NAME/verify"
+mkdir -p "$out"
+work() {
+    gpu=$1; shift
+    for run in "$@"; do
+        ckpt=$(awk -v r="$run" '$1 == r {print $2}' q_runs.txt)
+        for split in val test; do
+            [[ -f "$out/${run}_${split}.json" ]] && continue
+            CUDA_VISIBLE_DEVICES=$gpu uv run --frozen python revision/detail_intervention.py \
+                --checkpoint "$ckpt" --data-root "$DATA_ROOT" --dataset "$split" --device cuda \
+                --conditions original --batch-size "$EVAL_BATCH" --num-workers 2 \
+                --output "$out/${run}_${split}.json" > "$out/${run}_${split}.log" 2>&1
+        done
+    done
+}
+mapfile -t runs < <(awk '{print $1}' q_runs.txt)
+work 0 "${runs[@]:0:3}" &
+work 1 "${runs[@]:3}" &
+wait
+```
+
+```python
+import json
+verified, bad = [], []
+for name in CKPTS:
+    ok = True
+    for split, expected in zip(('val', 'test'), EXPECTED[name]):
+        got = json.loads(Path(os.environ['RUN_ROOT'], os.environ['RUN_NAME'], 'verify', f'{name}_{split}.json')
+                         .read_text())['summary']['mean_iou']['original']
+        print(f'{name} {split}: {got:.4f} (published {expected:.4f})')
+        ok &= abs(got - expected) <= 5e-5
+    (verified if ok else bad).append(name)
+Path('q_verified.txt').write_text(''.join(f'{k} {CKPTS[k]}\n' for k in verified))
+print('verified:', verified, '| NOT verified (excluded):', bad)
+assert verified, 'No checkpoint reproduces its published scores: stop here'
+```
+
+### Cell Q3: mask agreement on the verified checkpoints (both GPUs, about 3 h for five runs)
+
+```bash
+%%bash
+set -euo pipefail
+out="$RUN_ROOT/$RUN_NAME"
+work() {
+    gpu=$1; shift
+    for run in "$@"; do
+        ckpt=$(awk -v r="$run" '$1 == r {print $2}' q_verified.txt)
+        for split in val test; do
+            [[ -f "$out/${run}_${split}.json" ]] && continue
+            CUDA_VISIBLE_DEVICES=$gpu uv run --frozen python revision/mask_agreement.py \
+                --checkpoint "$ckpt" --data-root "$DATA_ROOT" --dataset "$split" --device cuda \
+                --batch-size "$EVAL_BATCH" --num-workers 2 --output "$out/${run}_${split}.json" \
+                > "$out/${run}_${split}.log" 2>&1
+            tail -1 "$out/${run}_${split}.log"
+        done
+    done
+}
+mapfile -t runs < <(awk '{print $1}' q_verified.txt)
+work 0 "${runs[@]:0:3}" &
+work 1 "${runs[@]:3}" &
+wait
+```
+
+```python
+for line in Path('q_verified.txt').read_text().splitlines():
+    run = line.split()[0]
+    for split in ('val', 'test'):
+        a = json.loads(Path(os.environ['RUN_ROOT'], os.environ['RUN_NAME'], f'{run}_{split}.json').read_text())
+        b = json.loads(Path(os.environ['RUN_ROOT'], os.environ['RUN_NAME'], 'verify', f'{run}_{split}.json').read_text())
+        mine = {n: r['iou_original'] for n, r in a['per_sample'].items()}
+        assert mine == b['per_sample']['original'], f'{run} {split}: original changed between cells'
+        s = a['summary']
+        print(run, split, {c: round(s[c]['mask_iou'], 4) for c in ('zeros', 'misaligned', 'low_res')})
+```
+
+Then run Cell Z (the ZIP is named `q_mask_agreement.zip`).
+
 ## Cell Z: ZIP results, excluding checkpoints
 
 ```python
