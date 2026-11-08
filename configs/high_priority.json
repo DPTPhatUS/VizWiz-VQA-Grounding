@@ -14,6 +14,48 @@
   },
   "runs": [
     {
+      "id": "cm_affinity_s42",
+      "model": "cm",
+      "connection_mode": "separate",
+      "local_refinement": "symmetric-affinity",
+      "seed": 42
+    },
+    {
+      "id": "cm_affinity_s123",
+      "model": "cm",
+      "connection_mode": "separate",
+      "local_refinement": "symmetric-affinity",
+      "seed": 123
+    },
+    {
+      "id": "cm_affinity_s456",
+      "model": "cm",
+      "connection_mode": "separate",
+      "local_refinement": "symmetric-affinity",
+      "seed": 456
+    },
+    {
+      "id": "cm_two_role_s42",
+      "model": "cm",
+      "connection_mode": "separate",
+      "local_refinement": "two-role",
+      "seed": 42
+    },
+    {
+      "id": "cm_two_role_s123",
+      "model": "cm",
+      "connection_mode": "separate",
+      "local_refinement": "two-role",
+      "seed": 123
+    },
+    {
+      "id": "cm_two_role_s456",
+      "model": "cm",
+      "connection_mode": "separate",
+      "local_refinement": "two-role",
+      "seed": 456
+    },
+    {
       "id": "ftc_s42",
       "model": "ftc",
       "seed": 42

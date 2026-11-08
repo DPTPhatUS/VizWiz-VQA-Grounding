@@ -10,6 +10,8 @@ from diagnostics.common import inference_arguments, load_inference, size_bin
 
 
 def role_counts(output,mask):
+    if 'edge_logits' not in output or output['edge_logits'].shape[-1] != 3:
+        raise ValueError('Role diagnostics currently require three-role CM')
     targets=membership_targets(output,mask)
     valid=output['edge_valid'].expand(targets.shape[0],-1,-1)
     truth=targets.argmax(-1)[valid]
@@ -62,8 +64,9 @@ def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__);inference_arguments(parser)
     args=parser.parse_args(argv)
     model,_,loader,device,metadata=load_inference(args,'val')
-    if model.experiment_config['model']!='cm' or not model.experiment_config['membership_enabled']:
-        raise ValueError('Role diagnostics require CM with membership enabled')
+    if (model.experiment_config['model']!='cm' or not model.experiment_config['membership_enabled']
+            or model.experiment_config.get('local_refinement', 'membership') != 'membership'):
+        raise ValueError('Role diagnostics currently require three-role CM')
     out=new_output(args.output_dir)
     result=analyze(model,loader,device)
     write_json(out/'results.json',{**metadata,'roles':['include','exclude','neutral'],

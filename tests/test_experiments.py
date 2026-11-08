@@ -216,9 +216,10 @@ class RevisionPipeline(unittest.TestCase):
     def test_preflight_all_models_and_dry_run(self):
         with tempfile.TemporaryDirectory() as tmp,contextlib.redirect_stdout(io.StringIO()):
             data=fixture_data(Path(tmp)/'data');self.assertEqual(preflight.validate_data(data),{'train':4,'val':3})
-            for options in [[],['--disable-context'],['--disable-membership'],['--model','ftc'],['--model','ftc-capacity']]:
+            for options in [[],['--disable-context'],['--disable-membership'],['--model','ftc'],['--model','ftc-capacity'],
+                            ['--local-refinement','symmetric-affinity'],['--local-refinement','two-role']]:
                 result=preflight.main(['--tiny','--device','cpu','--data-root',str(data),*options]);self.assertTrue(math.isfinite(result['losses'][0]))
-            manifest=json.loads(Path('configs/high_priority.json').read_text());self.assertEqual(len(manifest['runs']),21)
+            manifest=json.loads(Path('configs/high_priority.json').read_text());self.assertEqual(len(manifest['runs']),27)
             from experiments.launch import main
             absent=Path(tmp)/'never-created';main(['--data-root',str(data),'--output-root',str(absent),'--runs','ftc_s42','--dry-run'])
             self.assertFalse(absent.exists());cmds=commands(manifest,manifest['runs'][0],data,absent,'cpu',2)

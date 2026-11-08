@@ -5,11 +5,13 @@ Choose your NVIDIA CUDA template and one GPU with sufficient resources. Upload o
 Settings:
 
 - `HF_TOKEN`: a write token, or read it from the instance environment. Keep notebooks containing tokens private.
-- `RUN_IDS=[]`: all thirteen experiments, or specify the desired model/seed IDs.
+- `RUN_IDS=["cm_affinity_s42"]`: one new control by default. Change the list for the next run; `[]` selects all 27 experiments, including older configurations.
 - `SAVE_MASKS=False`: logits are always saved; enable this for additional PNGs.
 - `WORK_DIR=/workspace/cm-study`: a new directory for this attempt.
 - `GIT_URL` / `GIT_BRANCH`: source cloned automatically. Push the updated branch before using it remotely.
 - `HF_REPO` / `HF_PREFIX`: public destination `Last-Bullet/vizwiz-cm-aciids-2027`, prefix `matched-30ep-v1`.
+
+Set `HF_REPO` to your current destination. Recommended new-run order is `cm_affinity_s42`, `cm_affinity_s123`, `cm_affinity_s456`, then `cm_two_role_s42`, `cm_two_role_s123`, `cm_two_role_s456`. Multiple IDs run sequentially. This notebook uses one GPU; use the Kaggle/Linux launcher with `--processes 2` if matching an existing two-GPU cohort.
 
 Setup always clones the source, installs Python 3.12 and locked dependencies, downloads the dataset ZIP, and extracts its `vizwiz/` directory. The ZIP is deleted after successful extraction. Models and data caches belong to this workspace. Nothing from an earlier experiment is restored or continued.
 
@@ -39,3 +41,5 @@ Hugging Face uses `matched-30ep-v1/<timestamp>/<run-id>/` and `<timestamp>/summa
 If anything goes wrong, interrupt the run cell, **delete `/workspace/cm-study` yourself, and Run All from the beginning**. The notebook requires a new workspace and does not delete existing files for you. All selected models train again from scratch. There are no resume options, restoration, backup/status manifests, hashes, or automatic study-wide ZIPs.
 
 Research artifact definitions and optional diagnostics are in [README.md](../README.md).
+
+After collecting timestamp folders locally, `python -m experiments.summarize --root /path/to/outputs --output-dir /path/to/new_summary` combines them and pairs each control with available CM-Separate seeds. Keep one result per run ID under that root.

@@ -9,7 +9,8 @@ EXPERIMENT = 'context-membership'
 
 
 class GroundingModel(nn.Module):
-    def __init__(self, tiny=False, connection_mode='shared', context=True, membership=True, pretrained=True):
+    def __init__(self, tiny=False, connection_mode='shared', context=True, membership=True, pretrained=True,
+                 local_refinement='membership'):
         super().__init__()
         self.image_encoder = TinyVision() if tiny else ImageEncoder(pretrained=pretrained)
         self.text_encoder = TextEncoder(tiny, pretrained=pretrained).requires_grad_(False)
@@ -19,7 +20,7 @@ class GroundingModel(nn.Module):
         self.cross_attn = nn.MultiheadAttention(self.visual_dim, 2 if tiny else 8, batch_first=True)
         self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128,
                                       connection_mode=connection_mode, tiny=tiny,
-                                      context=context, membership=membership)
+                                      context=context, membership=membership, local_refinement=local_refinement)
         self.register_buffer("image_mean", torch.tensor([.48145466, .4578275, .40821073]).view(1,3,1,1))
         self.register_buffer("image_std", torch.tensor([.26862954, .26130258, .27577711]).view(1,3,1,1))
         self.experiment_config = {
@@ -30,6 +31,10 @@ class GroundingModel(nn.Module):
             'protocol': 'context-membership-v1',
             'context_enabled': context, 'membership_enabled': membership,
         }
+        # Keep the existing CM checkpoint identity unchanged. New controls carry
+        # their explicit architecture choice and are loaded strictly as such.
+        if local_refinement != 'membership':
+            self.experiment_config['local_refinement'] = local_refinement
 
     def encode_image(self, image):
         return self.image_encoder((image - self.image_mean) / self.image_std)

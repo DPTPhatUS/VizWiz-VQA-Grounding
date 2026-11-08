@@ -10,7 +10,7 @@ Implementation scripts and shared files live directly at the source root. There 
 | `predict_save.py`, `visualize_predictions.py` | One-image prediction or evidence overlay. |
 | `predictions.py` | Logit export/index, native reconstruction, optional PNG export. |
 | `dataset.py` | Question-only inputs, image/mask alignment, loaders and collating. |
-| `losses.py` | Segmentation BCE, occupancy targets, membership loss. |
+| `losses.py` | Segmentation BCE, occupancy targets, three-/two-role loss, balanced affinity loss. |
 | `metrics.py` | Native-grid counts, image metrics, aggregate scores. |
 | `validation.py` | Non-padding distributed validation, preserving training modes and RNG. |
 | `checkpoints.py` | Selected-model saving and strict architecture/tensor reconstruction. |
@@ -22,10 +22,10 @@ Implementation scripts and shared files live directly at the source root. There 
 | `experiments/launch.py` | Fresh timestamped campaign: train → validation/test evaluation → upload → summary. |
 | `experiments/vast.py` | Fresh dataset download, extraction, ZIP deletion, single-GPU launch. |
 | `experiments/hub.py` | Plain uploads of completed research artifacts and study summaries. |
-| `experiments/summarize.py` | Per-seed comparisons, sample deviations, paired CM-Separate–FTC differences. |
+| `experiments/summarize.py` | Combine campaigns, sample deviations, paired CM-Separate–FTC/control differences. |
 | `experiments/export.py` | Explicit manual archive export. |
 | `diagnostics/` | Threshold calibration, question dependence, relation-role analysis, efficiency. |
-| `configs/high_priority.json` | Thirteen model/seed configurations and matched 30-epoch settings. |
+| `configs/high_priority.json` | 27 model/seed configurations; affinity and two-role controls first; matched 30-epoch settings. |
 | `docs/` | Vast/Kaggle setup and verification. |
 | `tests/` | Offline behavior tests, reference fixtures, optional hardware smoke tools. |
 

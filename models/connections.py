@@ -4,6 +4,32 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+LOCAL_REFINEMENTS = ('membership', 'symmetric-affinity', 'two-role')
+
+
+def symmetric_logits(logits, indices):
+    """Average opposite edge scores; neighborhood() orders reverse slots as 7-k."""
+    opposite = torch.arange(7, -1, -1, device=indices.device)
+    return (logits + logits[:, indices, opposite]) * .5
+
+
+def propagate_affinity(unary, affinity_logits, indices, valid, strength, steps):
+    """Unary-anchored random walk on symmetric affinities, with unit self edges.
+
+    z[0] = u; z[t+1] = (1-alpha)u + alpha D^-1(I+A)z[t].
+    Affinities are symmetric before row normalization. Signed logits preserve
+    background evidence; an isolated cell keeps its original unary value.
+    """
+    weights = affinity_logits.float().sigmoid() * valid
+    denominator = 1 + weights.sum(-1)
+    anchor = unary.float().flatten(1)
+    logits = anchor
+    alpha = strength.sigmoid()
+    for _ in range(steps):
+        propagated = (logits + (weights * logits[:, indices]).sum(-1)) / denominator
+        logits = (1 - alpha) * anchor + alpha * propagated
+    return logits.reshape_as(unary)
+
 
 def coordinates(height, width, device, dtype):
     y, x = torch.meshgrid(torch.linspace(-1, 1, height, device=device, dtype=dtype),
@@ -64,10 +90,15 @@ class ConnectionNetwork(nn.Module):
 
 class ContextMembership(nn.Module):
     def __init__(self, channels, text_dim, mode, width=128, pair_width=16, steps=2,
-                 context=True, membership=True):
+                 context=True, membership=True, local_refinement='membership'):
         super().__init__()
         if mode not in ('shared', 'separate'):
             raise ValueError('connection mode must be shared or separate')
+        if local_refinement not in LOCAL_REFINEMENTS:
+            raise ValueError(f'Unknown local refinement: {local_refinement}')
+        if not membership and local_refinement != 'membership':
+            raise ValueError('A local refinement control cannot disable membership')
+        self.local_refinement = local_refinement
         self.mode, self.steps = mode, steps
         self.context_network = ConnectionNetwork(channels, text_dim, width, pair_width)
         # No duplicate registered alias in shared mode: one actual parameter set.
@@ -83,6 +114,16 @@ class ContextMembership(nn.Module):
         self.unary_norm = nn.LayerNorm(channels)
         self.unary_head = nn.Conv2d(channels, 1, 1)
         self.update_strength = nn.Parameter(torch.zeros(2))
+        # Construct in the original order before trimming the output head. This
+        # preserves every common weight and the RNG state, including the readout
+        # constructed by CompactDecoder after this module. No unused rows remain.
+        if local_refinement != 'membership':
+            roles = 1 if local_refinement == 'symmetric-affinity' else 2
+            self.membership_head.out_features = roles
+            self.membership_head.weight = nn.Parameter(self.membership_head.weight[:roles].detach().clone())
+            self.membership_head.bias = nn.Parameter(self.membership_head.bias[:roles].detach().clone())
+            if local_refinement == 'symmetric-affinity':
+                self.update_strength = nn.Parameter(torch.zeros(1))  # alpha starts at 0.5
         self.context_enabled, self.membership_enabled = context, membership
         # Construct everything before freezing so ablations preserve common initial weights.
         if not context:
@@ -125,6 +166,13 @@ class ContextMembership(nn.Module):
         indices, valid = neighborhood(height, width, feature.device)
         pairs = network.local_pairs(conditioned, positions, indices)
         edge_logits = self.membership_head(pairs)
+        if self.local_refinement == 'symmetric-affinity':
+            affinity_logits = symmetric_logits(edge_logits.squeeze(-1).float(), indices)
+            refined = propagate_affinity(unary, affinity_logits, indices, valid,
+                                         self.update_strength, self.steps)
+            return {'features': unary_features, 'membership_logits': refined,
+                    'unary_logits': unary, 'affinity_logits': affinity_logits,
+                    'edge_indices': indices, 'edge_valid': valid}
         weights = edge_logits.float().softmax(-1) * valid[None, :, :, None]
         logits = unary.float().flatten(1)
         plus, minus = 2 * self.update_strength.sigmoid()

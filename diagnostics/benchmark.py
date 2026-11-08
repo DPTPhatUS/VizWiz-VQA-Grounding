@@ -43,7 +43,7 @@ def decoder_inputs(model,batch):
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--models',nargs='+',choices=('ftc','cm-shared','cm-separate','ftc-capacity','unet'),
+    parser.add_argument('--models',nargs='+',choices=('ftc','cm-shared','cm-separate','cm-affinity','cm-two-role','ftc-capacity','unet'),
                         default=['ftc','cm-shared','cm-separate','ftc-capacity','unet'])
     parser.add_argument('--device',default='cuda')
     parser.add_argument('--precision',choices=('fp32','fp16'),default='fp32')
@@ -71,7 +71,8 @@ def main(argv=None):
             model=ReplicatedUNet()
         else:
             model=build_model('cm' if name.startswith('cm-') else name,tiny=args.tiny,
-                              connection_mode='shared' if name=='cm-shared' else 'separate')
+                              connection_mode='shared' if name=='cm-shared' else 'separate',
+                              local_refinement={'cm-affinity':'symmetric-affinity','cm-two-role':'two-role'}.get(name,'membership'))
         model.to(device).float().eval()
         size=32 if args.tiny else 336
         batch={'image':torch.rand(1,3,size,size,device=device),'text':['Q: What is the expiration date on this bottle?']}

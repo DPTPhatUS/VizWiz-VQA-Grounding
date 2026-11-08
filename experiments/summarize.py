@@ -19,8 +19,13 @@ def summary_stats(rows):
 def summarize(root,manifest):
     rows=[];missing=[];settings=None
     for run in manifest['runs']:
-        folder=Path(root)/run['id'];path=folder/'test/metrics.json'
-        if not path.exists():missing.append(run['id']);continue
+        # Accept one campaign or its parent containing separately launched runs.
+        direct = Path(root)/run['id']/'test/metrics.json'
+        candidates = ([direct] if direct.exists() else []) + list(Path(root).glob(f'*/{run["id"]}/test/metrics.json'))
+        if not candidates:missing.append(run['id']);continue
+        if len(candidates) != 1:
+            raise ValueError(f'Multiple results for {run["id"]}; use a root with one result per run')
+        path=candidates[0];folder=path.parent.parent
         result=json.loads(path.read_text())['summary'];record=json.loads((folder/'run.json').read_text())
         if record.get('study')!=manifest['name']:
             raise ValueError(f'Study identity mismatch: {run["id"]}')
@@ -41,8 +46,16 @@ def summarize(root,manifest):
     ftc={r['seed']:r for r in rows if r['configuration']=='ftc'}
     cm={r['seed']:r for r in rows if r['configuration']=='cm_separate'}
     paired=[{'seed':seed,**{key:cm[seed][key]-ftc[seed][key] for key in METRICS}} for seed in sorted(ftc.keys()&cm.keys())]
+    controls = {}
+    for label in ('cm_affinity', 'cm_two_role', 'context_only', 'membership_only', 'cm_noaux', 'ftc_capacity'):
+        control = {r['seed']:r for r in rows if r['configuration']==label}
+        pairs = [{'seed':seed, **{key:cm[seed][key]-control[seed][key] for key in METRICS}}
+                 for seed in sorted(cm.keys()&control.keys())]
+        if pairs:
+            controls[label] = {'pairs':pairs, 'num_pairs':len(pairs), 'summary':summary_stats(pairs)}
     return {'cohort':manifest['name'],'runs':rows,'missing_runs':missing,'by_configuration':groups,
             'paired_cm_minus_ftc':paired,'paired_summary':summary_stats(paired) if paired else {},
+            'paired_cm_minus_controls':controls,
             'uncertainty':'sample standard deviation across training seeds; not an image-level confidence interval'}
 
 

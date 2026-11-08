@@ -7,11 +7,15 @@ from dataset import VizWizGroundingDataset
 from models.factory import build_model
 from validation import validation_iou
 
-parser=argparse.ArgumentParser();parser.add_argument('root');args=parser.parse_args()
+parser=argparse.ArgumentParser();parser.add_argument('root')
+parser.add_argument('--local-refinement',choices=('membership','symmetric-affinity','two-role'))
+args=parser.parse_args()
 torch.set_num_threads(2);dist.init_process_group('gloo')
 try:
     rank,world=dist.get_rank(),dist.get_world_size()
-    torch.manual_seed(42);model=build_model('ftc',tiny=True)
+    torch.manual_seed(42)
+    model=build_model('cm' if args.local_refinement else 'ftc',tiny=True,
+                      connection_mode='separate',local_refinement=args.local_refinement or 'membership')
     dataset=VizWizGroundingDataset(args.root,'val',32)
     loader_args=argparse.Namespace(batch_size=2,num_workers=0,device='cpu')
     score=validation_iou(model,dataset,loader_args,torch.device('cpu'),rank,world)

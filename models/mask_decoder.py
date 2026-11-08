@@ -34,7 +34,7 @@ def separable(in_channels, out_channels):
 
 class CompactDecoder(nn.Module):
     def __init__(self, in_channels=1024, text_dim=768, width=128, connection_mode='shared', tiny=False,
-                 context=True, membership=True):
+                 context=True, membership=True, local_refinement='membership'):
         super().__init__()
         self.projections = nn.ModuleList([nn.Conv2d(in_channels, width, 1) for _ in range(4)])
         self.conditioner = SkipConditioner(text_dim, width)
@@ -45,7 +45,8 @@ class CompactDecoder(nn.Module):
         ])
         self.connections = ContextMembership(64, text_dim, connection_mode,
                                              width=16 if tiny else 128,
-                                             context=context, membership=membership)
+                                             context=context, membership=membership,
+                                             local_refinement=local_refinement)
         self.membership_fusion = nn.Conv2d(65, 64, 1)
         self.output = nn.Conv2d(16, 1, 1)
 

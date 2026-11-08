@@ -17,6 +17,7 @@ from checkpoints import save_checkpoint
 from artifacts import write_json
 from models.cm import GroundingModel
 from models.factory import build_model
+from models.connections import LOCAL_REFINEMENTS
 from losses import SupervisedObjective
 from validation import validation_iou
 
@@ -43,7 +44,9 @@ def training_parser():
     parser.add_argument('--connection-mode', choices=('shared', 'separate'),
                         help='Default: shared')
     parser.add_argument('--edge-loss-weight', type=float,
-                        help='Membership supervision weight; default .1 when enabled')
+                        help='Relation supervision weight; default .1 when enabled')
+    parser.add_argument('--local-refinement', choices=LOCAL_REFINEMENTS,
+                        help='CM local update rule; default membership (three roles)')
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=4, help="Global batch size across all ranks")
     parser.add_argument("--num-workers", type=int, default=4)
@@ -72,11 +75,16 @@ def check_arguments(args):
 def configure_run(args):
     explicit = getattr(args, '_explicit', set())
     args.model = args.model or 'cm'
-    if args.model != 'cm' and any(k in explicit for k in ('connection_mode','disable_context','disable_membership','edge_loss_weight')):
+    if args.model != 'cm' and any(k in explicit for k in ('connection_mode','disable_context','disable_membership','edge_loss_weight','local_refinement')):
         raise ValueError('CM-specific options are not supported for FTC models')
     args.connection_mode = args.connection_mode or 'shared'
+    args.local_refinement = args.local_refinement or 'membership'
     args.tiny = bool(args.tiny)
     args.disable_context, args.disable_membership = bool(args.disable_context), bool(args.disable_membership)
+    if args.model != 'cm' and args.local_refinement != 'membership':
+        raise ValueError('Local refinement controls require a CM model')
+    if args.disable_membership and args.local_refinement != 'membership':
+        raise ValueError('A local refinement control cannot disable membership')
     if args.edge_loss_weight is None:
         args.edge_loss_weight = .1 if args.model == 'cm' and not args.disable_membership else 0.
     if args.disable_membership and args.edge_loss_weight > 0:
@@ -131,6 +139,7 @@ def _train(args, rank, world, distributed, device):
         if args.tiny: options['tiny'] = True
         if args.disable_context: options['context'] = False
         if args.disable_membership: options['membership'] = False
+        if args.local_refinement != 'membership': options['local_refinement'] = args.local_refinement
         model = GroundingModel(**options)
     else:
         model = build_model(model=args.model, tiny=args.tiny)

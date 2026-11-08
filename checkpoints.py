@@ -29,7 +29,8 @@ def model_options(saved, explicit_model=None):
         raise ValueError('Incomplete model configuration in checkpoint')
     return dict(model=kind, tiny=config['tiny'],
                 **({'connection_mode':config['connection_mode'], 'context':config['context_enabled'],
-                    'membership':config['membership_enabled']} if kind == 'cm' else {}))
+                    'membership':config['membership_enabled'],
+                    'local_refinement':config.get('local_refinement', 'membership')} if kind == 'cm' else {}))
 
 
 def load_model_weights(model, saved, assign=False):

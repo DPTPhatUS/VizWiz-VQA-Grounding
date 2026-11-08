@@ -28,7 +28,15 @@ Launch fresh runs; use `--processes 2` when two GPUs are enabled, or `1` for one
 !uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs ftc_s42 cm_shared_s42 cm_separate_s42
 ```
 
-Omit `--runs` for all thirteen experiments. Every invocation creates `outputs/<timestamp>/` and starts each selected model from scratch. The protocol is 30 epochs, global batch 4, Adam at 1e-5, and per-epoch validation. Only the validation-selected model is saved. Both validation/test metrics and lossless logits are exported, with one `logits.npz` per split, then the completed run uploads seven files to the public repository `Last-Bullet/vizwiz-cm-aciids-2027`. The summary uploads when all selected runs finish.
+For the new controls, run these IDs in order as budget permits: `cm_affinity_s42`, `cm_affinity_s123`, `cm_affinity_s456`, then `cm_two_role_s42`, `cm_two_role_s123`, `cm_two_role_s456`. For example:
+
+```python
+!uv run --frozen python -m experiments.launch --data-root "$CM_DATA_ROOT" --processes 2 --runs cm_affinity_s42 --hf-repo OWNER/REPOSITORY
+```
+
+Replace `OWNER/REPOSITORY` with your current destination. Keep the same process count as the CM comparison runs. Supply several IDs to queue them sequentially. Omit `--runs` for all 27 experiments, including older configurations. Every invocation creates `outputs/<timestamp>/` and starts each selected model from scratch. The protocol is 30 epochs, global batch 4, Adam at 1e-5, and per-epoch validation. Only the validation-selected model is saved. Both validation/test metrics and lossless logits are exported, with one `logits.npz` per split, then the completed run uploads seven files. The summary uploads when all selected runs finish.
+
+Use `python -m experiments.summarize --root outputs --output-dir outputs/combined_summary` (through `!uv run --frozen`) to combine different timestamp folders, including earlier CM-Separate results. It reports means, sample standard deviations, and paired control differences for available seeds.
 
 There is no continuation from earlier sessions. Start a fresh checkout/session after failure. Previously uploaded results remain in their timestamped folders.
 
