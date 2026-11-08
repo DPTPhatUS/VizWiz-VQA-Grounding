@@ -132,12 +132,14 @@ The last line must be `OK`.
 
 ### Cell 3: memory probe
 
+All cells use `--num-workers 2` (per GPU process): 2 processes × 2 workers match the 4 CPU cores of a Kaggle 2×T4 session. Workers change speed only, not results (no random augmentation; shuffling uses the seeded sampler). Keep the probe and training on the same value so the time estimate holds.
+
 Runs the real B0 training path (both GPUs, real data, mixed precision, full optimiser) for 30 steps with 4 images per GPU, then reports peak memory and speed. No checkpoint is written.
 
 ```bash
 %%bash
 uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
-  --data-root "$DATA_ROOT" --output-dir outputs/probe_bs8 --batch-size 8 --num-workers 4 --max-steps 30 \
+  --data-root "$DATA_ROOT" --output-dir outputs/probe_bs8 --batch-size 8 --num-workers 2 --max-steps 30 \
   --dice-weight 0.5 --freeze-text-encoder --no-freeze-vision-encoder \
   --optimizer adamw --weight-decay 0.05 --lr 1e-4 --backbone-lr 1e-5 --lr-scheduler cosine --warmup-ratio 0.05 \
   --grad-clip-norm 1.0 2>&1 | grep -E "Probe:|Error|error" 
@@ -163,7 +165,7 @@ print('Use batch size', os.environ['BATCH'])
 ```bash
 %%bash
 uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
-  --data-root "$DATA_ROOT" --output-dir "$OUT" --num-epochs 20 --batch-size "$BATCH" --num-workers 4 \
+  --data-root "$DATA_ROOT" --output-dir "$OUT" --num-epochs 20 --batch-size "$BATCH" --num-workers 2 \
   --dice-weight 0.5 --freeze-text-encoder --no-freeze-vision-encoder \
   --optimizer adamw --weight-decay 0.05 --lr 1e-4 --backbone-lr 1e-5 --lr-scheduler cosine --warmup-ratio 0.05 \
   --grad-clip-norm 1.0 --validate-every 2 --save-every 10 --seed 42 \
@@ -189,7 +191,7 @@ Validation chooses between epochs 10 and 20; test is reported for both but choos
 for ep in 10 20; do
   for split in val test; do
     uv run --frozen torchrun --standalone --nproc_per_node=2 eval.py --checkpoint "$OUT/checkpoint_epoch${ep}.pt" \
-      --split "$split" --data-root "$DATA_ROOT" --output-dir "$OUT/eval_${split}_ep${ep}" --batch-size 8 --num-workers 4 \
+      --split "$split" --data-root "$DATA_ROOT" --output-dir "$OUT/eval_${split}_ep${ep}" --batch-size 8 --num-workers 2 \
       2>&1 | grep "mean IoU"
   done
 done
