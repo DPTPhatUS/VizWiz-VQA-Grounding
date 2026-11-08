@@ -63,7 +63,7 @@ Enable Internet and **two T4 GPUs**. Attach the VizWiz dataset (`vizwiz-vqa-grou
 
 | Cell | What | Time (estimate) |
 |---|---|---|
-| 1 | Setup: clone `ocrg/main`, install, check GPUs and data | ~5 min |
+| 1 | Setup: clone `ocrg/main`, install, fast HF download, cache CLIP, check GPUs and data | ~5 min |
 | 2 | Offline tests | ~2 min |
 | 3 | Memory probe: 4 images per GPU fit? Speed? | ~5 min |
 | 4 | Train B0 (20 epochs) | from Cell 3's estimate |
@@ -73,10 +73,28 @@ Enable Internet and **two T4 GPUs**. Attach the VizWiz dataset (`vizwiz-vqa-grou
 ### Cell 1: setup
 
 ```python
-!git clone --single-branch --branch ocrg/main https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+!git clone --depth 1 --single-branch --branch ocrg/main https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
 %cd /kaggle/working/VizWiz-VQA-Grounding
 !git log --oneline -1
-!uv sync --frozen
+!uv sync --frozen --quiet
+```
+
+Faster Hugging Face downloads (optional; needs a Kaggle secret `HF_TOKEN`). `uv pip install` adds the packages to the environment without editing `pyproject.toml` or `uv.lock`, so the checkout stays at the recorded commit (`uv add` would change both files):
+
+```python
+!uv pip install -q wrapt hf_transfer
+%env HF_HUB_ENABLE_HF_TRANSFER=1
+%env HF_XET_HIGH_PERFORMANCE=1
+
+import os
+from kaggle_secrets import UserSecretsClient
+os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+```
+
+Download CLIP once (~1.7 GB). Every later cell starts two processes that load the model; with the cache filled they read it from disk instead of the network:
+
+```python
+!uv run --frozen python -c "from huggingface_hub import snapshot_download; print(snapshot_download('openai/clip-vit-large-patch14-336', allow_patterns=['*.json', '*.txt', 'pytorch_model.bin']))"
 ```
 
 ```python
