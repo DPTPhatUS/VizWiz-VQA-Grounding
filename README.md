@@ -82,10 +82,10 @@ Enable Internet and **two T4 GPUs**. Attach the VizWiz dataset (`vizwiz-vqa-grou
 
 `UV_PROJECT_ENVIRONMENT` puts the virtual environment (several GB with CUDA torch) outside `/kaggle/working`, keeping the 20 GB working disk for checkpoints; every later `uv run` uses it. It is rebuilt in each new session (rerun Cell 1, e.g. after a resume).
 
-Faster Hugging Face downloads (optional; needs a Kaggle secret `HF_TOKEN`). `uv pip install` adds the packages to the environment without editing `pyproject.toml` or `uv.lock`, so the checkout stays at the recorded commit (`uv add` would change both files):
+Extra packages (run this cell). `wrapt` is required on Kaggle: its `sitecustomize` imports it in every Python process, and without it each process prints `ModuleNotFoundError: No module named 'wrapt'`. `--python` targets the environment set by `UV_PROJECT_ENVIRONMENT` (plain `uv pip install` would install into `./.venv`). `hf_transfer` and `HF_TOKEN` (a Kaggle secret) speed up Hugging Face downloads. `uv pip install` adds the packages to the environment without editing `pyproject.toml` or `uv.lock`, so the checkout stays at the recorded commit (`uv add` would change both files):
 
 ```python
-!uv pip install -q wrapt hf_transfer
+!uv pip install -q --python /root/ocrg-venv wrapt hf_transfer
 %env HF_HUB_ENABLE_HF_TRANSFER=1
 %env HF_XET_HIGH_PERFORMANCE=1
 
