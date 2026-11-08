@@ -76,8 +76,11 @@ Enable Internet and **two T4 GPUs**. Attach the VizWiz dataset (`vizwiz-vqa-grou
 !git clone --depth 1 --single-branch --branch ocrg/main https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
 %cd /kaggle/working/VizWiz-VQA-Grounding
 !git log --oneline -1
+%env UV_PROJECT_ENVIRONMENT=/root/ocrg-venv
 !uv sync --frozen --quiet
 ```
+
+`UV_PROJECT_ENVIRONMENT` puts the virtual environment (several GB with CUDA torch) outside `/kaggle/working`, keeping the 20 GB working disk for checkpoints; every later `uv run` uses it. It is rebuilt in each new session (rerun Cell 1, e.g. after a resume).
 
 Faster Hugging Face downloads (optional; needs a Kaggle secret `HF_TOKEN`). `uv pip install` adds the packages to the environment without editing `pyproject.toml` or `uv.lock`, so the checkout stays at the recorded commit (`uv add` would change both files):
 
