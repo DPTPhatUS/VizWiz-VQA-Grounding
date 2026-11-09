@@ -59,6 +59,153 @@ Offline (tiny random encoders, cached CLIP tokenizer), including two-process CPU
 
 Research fork of [yjh9929/VizWiz-VQA-Grounding](https://github.com/yjh9929/VizWiz-VQA-Grounding) (CVPR 2025 VizWiz workshop spotlight), via `exp/baseline-fixes`. Licensed under [Creative Commons Attribution 4.0 International](http://creativecommons.org/licenses/by/4.0/).
 
+## Kaggle: B1 — one session, three continuation arms
+
+Enable Internet and **two T4 GPUs** in a new notebook. Attach these three Inputs:
+
+- VizWiz images and masks: `phtphantun/vizwiz-vqa-grounding` (the same dataset as B0).
+- Your B0 outputs: [`khoahoang0512/vizwiz-ocr-vit-baseline`](https://www.kaggle.com/datasets/khoahoang0512/vizwiz-ocr-vit-baseline).
+- Your existing OCR cache: [`khoahoang0512/vizwiz-ocr-cache`](https://www.kaggle.com/datasets/khoahoang0512/vizwiz-ocr-cache).
+
+The ready-to-import notebook is [notebooks/b1_simple_ocr.ipynb](notebooks/b1_simple_ocr.ipynb). It contains the cells below. No `personal/` files are needed. The branch must be pushed before Kaggle can clone it; preparation alone does not publish local commits.
+
+The experiment trains `b0_continued`, `b1_ocr_48`, then `b1_ocr_96`, each for **10 continuation epochs** from the same verified B0 seed42/epoch20 weights. Optimizer, scheduler and scaler start fresh for every arm. The matched recipe is AdamW, weight decay0.05, existing head LR1e-5, vision LR1e-6, new OCR LR1e-4, cosine with5% warmup/floor0.1, global batch8, clipping1.0 and BCE+0.5 Dice. Vision is fine-tuned; text stays frozen. Both B1 arms use cap64 frozen OCR-text vectors plus normalized boxes/missing-text flag and one separate OCR attention branch; stage48 uses128 channels/four heads, stage96 uses64 channels/two heads. These width/head/parameter differences are recorded architectural consequences, so their comparison is not a perfectly capacity-matched resolution test.
+
+Validation runs every epoch. **Only weight-only epochs5/10 are saved and eligible for selection.** The complete ten-point curves are retained. All three arms finish before comprehensive diagnostics begin. No runtime probe or five-epoch pause is required. Weight-only files do not support optimizer-state resume; this guide completes one session and never silently restarts an existing run.
+
+| Cell | What |
+|---|---|
+| 1 | Clone the experiment branch, install the locked environment, cache CLIP |
+| 2 | Offline CPU correctness tests, including empty-rank DDP |
+| 3 | Resolve the attached data, parent checkpoint, validation reference and OCR cache |
+| 4 | Run all three trainings, then all snapshot evaluations/interventions, CPU diagnostics and ZIP verification |
+| Z | Verify completion, save the notebook outputs and download the analysis ZIP |
+
+### Cell 1: setup
+
+```bash
+%%bash
+set -euo pipefail
+test ! -e /kaggle/working/VizWiz-VQA-Grounding
+git clone --depth 1 --single-branch --branch ocrg/exp-b1-simple-ocr \
+  https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git /kaggle/working/VizWiz-VQA-Grounding
+cd /kaggle/working/VizWiz-VQA-Grounding
+git log --oneline -1
+git ls-files --error-unmatch scripts/run_b1_session.py b1_run.py b1_data.py b1_analysis.py grounding_diagnostics.py models/simple_ocr.py
+```
+
+```python
+%cd /kaggle/working/VizWiz-VQA-Grounding
+%env UV_PROJECT_ENVIRONMENT=/root/ocrg-b1-venv
+%env OMP_NUM_THREADS=1
+%env MKL_NUM_THREADS=1
+%env HF_HUB_ENABLE_HF_TRANSFER=1
+%env HF_XET_HIGH_PERFORMANCE=1
+```
+
+```bash
+%%bash
+set -euo pipefail
+command -v uv >/dev/null || python -m pip install uv
+uv sync --frozen --quiet
+uv pip install -q --python /root/ocrg-b1-venv wrapt hf_transfer
+uv run --frozen python -c "from huggingface_hub import snapshot_download; print(snapshot_download('openai/clip-vit-large-patch14-336', allow_patterns=['*.json','*.txt','pytorch_model.bin']))"
+```
+
+The environment stays outside `/kaggle/working` to leave space for six full weight-only snapshots (about10.4GB together), the small OCR feature cache, analysis and ZIP. No checkpoints are copied from Inputs into the working directory. `wrapt` is needed by Kaggle's `sitecustomize`; these extra packages do not edit the lockfile. CLIP is public; `HF_TOKEN` is optional for faster downloading. If you use the secret, set it as in the B0 setup below.
+
+### Cell 2: offline tests
+
+These are synthetic CPU tests, not a runtime feasibility probe. The empty CUDA visibility applies only to this command; it does not disable the GPUs for Cell4.
+
+```bash
+%%bash
+set -euo pipefail
+CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 uv run --frozen python -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+Every test must pass. A synthetic ten-epoch fixture checks checkpoint5/10 and does not use your trained parent or dataset. Do not continue after a failing cell.
+
+### Cell 3: attached inputs
+
+Your two datasets already contain the parent weights, original validation results and unpacked OCR records. The cell resolves their actual paths under `/kaggle/input`; it never opens test metrics. An ambiguous/missing input is an error rather than a guessed path.
+
+```python
+import json, os
+from pathlib import Path
+
+inputs = Path('/kaggle/input')
+def one(paths, label):
+    paths = list(paths)
+    assert len(paths) == 1, f'{label}: expected one candidate, found {paths}'
+    return paths[0]
+
+data = one(inputs.rglob('val_grounding.json'), 'VizWiz validation annotations').parent
+parent = one((p for p in inputs.rglob('checkpoint_epoch20.pt')
+              if 'ocrg_b0_s42' in p.parts and 'vizwiz-ocr-vit-baseline' in p.parts), 'B0 seed42 checkpoint')
+reference = parent.parent / 'eval_val_ep20' / 'metrics.json'
+assert reference.is_file(), f'Missing original validation metrics: {reference}'
+cache_manifest = one((p for p in inputs.rglob('manifest.json')
+                      if p.parent.name == 'ocr_cache' and 'vizwiz-ocr-cache' in p.parts), 'OCR cache manifest')
+ocr_cache = cache_manifest.parent
+for split, expected in (('train', 6494), ('val', 1131)):
+    records = json.loads((data / f'{split}_grounding.json').read_text())
+    assert len(records) == expected
+    assert (data / split).is_dir() and (data / 'binary_masks_png' / split).is_dir()
+
+os.environ['DATA_ROOT'] = str(data)
+os.environ['B0_PARENT'] = str(parent)
+os.environ['B0_REFERENCE'] = str(reference)
+os.environ['OCR_CACHE'] = str(ocr_cache)
+os.environ['SESSION_OUT'] = '/kaggle/working/b1_session'
+assert not Path(os.environ['SESSION_OUT']).exists(), 'Output exists: use a fresh session or a new SESSION_OUT'
+for key in ('DATA_ROOT','B0_PARENT','B0_REFERENCE','OCR_CACHE','SESSION_OUT'):
+    print(key, '=', os.environ[key])
+```
+
+Expected directory names are `vizwiz-ocr-vit-baseline/ocrg_b0_s42/` and `vizwiz-ocr-cache/ocr_cache/{train,val}/`. The mounted prefix may be `/kaggle/input/datasets/khoahoang0512/` or `/kaggle/input/`; both work. If you renamed an Input, set the four exact paths explicitly instead. The runner also accepts the original OCR ZIP with `--ocr-cache`; unpacked records are repacked byte-for-byte for access by the shared diagnostic utilities. This does **not** regenerate OCR. Source image RGB hashes and OCR geometry are verified before training. Parent SHA256 must equal `49aeae8744fd2f52778ef783b13e5359965baed26935c249ee177cf3e4c0e15e`.
+
+### Cell 4: complete session
+
+```bash
+%%bash
+set -euo pipefail
+uv run --frozen python scripts/run_b1_session.py \
+  --data-root "$DATA_ROOT" --parent "$B0_PARENT" --reference "$B0_REFERENCE" \
+  --ocr-cache "$OCR_CACHE" --output-root "$SESSION_OUT" --gpus 2 --num-workers 2
+```
+
+Let this cell finish. It checks the original B0 source/parent, builds the same frozen OCR features for every arm, then trains all three sequentially. One line per epoch reports loss, validation mIoU and skipped AMP updates; full output is in `SESSION_OUT/logs/`. No comprehensive analysis begins until all three ten-epoch completion records and all six snapshot hashes pass.
+
+It then evaluates the original B0 and all six saved snapshots at native resolution. For **each of the four B1 snapshots**, it additionally evaluates empty/OCR-off evidence, cross-image OCR, within-image text shuffle and geometry-only evidence. These are inference interventions, not retrained capacity controls. There are23 validation evaluations in total; no test evaluation. Empty evidence removes the OCR residual exactly for the current shared weights; it need not recover the original parent's accuracy after fine-tuning.
+
+The CPU stage produces per-image IoUs, size and OCR-coverage groups, FP/FN, precision/recall and mask extents, paired comparisons against original and continued B0, curves and fixed-seed galleries. Selection uses overall validation mIoU only among saved5/10, with earlier ties; epoch10 fixed-budget results are also retained. Single-parent/seed conclusions remain exploratory, and the known image-duplicate sensitivity remains visible.
+
+Failures retain their logs and partial artifacts and stop the notebook. Existing run directories and archives are never overwritten; there is no automatic partial/cross-session resume. Model weights are stored separately as `SESSION_OUT/training/<arm>/checkpoint_epoch5.pt` and `checkpoint_epoch10.pt`, with SHA256 sidecars. Parent/feature hashes, environment, code hashes, data identities, optimizer groups, learning rates, successful/skipped updates and commands are recorded. The weight-only files have no optimizer/scaler state.
+
+### Cell Z: verified output and download
+
+```python
+from IPython.display import FileLink, display
+from zipfile import ZipFile
+out = Path(os.environ['SESSION_OUT'])
+complete = json.loads((out / 'COMPLETE.json').read_text())
+assert complete['evaluations'] == 23
+checkpoints = sorted((out / 'training').glob('*/checkpoint_epoch*.pt'))
+assert len(checkpoints) == 6, checkpoints
+archive = out.parent / f'{out.name}_analysis.zip'
+assert archive.is_file() and archive.with_suffix('.zip.sha256').is_file()
+with ZipFile(archive) as bundle:
+    assert bundle.testzip() is None
+    assert not any(n.endswith(('.pt','.bin','.safetensors')) for n in bundle.namelist())
+print('Selected epochs:', complete['selected_epochs'])
+print('Keep these six weight files separately:', *map(str, checkpoints), sep='\n')
+print('Analysis ZIP SHA256:', archive.with_suffix('.zip.sha256').read_text().strip())
+display(FileLink(str(archive)))
+```
+
+Use **Save Version → Save & Run All** in a clean notebook session to persist this complete execution and its working outputs. Download `b1_session_analysis.zip` from the Output panel (or the link above) for local investigation. Keep all six weight files separately in the saved notebook outputs. The ZIP contains native predictions for all23 evaluations, lightweight native GT masks/OCR records/questions, diagnostics, galleries, complete curves, lightweight training records, checkpoint hashes and an independently checked member-hash manifest. Heavy model weights, optimizer state and frozen feature tensors are excluded. Do not upload these experiment artifacts to Git.
+
 ## Kaggle: B0, seed 42 (first run)
 
 Enable Internet and **two T4 GPUs**. Attach the VizWiz dataset (`vizwiz-vqa-grounding`). Run the cells in order. Every cell stops loudly when something is wrong; send its output instead of working around it. The recipe is decision D017 in the project log.
@@ -122,7 +269,7 @@ assert not Path(os.environ['OUT']).exists(), 'Output folder exists: choose a new
 
 ### Cell 2: offline tests
 
-Downloads the CLIP tokenizer once, then runs the 24 tests (tiny random models, including a two-process run).
+Downloads the CLIP tokenizer once, then runs the offline tests (tiny random models, including two-process runs).
 
 ```bash
 %%bash
