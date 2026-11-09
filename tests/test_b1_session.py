@@ -577,7 +577,7 @@ class DataAndWorkflowTests(unittest.TestCase):
                 features=features,
                 data=root,
                 view="clean",
-                eval_batch_size=2,
+                eval_batch_size=4,
                 workers=0,
             )
             evaluate_snapshot(evaluation)

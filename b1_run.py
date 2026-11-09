@@ -398,7 +398,7 @@ def main():
     p.add_argument("--parent-eval", action="store_true")
     p.add_argument("--view", choices=VIEWS, default="clean")
     p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--eval-batch-size", type=int, default=2)
+    p.add_argument("--eval-batch-size", type=int, default=4)
     p.add_argument("--workers", type=int, default=2)
     args = p.parse_args()
     if args.batch_size < 1 or args.eval_batch_size < 1 or args.workers < 0:
