@@ -1,6 +1,7 @@
 """Comprehensive CPU diagnostics after every arm has finished training."""
 
 import json
+import os
 import shutil
 from pathlib import Path
 from zipfile import ZipFile
@@ -281,6 +282,9 @@ def analyze_all(
             indent=2,
         )
     )
+    # Kaggle exports an inline backend that may be absent from the isolated venv.
+    # Matplotlib validates MPLBACKEND during import, before use() can override it.
+    os.environ["MPLBACKEND"] = "Agg"
     import matplotlib
 
     matplotlib.use("Agg")

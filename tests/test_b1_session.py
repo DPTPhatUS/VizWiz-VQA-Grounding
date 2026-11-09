@@ -5,6 +5,8 @@ import hashlib
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -304,6 +306,38 @@ class DataAndWorkflowTests(unittest.TestCase):
                 sample["ocr"][1][:, 4], record["geometry"][order, 4]
             )
             self.assertNotIn("SECRET", sample["text"])
+
+    def test_analysis_with_unavailable_kaggle_inline_backend(self):
+        # A fresh process is essential: an already imported Matplotlib hides
+        # import-time backend validation. Simulate the venv lacking the module.
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys, unittest; "
+                    "sys.modules['matplotlib_inline'] = None; "
+                    "sys.path.insert(0, 'tests'); "
+                    "suite = unittest.defaultTestLoader.loadTestsFromName("
+                    "'test_b1_session.DataAndWorkflowTests."
+                    "test_complete_analysis_on_synthetic_native_masks'); "
+                    "result = unittest.TextTestRunner(verbosity=2).run(suite); "
+                    "sys.exit(not result.wasSuccessful())"
+                ),
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            env={
+                **os.environ,
+                "MPLBACKEND": "module://matplotlib_inline.backend_inline",
+                "CUDA_VISIBLE_DEVICES": "",
+                "HF_HUB_OFFLINE": "1",
+            },
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_complete_analysis_on_synthetic_native_masks(self):
         from b1_analysis import analyze_all

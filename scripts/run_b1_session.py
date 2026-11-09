@@ -158,7 +158,12 @@ def package(root: Path) -> Path:
 
 def run_command(cmd, log):
     print("Running:", " ".join(cmd), flush=True)
-    env = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
+    env = {
+        **os.environ,
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "MPLBACKEND": "Agg",
+    }
     with (
         log.open("w") as stream,
         subprocess.Popen(

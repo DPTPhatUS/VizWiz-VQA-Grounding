@@ -99,6 +99,7 @@ git ls-files --error-unmatch scripts/run_b1_session.py b1_run.py b1_data.py b1_a
 %env UV_PROJECT_ENVIRONMENT=/root/ocrg-b1-venv
 %env OMP_NUM_THREADS=1
 %env MKL_NUM_THREADS=1
+%env MPLBACKEND=Agg
 %env HF_HUB_ENABLE_HF_TRANSFER=1
 %env HF_XET_HIGH_PERFORMANCE=1
 ```
@@ -121,7 +122,7 @@ These are synthetic CPU tests, not a runtime feasibility probe. The empty CUDA v
 ```bash
 %%bash
 set -euo pipefail
-CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 uv run --frozen python -m unittest discover -s tests -p 'test_*.py' -v
+MPLBACKEND=Agg CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 uv run --frozen python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 Every test must pass. A synthetic ten-epoch fixture checks checkpoint5/10 and does not use your trained parent or dataset. Do not continue after a failing cell.
