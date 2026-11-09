@@ -13,9 +13,12 @@ class ImageEncoder(nn.Module):
     weights (offline tests only).
     """
 
-    def __init__(self, model_name="openai/clip-vit-large-patch14-336", config: CLIPVisionConfig | None = None):
+    def __init__(self, model_name="openai/clip-vit-large-patch14-336", config: CLIPVisionConfig | None = None,
+                 *, revision: str | None = None, interpolate_pos_encoding: bool = False):
         super().__init__()
-        self.vision_encoder = CLIPVisionModel(config) if config is not None else CLIPVisionModel.from_pretrained(model_name)
+        self.vision_encoder = (CLIPVisionModel(config) if config is not None else
+                               CLIPVisionModel.from_pretrained(model_name, **({"revision": revision} if revision else {})))
+        self.interpolate_pos_encoding = interpolate_pos_encoding
         # post_layernorm only normalises the pooled CLS output, which is never used. Freezing it keeps
         # every trainable parameter in the graph, so DDP can run with find_unused_parameters=False.
         # Matched by name: transformers 4.x nests it under vision_model, 5.x does not.
@@ -35,6 +38,9 @@ class ImageEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor):
         """x: (B, 3, H, W) CLIP-normalised images -> (s1, s2, s3, last), each (B, D_v, H_p, W_p)."""
-        outputs = self.vision_encoder(x, output_hidden_states=True)
+        # Preserve the original native-resolution B0 call exactly. B/16 extends
+        # its pretrained 14x14 position grid to 21x21 for the same 336px input.
+        options = {"interpolate_pos_encoding": True} if self.interpolate_pos_encoding else {}
+        outputs = self.vision_encoder(x, output_hidden_states=True, **options)
         skips = tuple(self._to_map(outputs.hidden_states[i]) for i in SKIP_LAYERS)
         return skips + (self._to_map(outputs.last_hidden_state),)

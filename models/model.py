@@ -14,6 +14,10 @@ from models.text_encoder import TextEncoder
 from utils import align_state_dict
 
 CLIP_NAME = "openai/clip-vit-large-patch14-336"
+VITB16_NAME = "openai/clip-vit-base-patch16"
+VITB16_REVISION = "57c216476eefef5ab752ec549e440a49ae4ae5f3"
+TEXT_REVISION = "ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
+VISION_BACKBONES = ("clip-vit-l14-336", "clip-vit-b16")
 
 
 @dataclass(frozen=True)
@@ -27,11 +31,24 @@ class ModelConfig:
     decoder: str = "fusion"  # "fusion" (FusionDecoder) or "unet" (upstream UNetDecoder)
     attention_residual: bool = True  # F = V + alpha * MHA(V, T); False: F = MHA(V, T) (upstream)
     attention_residual_init: float = 0.01  # initial alpha (learnable), as in the ACIIDS models
-    stage_attention: bool = True  # question attention in decoder stages 48/96/192 px (gamma init 0); fusion only
+    stage_attention: bool = True  # question attention in the first three upsampling stages; gamma init 0
     clip_name: str = CLIP_NAME
     tiny: bool = False  # randomly initialised tiny encoders, for offline tests only
+    vision_backbone: str = "clip-vit-l14-336"
+    vision_revision: str | None = None
+    text_revision: str | None = None
 
     def __post_init__(self):
+        if self.vision_backbone not in VISION_BACKBONES:
+            raise ValueError(f"Unknown vision backbone {self.vision_backbone!r}")
+        if self.vision_backbone == "clip-vit-b16":
+            if self.clip_name != CLIP_NAME:
+                raise ValueError("B/16 image-only baseline retains the original ViT-L question encoder")
+            object.__setattr__(self, "vision_revision", self.vision_revision or VITB16_REVISION)
+            object.__setattr__(self, "text_revision", self.text_revision or TEXT_REVISION)
+        for revision in (self.vision_revision, self.text_revision):
+            if revision is not None and (len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision)):
+                raise ValueError("Pretrained revisions must be immutable 40-character commit hashes")
         if self.decoder not in {"fusion", "unet"}:
             raise ValueError(f"Unknown decoder {self.decoder!r}")
         if self.stage_attention and self.decoder != "fusion":
@@ -40,24 +57,33 @@ class ModelConfig:
     def to_dict(self) -> dict:
         return asdict(self)
 
+    @property
+    def vision_name(self) -> str:
+        return VITB16_NAME if self.vision_backbone == "clip-vit-b16" else self.clip_name
 
-def _tiny_configs():
+
+def _tiny_configs(vitb16: bool = False):
     vision = CLIPVisionConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=10,
-                              num_attention_heads=2, image_size=IMAGE_SIZE, patch_size=14)
+                              num_attention_heads=2, image_size=224 if vitb16 else IMAGE_SIZE,
+                              patch_size=16 if vitb16 else 14)
     text = CLIPTextConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=2, num_attention_heads=2)
     return vision, text
 
 
 class GroundingModel(nn.Module):
-    """(images (B, 3, 336, 336) CLIP-normalised, questions list[str]) -> mask logits (B, 1, 384, 384)."""
+    """336px CLIP-normalised images + questions -> logits (384px for L/14, 336px for B/16)."""
 
     def __init__(self, config: ModelConfig | None = None, n_heads: int = 8):
         super().__init__()
         config = config or ModelConfig()
         self.config = config
-        vision_config, text_config = _tiny_configs() if config.tiny else (None, None)
-        self.image_encoder = ImageEncoder(config.clip_name, vision_config)
-        self.text_encoder = TextEncoder(config.clip_name, text_config)
+        vitb16 = config.vision_backbone == "clip-vit-b16"
+        vision_config, text_config = _tiny_configs(vitb16) if config.tiny else (None, None)
+        self.image_encoder = ImageEncoder(config.vision_name, vision_config, revision=config.vision_revision,
+                                          interpolate_pos_encoding=vitb16)
+        # Synthetic checks use the existing cached tokenizer, never the network.
+        self.text_encoder = TextEncoder(config.clip_name, text_config,
+                                         revision=None if config.tiny else config.text_revision)
         self.hidden_dim = self.image_encoder.out_channels  # 1024 for ViT-L
         heads = 2 if config.tiny else n_heads
         self.text_proj = nn.Linear(self.text_encoder.output_dim, self.hidden_dim)
@@ -82,7 +108,7 @@ class GroundingModel(nn.Module):
         tokens, padding = self.text_encoder(texts)  # (B, L, D_t), (B, L)
         fused = self.fuse(vision, tokens, padding)  # (B, D_v, H_p, W_p)
         if isinstance(self.decoder, FusionDecoder):
-            return self.decoder(fused, s1, s2, s3, tokens, padding)  # (B, 1, 16*H_p, 16*W_p)
+            return self.decoder(fused, s1, s2, s3, tokens, padding)  # 16x the selected encoder's patch grid
         return self.decoder(fused, s3, s2, s1)  # upstream argument order
 
     @classmethod

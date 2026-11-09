@@ -9,10 +9,12 @@ class TextEncoder(nn.Module):
     tokenizer always comes from model_name.
     """
 
-    def __init__(self, model_name="openai/clip-vit-large-patch14-336", config: CLIPTextConfig | None = None):
+    def __init__(self, model_name="openai/clip-vit-large-patch14-336", config: CLIPTextConfig | None = None,
+                 *, revision: str | None = None):
         super().__init__()
-        self.model = CLIPTextModel(config) if config is not None else CLIPTextModel.from_pretrained(model_name)
-        self.tokenizer = CLIPTokenizer.from_pretrained(model_name)
+        options = {"revision": revision} if revision else {}
+        self.model = CLIPTextModel(config) if config is not None else CLIPTextModel.from_pretrained(model_name, **options)
+        self.tokenizer = CLIPTokenizer.from_pretrained(model_name, **options)
         self.output_dim = self.model.config.hidden_size  # 768 for ViT-L/14-336
 
     def forward(self, texts):
