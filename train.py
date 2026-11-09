@@ -66,9 +66,9 @@ def parse_args():
     parser.add_argument("--grad-clip-norm", type=float, default=None, help="Clip the gradient norm (off by default)")
     parser.add_argument("--decoder", choices=("fusion", "unet"), default=ModelConfig.decoder)
     parser.add_argument("--vision-backbone", choices=VISION_BACKBONES, default=ModelConfig.vision_backbone,
-                        help="Change only the image encoder; input336 and the ViT-L question encoder stay fixed")
+                        help="Select a paired vision/text CLIP backbone; input stays336, text remains frozen by recipe")
     parser.add_argument("--vision-revision", default=None, help="Immutable vision pretrained commit (B/16 pins a default)")
-    parser.add_argument("--text-revision", default=None, help="Immutable question pretrained commit (B/16 pins a default)")
+    parser.add_argument("--text-revision", default=None, help="Must match --vision-revision (B/16 pins the pair by default)")
     parser.add_argument("--attention-residual", action=argparse.BooleanOptionalAction, default=ModelConfig.attention_residual,
                         help="F = V + alpha * MHA(V, T) (default) instead of F = MHA(V, T)")
     parser.add_argument("--attention-residual-init", type=float, default=ModelConfig.attention_residual_init)

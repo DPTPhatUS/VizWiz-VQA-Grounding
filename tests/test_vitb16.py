@@ -21,7 +21,6 @@ import eval as evaluator
 import train
 from losses import segmentation_loss
 from models.model import (
-    CLIP_NAME,
     TEXT_REVISION,
     VITB16_NAME,
     VITB16_REVISION,
@@ -36,15 +35,15 @@ torch.set_num_threads(1)
 class ViTB16Tests(unittest.TestCase):
     def test_pretrained_identity_and_legacy_defaults(self):
         config = ModelConfig(vision_backbone="clip-vit-b16")
-        self.assertEqual((config.vision_name, config.clip_name), (VITB16_NAME, CLIP_NAME))
-        self.assertEqual((config.vision_revision, config.text_revision), (VITB16_REVISION, TEXT_REVISION))
+        self.assertEqual((config.vision_name, config.clip_name), (VITB16_NAME, VITB16_NAME))
+        self.assertEqual((config.vision_revision, config.text_revision), (VITB16_REVISION, VITB16_REVISION))
         self.assertEqual(ModelConfig(**json.loads(json.dumps(config.to_dict()))), config)
         legacy = ModelConfig()
         old = {k: v for k, v in legacy.to_dict().items()
                if k not in ("vision_backbone", "vision_revision", "text_revision")}
         self.assertEqual(ModelConfig(**old), legacy)
-        with self.assertRaisesRegex(ValueError, "retains the original"):
-            ModelConfig(vision_backbone="clip-vit-b16", clip_name=VITB16_NAME)
+        with self.assertRaisesRegex(ValueError, "pair must share"):
+            ModelConfig(vision_backbone="clip-vit-b16", text_revision=TEXT_REVISION)
         with self.assertRaisesRegex(ValueError, "immutable"):
             ModelConfig(vision_backbone="clip-vit-b16", vision_revision="main")
         # Exercise actual from_pretrained argument routing with tiny substitutes.
@@ -56,8 +55,8 @@ class ViTB16Tests(unittest.TestCase):
         ):
             GroundingModel(config)
         vload.assert_called_once_with(VITB16_NAME, revision=VITB16_REVISION)
-        tload.assert_called_once_with(CLIP_NAME, revision=TEXT_REVISION)
-        tokenizer.assert_called_once_with(CLIP_NAME, revision=TEXT_REVISION)
+        tload.assert_called_once_with(VITB16_NAME, revision=VITB16_REVISION)
+        tokenizer.assert_called_once_with(VITB16_NAME, revision=VITB16_REVISION)
 
     def test_interpolated_features_projection_and_gradients(self):
         torch.manual_seed(0)
@@ -73,7 +72,8 @@ class ViTB16Tests(unittest.TestCase):
         for actual, index in zip(features, (4, 7, 9, 10), strict=True):
             torch.testing.assert_close(actual, model.image_encoder._to_map(raw.hidden_states[index]), rtol=0, atol=0)
         self.assertIsInstance(model.text_proj, torch.nn.Linear)
-        self.assertEqual(model.text_proj.in_features, model.text_proj.out_features)
+        self.assertEqual((model.text_proj.in_features, model.text_proj.out_features), (16, 32))
+        self.assertEqual([block.text_proj.in_features for block in model.decoder.stage_attention], [16] * 3)
         stages = []
         hooks = [stage.register_forward_hook(lambda module, inputs, output: stages.append(tuple(output.shape[-2:])))
                  for stage in model.decoder.stages]

@@ -42,10 +42,13 @@ class ModelConfig:
         if self.vision_backbone not in VISION_BACKBONES:
             raise ValueError(f"Unknown vision backbone {self.vision_backbone!r}")
         if self.vision_backbone == "clip-vit-b16":
-            if self.clip_name != CLIP_NAME:
-                raise ValueError("B/16 image-only baseline retains the original ViT-L question encoder")
+            if self.clip_name not in (CLIP_NAME, VITB16_NAME):
+                raise ValueError("B/16 requires its paired CLIP text encoder")
+            object.__setattr__(self, "clip_name", VITB16_NAME)
             object.__setattr__(self, "vision_revision", self.vision_revision or VITB16_REVISION)
-            object.__setattr__(self, "text_revision", self.text_revision or TEXT_REVISION)
+            object.__setattr__(self, "text_revision", self.text_revision or self.vision_revision)
+        if self.vision_revision != self.text_revision:
+            raise ValueError("Vision/text encoder pair must share the same pretrained revision")
         for revision in (self.vision_revision, self.text_revision):
             if revision is not None and (len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision)):
                 raise ValueError("Pretrained revisions must be immutable 40-character commit hashes")
@@ -66,7 +69,8 @@ def _tiny_configs(vitb16: bool = False):
     vision = CLIPVisionConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=10,
                               num_attention_heads=2, image_size=224 if vitb16 else IMAGE_SIZE,
                               patch_size=16 if vitb16 else 14)
-    text = CLIPTextConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=2, num_attention_heads=2)
+    text = CLIPTextConfig(hidden_size=16 if vitb16 else 32, intermediate_size=64,
+                          num_hidden_layers=2, num_attention_heads=2)
     return vision, text
 
 
@@ -81,9 +85,7 @@ class GroundingModel(nn.Module):
         vision_config, text_config = _tiny_configs(vitb16) if config.tiny else (None, None)
         self.image_encoder = ImageEncoder(config.vision_name, vision_config, revision=config.vision_revision,
                                           interpolate_pos_encoding=vitb16)
-        # Synthetic checks use the existing cached tokenizer, never the network.
-        self.text_encoder = TextEncoder(config.clip_name, text_config,
-                                         revision=None if config.tiny else config.text_revision)
+        self.text_encoder = TextEncoder(config.clip_name, text_config, revision=config.text_revision)
         self.hidden_dim = self.image_encoder.out_channels  # 1024 for ViT-L
         heads = 2 if config.tiny else n_heads
         self.text_proj = nn.Linear(self.text_encoder.output_dim, self.hidden_dim)

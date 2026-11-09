@@ -1,12 +1,12 @@
 # VizWiz-VQA-Grounding: CLIP ViT-B/16 baseline (`ocrg/exp-backbone-clip-vitb16`)
 
-Question-only answer grounding on [VizWiz-VQA-Grounding](https://vizwiz.org/tasks-and-datasets/answer-grounding-for-vqa/): given a photo and a question, predict the mask of the image region that supports the answer. The model never sees the answer. This branch changes the **image encoder only** from the `ocrg/main` B0 to CLIP ViT-B/16. It keeps the frozen ViT-L question encoder, learned text projection, three skips, FusionDecoder, loss and native-resolution evaluation. No OCR or B1/H1/H2 modules are used.
+Question-only answer grounding on [VizWiz-VQA-Grounding](https://vizwiz.org/tasks-and-datasets/answer-grounding-for-vqa/): given a photo and a question, predict the mask of the image region that supports the answer. The model never sees the answer. This branch replaces the `ocrg/main` backbone with the **paired CLIP ViT-B/16 vision and text encoders**. Text stays frozen; vision is fine-tuned. Learned text projection, three skips, FusionDecoder structure, loss and native-resolution evaluation are retained. No OCR or B1/H1/H2 modules are used.
 
 ## B0 with ViT-B/16
 
 ```
 images 336x336 ─ CLIP ViT-B/16 (fine-tuned) ─ skips: blocks 4, 7, 9 ; last V   (21x21, 768 ch)
-question ─ original CLIP ViT-L text encoder (frozen) ─ tokens T ─ Linear 768→768
+question ─ paired CLIP ViT-B/16 text encoder (frozen) ─ tokens T ─ Linear 512→768
 F = V + α · MHA(query=V, key=T, value=T)                      α init 0.01; 8 heads
 Decoder (FusionDecoder):
   x = Conv1x1(F) → 256; x ← x + Bottleneck(x + Conv1x1(s_j)), j = 3, 2, 1
@@ -16,11 +16,11 @@ Decoder (FusionDecoder):
 Loss: BCE + 0.5 · per-image soft Dice against the 336px training mask
 ```
 
-Image weights: `openai/clip-vit-base-patch16`, revision `57c216476eefef5ab752ec549e440a49ae4ae5f3`. The native224 image encoder uses explicit positional interpolation from14x14 to21x21 at input336, retaining its original pretrained position table and CLS position. Question weights/tokenizer: `openai/clip-vit-large-patch14-336`, revision `ce19dc912ca5cd21c8a653c79e251e808ccabcd1`.
+Both encoders and the tokenizer use `openai/clip-vit-base-patch16`, revision `57c216476eefef5ab752ec549e440a49ae4ae5f3`. `models/image_encoder.py` loads `CLIPVisionModel` and `models/text_encoder.py` separately loads `CLIPTextModel` and its tokenizer, from this same checkpoint/revision. No combined `CLIPModel` is loaded. The native224 image encoder uses explicit positional interpolation from14x14 to21x21 at input336, retaining its original pretrained position table and CLS position.
 
-Compared with primary B0, vision depth changes24→12, width1024→768 and patch grid24x24→21x21. Decoder widths and question width768 stay fixed. Skip indices4/7/9 stay fixed, but their relative depths differ. The decoder emits336 rather than384; both paths resize logits to native dimensions for evaluation. This is a hybrid with the original question encoder, not the native150M ViT-B/16 dual encoder. Actual total/trainable parameter counts are recorded at run start. Across-backbone scores do not isolate capacity alone.
+Compared with primary B0, vision depth changes24→12, width1024→768 and patch grid24x24→21x21. Text width changes768→512; the learned text projection becomes512→768 and each decoder stage's text projection accepts512 channels. Decoder widths, head counts and fusion rules stay fixed. Skip indices4/7/9 stay fixed, but their relative depths differ. The decoder emits336 rather than384; both paths resize logits to native dimensions for evaluation. Actual grounding-model total/trainable parameter counts are recorded at run start; they include its custom fusion/decoder. Across-backbone scores compare complete pretrained encoder pairs, not image capacity alone.
 
-**Pass `--vision-backbone clip-vit-b16`.** The default remains historical ViT-L B0 for backward compatibility. B/16 pins the two revisions above; optional `--vision-revision`/`--text-revision` require immutable40-character commit hashes. Checkpoints save the architecture/revisions and reconstruct interpolation automatically. Old B0 configs without the new fields retain their original path; mismatched-backbone resumes fail. Initialize this baseline from pretrained encoders and a new grounding head, never from the trained ViT-L grounding checkpoint.
+**Pass `--vision-backbone clip-vit-b16`.** Despite the retained CLI name, this selects the entire matching encoder pair. The default remains historical ViT-L B0 for backward compatibility. B/16 pins both encoders to the revision above; explicit `--vision-revision`/`--text-revision` must be identical immutable40-character commits. Checkpoints save both identities/revisions and reconstruct interpolation automatically. Historical B0 configs without the new fields retain their original path. The superseded image-B/16/text-L hybrid is rejected, not silently loaded as the paired baseline; mismatched-backbone resumes fail. Initialize from pretrained encoders and a new grounding head, never from a trained ViT-L or hybrid grounding checkpoint.
 
 ## Data
 
@@ -58,7 +58,7 @@ The historical B0 source manifest/exporter remains unchanged and **intentionally
 MPLBACKEND=Agg CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-Tiny random encoders and the cached original tokenizer exercise B0 compatibility, B/16 positional interpolation/gradients/skips, checkpoint reconstruction, native masks, `predict()` and two-process CPU training. These are software checks, not pretrained accuracy or GPU-runtime measurements.
+Tiny random encoders and the cached B/16 and historical ViT-L tokenizers exercise B0 compatibility, B/16 positional interpolation/gradients/skips, checkpoint reconstruction, native masks, `predict()` and two-process CPU training. Cache the paired snapshot in Cell1 and historical tokenizer in Cell2 before offline tests. These are software checks, not pretrained accuracy or GPU-runtime measurements.
 
 ## Origin
 
@@ -98,13 +98,12 @@ uv sync --frozen --quiet
 uv pip install -q --python /root/ocrg-vitb16-venv wrapt hf_transfer
 uv run --frozen python - <<'PY'
 from huggingface_hub import snapshot_download
-from models.model import CLIP_NAME, VITB16_NAME, VITB16_REVISION, TEXT_REVISION
-for name, revision in ((VITB16_NAME, VITB16_REVISION), (CLIP_NAME, TEXT_REVISION)):
-    print(snapshot_download(name, revision=revision, allow_patterns=['*.json', '*.txt', 'pytorch_model.bin']))
+from models.model import VITB16_NAME, VITB16_REVISION
+print(snapshot_download(VITB16_NAME, revision=VITB16_REVISION, allow_patterns=['*.json', '*.txt', 'pytorch_model.bin']))
 PY
 ```
 
-Both models are public. An `HF_TOKEN` environment variable is optional if you already use a Kaggle secret. Both snapshots are needed because the image and question encoders differ.
+The model is public; an `HF_TOKEN` environment variable is optional if you already use a Kaggle secret. One B/16 snapshot supplies both separately loaded encoders. CPU compatibility tests also cache the historical ViT-L tokenizer below; its model weights are not needed for B/16 training.
 
 ```python
 import hashlib, json, os, subprocess
