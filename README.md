@@ -38,6 +38,8 @@ torchrun --nproc_per_node 2 train.py --data-root DATA --output-dir OUT --num-epo
 
 ## Evaluate
 
+For a new Kaggle notebook exporting native validation masks for B0 seeds 41/42/43, follow [the validation-mask export guide](docs/kaggle_b0_mask_export.md). It supports one or two GPUs and verifies exports against the original validation metrics.
+
 ```bash
 uv run eval.py --checkpoint OUT/checkpoint_epoch20.pt --split val --data-root DATA --output-dir OUT/eval_val_ep20
 torchrun --nproc_per_node 2 eval.py ...   # same result, images split across GPUs

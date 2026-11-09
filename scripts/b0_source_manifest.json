@@ -1,0 +1,24 @@
+{
+  "baseline_commit": "0677214ffbc3e05659719f66d30db519509eba4c",
+  "files": {
+    ".python-version": "7b55f8e67b5623c4bef3fa691288da9437d79d3aba156de48d481db32ac7d16d",
+    "bake_exif.py": "aae7bb7fb552622dc077bbd52715ceaddb0d4af3d67de5f38a7853e6e08a454a",
+    "countnum.py": "26f6184ed0c54520676f75442b7a6e61c1440022ddc911a06638ff8dda3838f5",
+    "dataset.py": "57b44d4ce7c349fccdc9b38d6765548d80b22649a7e01678d4803251e42d1dfa",
+    "eval.py": "47534db256d89c6ae5289a03160dd5429bb824ba938e8e7cd84b76baed657d3d",
+    "evaluation.py": "286777986184cfe96ca397841db510bde89023c30ee57d5e27ea24b1136708e6",
+    "losses.py": "e28c4463a04cefc1ec8807e072953020a47836394eee3db61ba606e8cd60e452",
+    "metrics.py": "d454e3f3a479aed2753332e90b0fc4daeb8cbdb3a19b844cc1d45fb68a37b53e",
+    "models/__init__.py": "b644e323e1a6faed96f9d7ec522bba015f469c4cada20481c5665f6260d8cd12",
+    "models/image_encoder.py": "05559d250431ab1708f84d1a6543ab21fb05fee5b1a92e9328af92f85246500d",
+    "models/mask_decoder.py": "49827d2def56ab71414d0fd744c865093f78d0678fd0b551af0c6a34380f86e3",
+    "models/model.py": "df38d4581a4e2b40cdb3d50efd0ca7e9895f1c3db3cf5d217c6881a7e1cbae1c",
+    "models/text_encoder.py": "53ce0e9ae700a4ae21473644a547abf4bb7610504eb1c843b85e9523fabff50a",
+    "pyproject.toml": "770130c7ac8bf2e83c60ea6b85b077055b1e449566fe16bd934608b4f3b33032",
+    "run_record.py": "9108f9e13e35383dc3b42f79251614ff9b2e94455a541798e851e5a8ae4ca080",
+    "train.py": "5dc817346aa551ae37cbab938f3ab7220471e1e0f1cf4e60acabef02c5bd0ac5",
+    "training_options.py": "34558b623513a87f762649579fce4537c3b1980e463fee23bd2ad7264cafe673",
+    "utils.py": "81df55354b4149c9f6f5be1945d9edefac0d5f0ec8ccca8b884c77274b82acda",
+    "uv.lock": "a094c7a30f1e8578467b13946a7af1332a2a52d6c97ad8502d29a9d849db89ed"
+  }
+}

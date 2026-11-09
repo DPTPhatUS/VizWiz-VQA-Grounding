@@ -11,5 +11,9 @@ models/__pycache__/
 !.omo/rules/**
 yolo*.pt
 docs/
+!docs/
+docs/*
+!docs/kaggle_b0_mask_export.md
 tests/*
 !tests/test_ocrg.py
+!tests/test_b0_export.py
