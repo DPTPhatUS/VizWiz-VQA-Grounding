@@ -5,45 +5,45 @@ Question-only answer grounding on [VizWiz-VQA-Grounding](https://vizwiz.org/task
 ## B0 with CLIP RN50
 
 ```
-images 336x336 ─ CLIP RN50 ModifiedResNet (fine-tuned)
-  stem (84x84, 64 ch) → s1=layer1 (84x84, 256 ch) → s2=layer2 (42x42, 512 ch)
-                      → s3=layer3 (21x21, 1024 ch) → V=layer4 (10x10, 2048 ch)
+images 384x384 ─ CLIP RN50 ModifiedResNet (fine-tuned)
+  stem (96x96, 64 ch) → s1=layer1 (96x96, 256 ch) → s2=layer2 (48x48, 512 ch)
+                      → s3=layer3 (24x24, 1024 ch) → V=layer4 (12x12, 2048 ch)
 question ─ paired CLIP RN50 text encoder (frozen) ─ tokens T ─ Linear 512→2048
 F = V + α · MHA(query=V, key=T, value=T)                      α init 0.01; 8 heads
 Decoder (FusionDecoder, hierarchical skips):
-  x = Conv1x1(F) → 256 (10x10) → bilinear to 21x21; x ← x + Bottleneck_256(x + Conv1x1_1024→256(s3))
-  stage 0: bilinear to 42x42 → ConvBlock 256→128 → fuse s2 (512→128) → question attention (γ init 0)
-  stage 1: bilinear to 84x84 → ConvBlock 128→64  → fuse s1 (256→64)  → question attention (γ init 0)
-  stage 2: bilinear ×2 (168x168) → ConvBlock 64→32                   → question attention (γ init 0)
-  stage 3: bilinear ×2 (336x336) → ConvBlock 32→16
-  Conv1x1 → 1 logit map (336x336)
-Loss: BCE + 0.5 · per-image soft Dice against the 336px training mask
+  x = Conv1x1(F) → 256 (12x12) → bilinear to 24x24; x ← x + Bottleneck_256(x + Conv1x1_1024→256(s3))
+  stage 0: bilinear to 48x48 → ConvBlock 256→128 → fuse s2 (512→128) → question attention (γ init 0)
+  stage 1: bilinear to 96x96 → ConvBlock 128→64  → fuse s1 (256→64)  → question attention (γ init 0)
+  stage 2: bilinear ×2 (192x192) → ConvBlock 64→32                   → question attention (γ init 0)
+  stage 3: bilinear ×2 (384x384) → ConvBlock 32→16
+  Conv1x1 → 1 logit map (384x384)
+Loss: BCE + 0.5 · per-image soft Dice against the 384px training mask
 ```
 
 Both encoders load from OpenAI's official CLIP RN50 release packaged on Hugging Face Hub (`timm/resnet50_clip.openai`, `open_clip_model.safetensors`), pinned to its immutable 40-character commit `ec3d92cf63a5f9d591f0d611b736895966c73076`. The BPE tokenizer is identical across OpenAI CLIP releases and is loaded from `openai/clip-vit-base-patch16` at revision `57c216476eefef5ab752ec549e440a49ae4ae5f3`. `models/image_encoder.py` extracts the `ModifiedResNet` visual trunk (`stem` and `layer1..4`, replacing the unused `attnpool` head with `nn.Identity()`), and `models/text_encoder.py` converts the paired 12-layer QuickGELU text transformer into `CLIPTextModel`.
 
-Compared with primary ViT-L/14-336 B0, the vision backbone changes from a uniform `24x24` (`1024` ch) patch grid to a multiscale CNN pyramid (`84x84` `256` ch, `42x42` `512` ch, `21x21` `1024` ch, `10x10` `2048` ch). Instead of fusing all three skips at the bottleneck resolution, `FusionDecoder` upsamples the `10x10` bottleneck to `21x21` to fuse `s3`, then fuses `s2` at `42x42` (`128` ch) and `s1` at `84x84` (`64` ch) before question attention at `42x42`, `84x84` and `168x168`. Text width changes `768→512`; the learned cross-attention text projection becomes `512→2048` and each decoder stage's text projection accepts `512` channels. The decoder emits `336x336` logits rather than `384x384`; both paths resize logits to native dimensions for evaluation. Across-backbone scores compare complete pretrained encoder pairs, not image capacity alone.
+Compared with primary ViT-L/14-336 B0, input images are resized to `384x384` (divisible by $32 = 4 \times 2 \times 2 \times 2$, so every stride-2 stage divides evenly by 2 without odd-border truncation) and the vision backbone changes from a uniform `24x24` (`1024` ch) patch grid to a multiscale CNN pyramid (`96x96` `256` ch, `48x48` `512` ch, `24x24` `1024` ch, `12x12` `2048` ch). Instead of fusing all three skips at the bottleneck resolution, `FusionDecoder` upsamples the `12x12` bottleneck to `24x24` to fuse `s3`, then fuses `s2` at `48x48` (`128` ch) and `s1` at `96x96` (`64` ch) before question attention at `48x48`, `96x96` and `192x192`. Text width changes `768→512`; the learned cross-attention text projection becomes `512→2048` and each decoder stage's text projection accepts `512` channels. Both paths emit `384x384` logits and resize logits to native dimensions for evaluation. Across-backbone scores compare complete pretrained encoder pairs, not image capacity alone.
 
 **Pass `--vision-backbone clip-rn50`.** Despite the retained CLI name, this selects the entire matching encoder pair. The default remains historical ViT-L B0 for backward compatibility. RN50 pins both encoders to the commit hash above; explicit `--vision-revision`/`--text-revision` must be identical immutable 40-character commits. Checkpoints save both identities/revisions and reconstruct hierarchical skip fusion automatically. Historical B0 configs without the new fields retain their original path; mismatched-backbone resumes fail. Initialize from pretrained encoders and a new grounding head, never from a trained ViT-L or ViT-B/16 grounding checkpoint.
 
 ## Data
 
-Point `--data-root` at a folder containing `{train,val}_grounding.json`, `{train,val}/` and `binary_masks_png/{train,val}/`. Full-frame images are EXIF-rotated, resized to 336x336 (bicubic, antialiased, without preserving aspect ratio), and CLIP-normalised (`mean=(0.48145466, 0.4578275, 0.40821073)`, `std=(0.26862954, 0.26130258, 0.27577711)`). Masks use nearest resizing. Question-only prompts and split membership remain unchanged. The optional `--text-mode qa` feeds the gold answer and is an ablation, not this baseline. Missing or misaligned masks fail.
+Point `--data-root` at a folder containing `{train,val}_grounding.json`, `{train,val}/` and `binary_masks_png/{train,val}/`. Full-frame images are EXIF-rotated, resized to 384x384 for CLIP RN50 (336x336 for historical ViT-L/14; bicubic, antialiased, without preserving aspect ratio), and CLIP-normalised (`mean=(0.48145466, 0.4578275, 0.40821073)`, `std=(0.26862954, 0.26130258, 0.27577711)`). Masks use nearest resizing to the same resolution. Question-only prompts and split membership remain unchanged. The optional `--text-mode qa` feeds the gold answer and is an ablation, not this baseline. Missing or misaligned masks fail.
 
 ## Train
 
 ```bash
 torchrun --nproc_per_node 2 train.py --vision-backbone clip-rn50 \
-  --data-root DATA --output-dir OUT --num-epochs 20 --batch-size 8 \
+  --data-root DATA --output-dir OUT --num-epochs 50 --batch-size 8 \
   --dice-weight 0.5 --freeze-text-encoder --no-freeze-vision-encoder \
   --optimizer adamw --weight-decay 0.05 --lr 1e-4 --backbone-lr 1e-5 --lr-scheduler cosine --warmup-ratio 0.05 \
   --grad-clip-norm 1.0 --validate-every 2 --save-every 10 \
   --expect vision_backbone=clip-rn50 --expect freeze_text_encoder=true --expect optimizer=adamw
 ```
 
-- This retains the original B0 recipe: 20 epochs, AdamW, no decay on norms/biases/embeddings/α/γ, head LR 1e-4, vision LR 1e-5, cosine with 5% warmup and clipping 1.0. Under multi-GPU DDP (`world_size > 1`), `train.py` converts RN50's `BatchNorm2d` layers to `SyncBatchNorm`.
+- This runs a 50-epoch schedule (`--save-every 10`, saving checkpoints 10/20/30/40/50) with the B0 optimisation recipe: AdamW, no decay on norms/biases/embeddings/α/γ, head LR 1e-4, vision LR 1e-5, cosine with 5% warmup and clipping 1.0. Under multi-GPU DDP (`world_size > 1`), `train.py` converts RN50's `BatchNorm2d` layers to `SyncBatchNorm`.
 - Global batch 8 means 4 per GPU on two GPUs; epoch validation also uses 4 per GPU. Training uses FP16 autocast; validation uses FP32 without gradients.
-- Use a fresh output directory per seed. Keep configs, history, the complete validation curve and full-state checkpoints 10/20. Select only between saved 10/20 on validation, not an unsaved epoch. Checkpoints include optimizer/scaler/scheduler state and are written atomically.
+- Use a fresh output directory per seed. Keep configs, history, the complete validation curve and full-state checkpoints 10/20/30/40/50. Select only among saved checkpoints on validation, not an unsaved epoch. Checkpoints include optimizer/scaler/scheduler state and are written atomically.
 
 ## Evaluate
 
@@ -77,8 +77,8 @@ Enable Internet and **two T4 GPUs**. Attach `phtphantun/vizwiz-vqa-grounding`. N
 | 1 | Clone this branch, install, cache pinned CLIP RN50 weights and tokenizer, check data/GPUs |
 | 2 | Offline CPU tests |
 | 3 | Optional memory/speed check |
-| 4 | Train the 20-epoch baseline |
-| 5 | Export validation masks at 10/20 and verify results |
+| 4 | Train the 50-epoch baseline |
+| 5 | Export validation masks at 10/20/30/40/50 and verify results |
 | Z | ZIP results without weights; retain checkpoints separately |
 
 ### Cell 1: setup
@@ -116,7 +116,7 @@ from pathlib import Path
 assert subprocess.check_output(['git', 'branch', '--show-current'], text=True).strip() == 'ocrg/exp-backbone-clip-rn50'
 assert not subprocess.check_output(['git', 'status', '--porcelain'], text=True).strip(), 'Use a clean checkout'
 os.environ['DATA_ROOT'] = '/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz'
-os.environ['RUN_NAME'] = 'ocrg_b0_rn50_336_s42'
+os.environ['RUN_NAME'] = 'ocrg_b0_rn50_384_s42'
 os.environ['OUT'] = f"/kaggle/working/outputs/{os.environ['RUN_NAME']}"
 os.environ['BATCH'] = '8'
 os.environ['SEED'] = '42'
@@ -168,7 +168,7 @@ uv run --no-sync torchrun --standalone --nproc_per_node=2 train.py --vision-back
 set -euo pipefail
 test ! -e "$OUT"
 uv run --no-sync torchrun --standalone --nproc_per_node=2 train.py --vision-backbone clip-rn50 \
-  --data-root "$DATA_ROOT" --output-dir "$OUT" --num-epochs 20 --batch-size "$BATCH" --num-workers 2 \
+  --data-root "$DATA_ROOT" --output-dir "$OUT" --num-epochs 50 --batch-size "$BATCH" --num-workers 2 \
   --dice-weight 0.5 --freeze-text-encoder --no-freeze-vision-encoder \
   --optimizer adamw --weight-decay 0.05 --lr 1e-4 --backbone-lr 1e-5 --lr-scheduler cosine --warmup-ratio 0.05 \
   --grad-clip-norm 1.0 --validate-every 2 --save-every 10 --seed "$SEED" \
@@ -178,16 +178,16 @@ uv run --no-sync torchrun --standalone --nproc_per_node=2 train.py --vision-back
   --expect stage_attention=true --expect grad_clip_norm=1.0 --expect world_size=2
 ```
 
-Progress: loss/timing each epoch, validation every 2 epochs, checkpoints 10/20. For seeds 41/43, choose a new `RUN_NAME`/`OUT` and matching `SEED`; keep the recipe fixed. If interrupted, persist the checkpoint and attach it to a new session. Use a fresh output directory and add `--resume-checkpoint /kaggle/input/<attached-output>/.../checkpoint_epoch10.pt` to Cell 4 with identical recipe flags. Optimizer/scaler/scheduler resume checks remain in force.
+Progress: loss/timing each epoch, validation every 2 epochs, checkpoints 10/20/30/40/50. For seeds 41/43, choose a new `RUN_NAME`/`OUT` and matching `SEED`; keep the recipe fixed. If interrupted, persist the checkpoint and attach it to a new session. Use a fresh output directory and add `--resume-checkpoint /kaggle/input/<attached-output>/.../checkpoint_epoch10.pt` to Cell 4 with identical recipe flags. Optimizer/scaler/scheduler resume checks remain in force.
 
 ### Cell 5: validation masks
 
-Validation chooses between saved 10/20; no test split is accessed.
+Validation chooses among saved 10/20/30/40/50; no test split is accessed.
 
 ```bash
 %%bash
 set -euo pipefail
-for ep in 10 20; do
+for ep in 10 20 30 40 50; do
   uv run --no-sync torchrun --standalone --nproc_per_node=2 eval.py \
     --checkpoint "$OUT/checkpoint_epoch${ep}.pt" --split val --data-root "$DATA_ROOT" \
     --output-dir "$OUT/eval_val_ep${ep}" --batch-size 4 --num-workers 2 --save-masks
@@ -199,7 +199,7 @@ from PIL import Image, ImageOps
 out = Path(os.environ['OUT'])
 records = json.loads((data / 'val_grounding.json').read_text())
 curve = {r['epoch']: r['val_miou'] for r in map(json.loads, (out / 'val_curve.jsonl').read_text().splitlines())}
-for ep in (10, 20):
+for ep in (10, 20, 30, 40, 50):
     folder = out / f'eval_val_ep{ep}'
     metrics = json.loads((folder / 'metrics.json').read_text())
     assert metrics['summary']['split'] == 'val'
@@ -232,7 +232,7 @@ info = {
     'annotations': {s: sha256(data / f'{s}_grounding.json') for s in ('train', 'val')},
     'checkpoints': {p.name: sha256(p) for p in sorted(out.glob('checkpoint_epoch*.pt'))},
 }
-assert set(info['checkpoints']) == {'checkpoint_epoch10.pt', 'checkpoint_epoch20.pt'}
+assert set(info['checkpoints']) == {f'checkpoint_epoch{ep}.pt' for ep in (10, 20, 30, 40, 50)}
 provenance.write_text(json.dumps(info, indent=2))
 archive = Path('/kaggle/working') / f"{os.environ['RUN_NAME']}.zip"
 members = {}
@@ -252,4 +252,4 @@ with Path(str(archive) + '.sha256').open('x') as checksum:
     checksum.write(sha256(archive) + '  ' + archive.name + '\n')
 ```
 
-Persist the notebook outputs before ending the session. Use **Save Version → Save & Run All** for a fresh unattended execution; it starts the experiment again, so do not use it to rerun a completed interactive training merely for saving. Download `ocrg_b0_rn50_336_s42.zip` and keep the two `.pt` files separately in Kaggle outputs. The ZIP contains configs, curves, per-image validation metrics, native masks and checkpoint hashes, excluding heavyweight weights. No pretrained accuracy or GPU-runtime result is claimed until the actual run completes.
+Persist the notebook outputs before ending the session. Use **Save Version → Save & Run All** for a fresh unattended execution; it starts the experiment again, so do not use it to rerun a completed interactive training merely for saving. Download `ocrg_b0_rn50_384_s42.zip` and keep the five `.pt` files separately in Kaggle outputs. The ZIP contains configs, curves, per-image validation metrics, native masks and checkpoint hashes, excluding heavyweight weights. No pretrained accuracy or GPU-runtime result is claimed until the actual run completes.

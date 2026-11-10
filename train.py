@@ -66,14 +66,14 @@ def parse_args():
     parser.add_argument("--grad-clip-norm", type=float, default=None, help="Clip the gradient norm (off by default)")
     parser.add_argument("--decoder", choices=("fusion", "unet"), default=ModelConfig.decoder)
     parser.add_argument("--vision-backbone", choices=VISION_BACKBONES, default=ModelConfig.vision_backbone,
-                        help="Select a paired vision/text CLIP backbone; input stays 336, text remains frozen by recipe")
+                        help="Select a paired vision/text CLIP backbone (336px for ViT-L/14, 384px for RN50)")
     parser.add_argument("--vision-revision", default=None, help="Immutable vision pretrained hash (RN50 pins a default)")
     parser.add_argument("--text-revision", default=None, help="Must match --vision-revision (RN50 pins the pair by default)")
     parser.add_argument("--attention-residual", action=argparse.BooleanOptionalAction, default=ModelConfig.attention_residual,
                         help="F = V + alpha * MHA(V, T) (default) instead of F = MHA(V, T)")
     parser.add_argument("--attention-residual-init", type=float, default=ModelConfig.attention_residual_init)
     parser.add_argument("--stage-attention", action=argparse.BooleanOptionalAction, default=ModelConfig.stage_attention,
-                        help="Question attention at the first three decoder stages (L/14: 48/96/192, RN50: 42/84/168)")
+                        help="Question attention at 48/96/192 px in the fusion decoder (gamma init 0)")
     parser.add_argument("--max-steps", type=int, default=0,
                         help="Probe mode: stop after N optimiser steps and write probe.json (peak GPU memory, "
                              "seconds per step); no checkpoints, history or validation")
@@ -201,7 +201,9 @@ def main():
 
         # --- Data ---
         pin = device.type == "cuda"
-        train_set = VizWizGroundingDataset(args.data_root, "train", text_mode=args.text_mode)
+        train_set = VizWizGroundingDataset(
+            args.data_root, "train", image_size=model_config.image_size, text_mode=args.text_mode
+        )
         generator = torch.Generator()
         sampler = (DistributedSampler(train_set, world_size, rank, shuffle=True, seed=args.seed) if world_size > 1
                    else RandomSampler(train_set, generator=generator))
@@ -211,7 +213,9 @@ def main():
         train_loader = DataLoader(train_set, batch_size=args.batch_size // world_size, sampler=sampler, **loader_options)
         val_set = val_loader = None
         if args.validate_every:
-            val_set = VizWizGroundingDataset(args.data_root, "val", native_mask=True, text_mode=args.text_mode)
+            val_set = VizWizGroundingDataset(
+                args.data_root, "val", image_size=model_config.image_size, native_mask=True, text_mode=args.text_mode
+            )
             val_loader = DataLoader(val_set, batch_size=args.batch_size // world_size,
                                     sampler=ShardSampler(len(val_set), rank, world_size), **loader_options)
 

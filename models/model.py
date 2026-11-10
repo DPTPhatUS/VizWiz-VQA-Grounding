@@ -7,7 +7,13 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import CLIPTextConfig, CLIPVisionConfig
 
-from dataset import IMAGE_SIZE, load_image, model_text, preprocess_image
+from dataset import (
+    IMAGE_SIZE,
+    RN50_IMAGE_SIZE,
+    load_image,
+    model_text,
+    preprocess_image,
+)
 from models.image_encoder import ImageEncoder, TinyRN50VisionConfig
 from models.mask_decoder import FusionDecoder, UNetDecoder
 from models.text_encoder import TextEncoder
@@ -66,6 +72,10 @@ class ModelConfig:
     def vision_name(self) -> str:
         return RN50_NAME if self.vision_backbone == "clip-rn50" else self.clip_name
 
+    @property
+    def image_size(self) -> int:
+        return RN50_IMAGE_SIZE if self.vision_backbone == "clip-rn50" else IMAGE_SIZE
+
 
 def _tiny_configs(rn50: bool = False):
     vision = (
@@ -83,7 +93,7 @@ def _tiny_configs(rn50: bool = False):
 
 
 class GroundingModel(nn.Module):
-    """336px CLIP-normalised images + questions -> logits (384px for L/14, 336px for RN50)."""
+    """CLIP-normalised images (336px for L/14, 384px for RN50) + questions -> 384x384 logits."""
 
     def __init__(self, config: ModelConfig | None = None, n_heads: int = 8):
         super().__init__()
@@ -151,6 +161,9 @@ class GroundingModel(nn.Module):
         self.eval()
         pil = load_image(image) if not hasattr(image, "size") else image.convert("RGB")
         device = next(self.parameters()).device
-        logits = self(preprocess_image(pil).unsqueeze(0).to(device), [model_text({"question": question, "most_common_answer": answer}, "qa" if answer else "question")])  # (1, 1, h, w)
+        logits = self(
+            preprocess_image(pil, self.config.image_size).unsqueeze(0).to(device),
+            [model_text({"question": question, "most_common_answer": answer}, "qa" if answer else "question")],
+        )  # (1, 1, h, w)
         logits = F.interpolate(logits.float(), size=(pil.height, pil.width), mode="bilinear", align_corners=False)
         return logits[0, 0] > 0  # (H, W)
