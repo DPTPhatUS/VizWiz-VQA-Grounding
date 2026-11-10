@@ -52,7 +52,9 @@ def main(argv=None):
         model, metadata = GroundingModel.from_checkpoint(args.checkpoint, device)
         trained_mode = ((metadata.get("run_config") or {}).get("recipe") or {}).get("text_mode", "question")
         text_mode = args.text_mode or trained_mode
-        dataset = VizWizGroundingDataset(args.data_root, args.split, native_mask=True, text_mode=text_mode)
+        dataset = VizWizGroundingDataset(args.data_root, args.split, image_size=model.config.image_size,
+                                         native_mask=True, text_mode=text_mode,
+                                         mean=model.config.image_mean, std=model.config.image_std)
         loader = DataLoader(dataset, batch_size=args.batch_size, sampler=ShardSampler(len(dataset), rank, world_size),
                             num_workers=args.num_workers, pin_memory=device.type == "cuda", collate_fn=collate)
         save = None

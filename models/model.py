@@ -1,19 +1,38 @@
-"""Question-only grounding model: CLIP encoders, question cross-attention, mask decoder."""
+"""Question-only grounding model: CLIP/SigLIP2 encoders, question cross-attention, mask decoder."""
 
 from dataclasses import asdict, dataclass
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import CLIPTextConfig, CLIPVisionConfig
+from transformers import (
+    CLIPTextConfig,
+    CLIPVisionConfig,
+    SiglipTextConfig,
+    SiglipVisionConfig,
+)
 
-from dataset import IMAGE_SIZE, load_image, model_text, preprocess_image
+from dataset import (
+    CLIP_MEAN,
+    CLIP_STD,
+    IMAGE_SIZE,
+    SIGLIP_IMAGE_SIZE,
+    SIGLIP_MEAN,
+    SIGLIP_STD,
+    load_image,
+    model_text,
+    preprocess_image,
+)
 from models.image_encoder import ImageEncoder
 from models.mask_decoder import FusionDecoder, UNetDecoder
 from models.text_encoder import TextEncoder
 from utils import align_state_dict
 
 CLIP_NAME = "openai/clip-vit-large-patch14-336"
+SIGLIP2_NAME = "google/siglip2-base-patch16-384"
+SIGLIP2_REVISION = "932518b266bc21ea2a4291b915a912d43aeb3a48"
+TEXT_REVISION = "ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
+VISION_BACKBONES = ("clip-vit-l14-336", "siglip2-b16-384")
 
 
 @dataclass(frozen=True)
@@ -30,8 +49,24 @@ class ModelConfig:
     stage_attention: bool = True  # question attention in decoder stages 48/96/192 px (gamma init 0); fusion only
     clip_name: str = CLIP_NAME
     tiny: bool = False  # randomly initialised tiny encoders, for offline tests only
+    vision_backbone: str = "clip-vit-l14-336"
+    vision_revision: str | None = None
+    text_revision: str | None = None
 
     def __post_init__(self):
+        if self.vision_backbone not in VISION_BACKBONES:
+            raise ValueError(f"Unknown vision backbone {self.vision_backbone!r}")
+        if self.vision_backbone == "siglip2-b16-384":
+            if self.clip_name not in (CLIP_NAME, SIGLIP2_NAME):
+                raise ValueError("SigLIP2 requires its paired SigLIP2 text encoder")
+            object.__setattr__(self, "clip_name", SIGLIP2_NAME)
+            object.__setattr__(self, "vision_revision", self.vision_revision or SIGLIP2_REVISION)
+            object.__setattr__(self, "text_revision", self.text_revision or self.vision_revision)
+        if self.vision_revision != self.text_revision:
+            raise ValueError("Vision/text encoder pair must share the same pretrained revision")
+        for revision in (self.vision_revision, self.text_revision):
+            if revision is not None and (len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision)):
+                raise ValueError("Pretrained revisions must be immutable 40-character commit hashes")
         if self.decoder not in {"fusion", "unet"}:
             raise ValueError(f"Unknown decoder {self.decoder!r}")
         if self.stage_attention and self.decoder != "fusion":
@@ -40,8 +75,31 @@ class ModelConfig:
     def to_dict(self) -> dict:
         return asdict(self)
 
+    @property
+    def vision_name(self) -> str:
+        return SIGLIP2_NAME if self.vision_backbone == "siglip2-b16-384" else self.clip_name
 
-def _tiny_configs():
+    @property
+    def image_size(self) -> int:
+        return SIGLIP_IMAGE_SIZE if self.vision_backbone == "siglip2-b16-384" else IMAGE_SIZE
+
+    @property
+    def image_mean(self) -> tuple[float, float, float]:
+        return SIGLIP_MEAN if self.vision_backbone == "siglip2-b16-384" else CLIP_MEAN
+
+    @property
+    def image_std(self) -> tuple[float, float, float]:
+        return SIGLIP_STD if self.vision_backbone == "siglip2-b16-384" else CLIP_STD
+
+
+def _tiny_configs(siglip2: bool = False):
+    if siglip2:
+        vision = SiglipVisionConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=10,
+                                    num_attention_heads=2, image_size=SIGLIP_IMAGE_SIZE, patch_size=16)
+        text = SiglipTextConfig(vocab_size=32, hidden_size=16, intermediate_size=64,
+                                num_hidden_layers=2, num_attention_heads=2, max_position_embeddings=64,
+                                projection_size=16, pad_token_id=0, eos_token_id=1, bos_token_id=2)
+        return vision, text
     vision = CLIPVisionConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=10,
                               num_attention_heads=2, image_size=IMAGE_SIZE, patch_size=14)
     text = CLIPTextConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=2, num_attention_heads=2)
@@ -49,15 +107,16 @@ def _tiny_configs():
 
 
 class GroundingModel(nn.Module):
-    """(images (B, 3, 336, 336) CLIP-normalised, questions list[str]) -> mask logits (B, 1, 384, 384)."""
+    """Normalised images (336px for L/14, 384px for SigLIP2) + questions -> mask logits (384px)."""
 
     def __init__(self, config: ModelConfig | None = None, n_heads: int = 8):
         super().__init__()
         config = config or ModelConfig()
         self.config = config
-        vision_config, text_config = _tiny_configs() if config.tiny else (None, None)
-        self.image_encoder = ImageEncoder(config.clip_name, vision_config)
-        self.text_encoder = TextEncoder(config.clip_name, text_config)
+        siglip2 = config.vision_backbone == "siglip2-b16-384"
+        vision_config, text_config = _tiny_configs(siglip2) if config.tiny else (None, None)
+        self.image_encoder = ImageEncoder(config.vision_name, vision_config, revision=config.vision_revision)
+        self.text_encoder = TextEncoder(config.clip_name, text_config, revision=config.text_revision)
         self.hidden_dim = self.image_encoder.out_channels  # 1024 for ViT-L
         heads = 2 if config.tiny else n_heads
         self.text_proj = nn.Linear(self.text_encoder.output_dim, self.hidden_dim)
@@ -107,6 +166,7 @@ class GroundingModel(nn.Module):
         self.eval()
         pil = load_image(image) if not hasattr(image, "size") else image.convert("RGB")
         device = next(self.parameters()).device
-        logits = self(preprocess_image(pil).unsqueeze(0).to(device), [model_text({"question": question, "most_common_answer": answer}, "qa" if answer else "question")])  # (1, 1, h, w)
+        image_tensor = preprocess_image(pil, self.config.image_size, self.config.image_mean, self.config.image_std)
+        logits = self(image_tensor.unsqueeze(0).to(device), [model_text({"question": question, "most_common_answer": answer}, "qa" if answer else "question")])  # (1, 1, h, w)
         logits = F.interpolate(logits.float(), size=(pil.height, pil.width), mode="bilinear", align_corners=False)
         return logits[0, 0] > 0  # (H, W)

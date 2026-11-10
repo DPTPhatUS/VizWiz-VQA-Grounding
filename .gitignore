@@ -17,3 +17,4 @@ docs/*
 tests/*
 !tests/test_ocrg.py
 !tests/test_b0_export.py
+!tests/test_siglip2.py

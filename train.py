@@ -28,7 +28,15 @@ from dataset import TEXT_MODES, VizWizGroundingDataset, collate
 from evaluation import ShardSampler, evaluate, gather_scores, mean_iou
 from losses import segmentation_loss
 from models import GroundingModel, ModelConfig
-from run_record import RECIPE_KEYS, append_jsonl, check_expectations, check_resume_recipe, git_state, parse_expectations
+from models.model import VISION_BACKBONES
+from run_record import (
+    RECIPE_KEYS,
+    append_jsonl,
+    check_expectations,
+    check_resume_recipe,
+    git_state,
+    parse_expectations,
+)
 from training_options import DEFAULTS as OPTIMIZATION_DEFAULTS
 from training_options import (
     TrainingArgumentParser,
@@ -57,6 +65,10 @@ def parse_args():
                         help="Weight of the per-image soft Dice term added to BCE (0 = BCE only)")
     parser.add_argument("--grad-clip-norm", type=float, default=None, help="Clip the gradient norm (off by default)")
     parser.add_argument("--decoder", choices=("fusion", "unet"), default=ModelConfig.decoder)
+    parser.add_argument("--vision-backbone", choices=VISION_BACKBONES, default=ModelConfig.vision_backbone,
+                        help="Select a paired vision/text backbone (L/14 at 336px or SigLIP2 Base/16 at native 384px)")
+    parser.add_argument("--vision-revision", default=None, help="Immutable vision pretrained commit (SigLIP2 pins a default)")
+    parser.add_argument("--text-revision", default=None, help="Must match --vision-revision (SigLIP2 pins the pair by default)")
     parser.add_argument("--attention-residual", action=argparse.BooleanOptionalAction, default=ModelConfig.attention_residual,
                         help="F = V + alpha * MHA(V, T) (default) instead of F = MHA(V, T)")
     parser.add_argument("--attention-residual-init", type=float, default=ModelConfig.attention_residual_init)
@@ -164,8 +176,10 @@ def main():
         # Resolved recipe: checked against --expect and the resume checkpoint before anything is built.
         model_config = ModelConfig(decoder=args.decoder, attention_residual=args.attention_residual,
                                    attention_residual_init=args.attention_residual_init,
-                                   stage_attention=args.stage_attention)
+                                   stage_attention=args.stage_attention, vision_backbone=args.vision_backbone,
+                                   vision_revision=args.vision_revision, text_revision=args.text_revision)
         resolved = {**public_arguments(args), "world_size": world_size}
+        resolved.update(vision_revision=model_config.vision_revision, text_revision=model_config.text_revision)
         for key, default in OPTIMIZATION_DEFAULTS.items():  # record what is used, not None
             if key not in ("freeze_vision_encoder", "freeze_text_encoder", "backbone_lr") and resolved.get(key) is None:
                 resolved[key] = default
@@ -174,7 +188,7 @@ def main():
         check_expectations(resolved, args.expected)
         if checkpoint is not None:
             check_resume_recipe(checkpoint, recipe)
-            if checkpoint.get("model_config") != model_config.to_dict():
+            if ModelConfig(**checkpoint["model_config"]).to_dict() != model_config.to_dict():
                 raise ValueError("Resume model_config differs from the checkpoint")
 
         seed_everything(args.seed)
@@ -187,7 +201,9 @@ def main():
 
         # --- Data ---
         pin = device.type == "cuda"
-        train_set = VizWizGroundingDataset(args.data_root, "train", text_mode=args.text_mode)
+        train_set = VizWizGroundingDataset(args.data_root, "train", image_size=model_config.image_size,
+                                           text_mode=args.text_mode, mean=model_config.image_mean,
+                                           std=model_config.image_std)
         generator = torch.Generator()
         sampler = (DistributedSampler(train_set, world_size, rank, shuffle=True, seed=args.seed) if world_size > 1
                    else RandomSampler(train_set, generator=generator))
@@ -197,7 +213,9 @@ def main():
         train_loader = DataLoader(train_set, batch_size=args.batch_size // world_size, sampler=sampler, **loader_options)
         val_set = val_loader = None
         if args.validate_every:
-            val_set = VizWizGroundingDataset(args.data_root, "val", native_mask=True, text_mode=args.text_mode)
+            val_set = VizWizGroundingDataset(args.data_root, "val", image_size=model_config.image_size,
+                                             native_mask=True, text_mode=args.text_mode,
+                                             mean=model_config.image_mean, std=model_config.image_std)
             val_loader = DataLoader(val_set, batch_size=args.batch_size // world_size,
                                     sampler=ShardSampler(len(val_set), rank, world_size), **loader_options)
 

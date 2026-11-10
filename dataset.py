@@ -11,7 +11,10 @@ from torch.utils.data import Dataset
 
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+SIGLIP_MEAN = (0.5, 0.5, 0.5)
+SIGLIP_STD = (0.5, 0.5, 0.5)
 IMAGE_SIZE = 336  # CLIP ViT-L/14-336 input; the full frame is resized without keeping the aspect ratio
+SIGLIP_IMAGE_SIZE = 384  # SigLIP2 Base/16-384 native input; full frame resized without keeping aspect ratio
 
 
 def load_image(path) -> Image.Image:
@@ -20,10 +23,12 @@ def load_image(path) -> Image.Image:
         return ImageOps.exif_transpose(image).convert("RGB")
 
 
-def preprocess_image(image: Image.Image, size: int = IMAGE_SIZE) -> torch.Tensor:
-    """PIL RGB -> (3, size, size) CLIP-normalised float tensor (bicubic, antialiased)."""
+def preprocess_image(image: Image.Image, size: int = IMAGE_SIZE,
+                     mean: tuple[float, float, float] = CLIP_MEAN,
+                     std: tuple[float, float, float] = CLIP_STD) -> torch.Tensor:
+    """PIL RGB -> (3, size, size) normalised float tensor (bicubic, antialiased)."""
     image = TF.resize(image, [size, size], interpolation=T.InterpolationMode.BICUBIC, antialias=True)
-    return TF.normalize(TF.to_tensor(image), CLIP_MEAN, CLIP_STD)  # (3, size, size)
+    return TF.normalize(TF.to_tensor(image), mean, std)  # (3, size, size)
 
 
 TEXT_MODES = ("question", "qa")
@@ -56,13 +61,16 @@ class VizWizGroundingDataset(Dataset):
     """
 
     def __init__(self, root, split: str, *, image_size: int = IMAGE_SIZE, native_mask: bool = False,
-                 text_mode: str = "question"):
+                 text_mode: str = "question", mean: tuple[float, float, float] = CLIP_MEAN,
+                 std: tuple[float, float, float] = CLIP_STD):
         if text_mode not in TEXT_MODES:
             raise ValueError(f"Unknown text_mode {text_mode!r}; use one of {TEXT_MODES}")
         self.root, self.split = Path(root), split
         self.records = json.loads((self.root / f"{split}_grounding.json").read_text(encoding="utf-8"))
         self.filenames = list(self.records)
         self.image_size = image_size
+        self.mean = mean
+        self.std = std
         self.native_mask = native_mask
         self.text_mode = text_mode
 
@@ -79,7 +87,7 @@ class VizWizGroundingDataset(Dataset):
             raise ValueError(f"Image and mask sizes differ for {filename}: {image.size} vs {mask.size}")
         size = [self.image_size, self.image_size]
         sample = {
-            "image": preprocess_image(image, self.image_size),  # (3, S, S)
+            "image": preprocess_image(image, self.image_size, self.mean, self.std),  # (3, S, S)
             "mask": (TF.to_tensor(TF.resize(mask, size, interpolation=T.InterpolationMode.NEAREST)) > 0.5).float(),  # (1, S, S)
             "text": model_text(self.records[filename], self.text_mode, filename),
             "filename": filename,
