@@ -76,22 +76,20 @@ class RN50Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "immutable"):
             ModelConfig(vision_backbone="clip-rn50", vision_revision="main")
 
-        # Exercise open_clip loader routing, URL hash check, and text weight conversion.
+        # Exercise open_clip + hf_hub_download loader routing and text weight conversion.
         dummy_clip = _DummyOpenCLIPModel().eval()
         fake_open_clip = types.ModuleType("open_clip")
-        fake_open_clip.pretrained = types.SimpleNamespace(
-            get_pretrained_url=MagicMock(return_value=f"https://openaipublic.azureedge.net/clip/models/{RN50_REVISION}/RN50.pt")
-        )
         fake_open_clip.create_model = MagicMock(return_value=dummy_clip)
         with (
             patch.dict(sys.modules, {"open_clip": fake_open_clip}),
+            patch("huggingface_hub.hf_hub_download", return_value="/tmp/open_clip_model.safetensors") as dl,
             patch("models.text_encoder.CLIPTokenizer.from_pretrained") as tokenizer,
         ):
             model = GroundingModel(config)
-        self.assertEqual(fake_open_clip.pretrained.get_pretrained_url.call_count, 2)
-        fake_open_clip.pretrained.get_pretrained_url.assert_called_with(RN50_NAME, "openai")
+        self.assertEqual(dl.call_count, 2)
+        dl.assert_called_with(RN50_NAME, "open_clip_model.safetensors", revision=RN50_REVISION)
         self.assertEqual(fake_open_clip.create_model.call_count, 2)
-        fake_open_clip.create_model.assert_called_with(RN50_NAME, pretrained="openai")
+        fake_open_clip.create_model.assert_called_with("RN50-quickgelu", pretrained="/tmp/open_clip_model.safetensors")
         tokenizer.assert_called_once_with(RN50_TOKENIZER_NAME, revision=RN50_TOKENIZER_REVISION)
         self.assertIsInstance(model.image_encoder.vision_encoder.attnpool, nn.Identity)
 
@@ -113,11 +111,6 @@ class RN50Tests(unittest.TestCase):
         with torch.no_grad():
             actual = hf_text(input_ids=input_ids).last_hidden_state
         torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
-
-        # Mismatched URL hash must fail.
-        fake_open_clip.pretrained.get_pretrained_url.return_value = "https://example.com/wrong/RN50.pt"
-        with patch.dict(sys.modules, {"open_clip": fake_open_clip}), self.assertRaisesRegex(ValueError, "Expected RN50 revision"):
-            GroundingModel(config)
 
     def test_pyramid_features_hierarchical_decoder_and_gradients(self):
         self.assertEqual(CLIP_MEAN, (0.48145466, 0.4578275, 0.40821073))

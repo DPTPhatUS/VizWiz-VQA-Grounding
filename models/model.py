@@ -14,8 +14,8 @@ from models.text_encoder import TextEncoder
 from utils import align_state_dict
 
 CLIP_NAME = "openai/clip-vit-large-patch14-336"
-RN50_NAME = "RN50-quickgelu"
-RN50_REVISION = "afeb0e10f9e5a86da6080e35cf09123aca3b358a0c3e3b6c78a7b63bc04b6762"
+RN50_NAME = "timm/resnet50_clip.openai"
+RN50_REVISION = "ec3d92cf63a5f9d591f0d611b736895966c73076"
 RN50_TOKENIZER_NAME = "openai/clip-vit-base-patch16"
 RN50_TOKENIZER_REVISION = "57c216476eefef5ab752ec549e440a49ae4ae5f3"
 TEXT_REVISION = "ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
@@ -52,10 +52,8 @@ class ModelConfig:
         if self.vision_revision != self.text_revision:
             raise ValueError("Vision/text encoder pair must share the same pretrained revision")
         for revision in (self.vision_revision, self.text_revision):
-            if revision is not None and (
-                len(revision) not in (40, 64) or any(c not in "0123456789abcdef" for c in revision)
-            ):
-                raise ValueError("Pretrained revisions must be immutable 40- or 64-character hex hashes")
+            if revision is not None and (len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision)):
+                raise ValueError("Pretrained revisions must be immutable 40-character commit hashes")
         if self.decoder not in {"fusion", "unet"}:
             raise ValueError(f"Unknown decoder {self.decoder!r}")
         if self.stage_attention and self.decoder != "fusion":

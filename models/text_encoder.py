@@ -55,12 +55,10 @@ def _open_clip_to_hf_text_model(clip_model) -> CLIPTextModel:
 
 def _load_rn50_text(model_name: str, *, revision: str | None = None) -> CLIPTextModel:
     import open_clip
+    from huggingface_hub import hf_hub_download
 
-    if revision is not None:
-        url = open_clip.pretrained.get_pretrained_url(model_name, "openai")
-        if not url or revision not in url:
-            raise ValueError(f"Expected RN50 revision {revision} in pretrained URL {url!r}")
-    return _open_clip_to_hf_text_model(open_clip.create_model(model_name, pretrained="openai"))
+    path = hf_hub_download(model_name, "open_clip_model.safetensors", revision=revision)
+    return _open_clip_to_hf_text_model(open_clip.create_model("RN50-quickgelu", pretrained=path))
 
 
 class TextEncoder(nn.Module):
@@ -77,7 +75,7 @@ class TextEncoder(nn.Module):
         options = {"revision": revision} if revision else {}
         if config is not None:
             self.model = CLIPTextModel(config)
-        elif model_name == "RN50-quickgelu":
+        elif model_name == "timm/resnet50_clip.openai":
             self.model = _load_rn50_text(model_name, revision=revision)
         else:
             self.model = CLIPTextModel.from_pretrained(model_name, **options)

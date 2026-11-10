@@ -20,11 +20,11 @@ Decoder (FusionDecoder, hierarchical skips):
 Loss: BCE + 0.5 · per-image soft Dice against the 336px training mask
 ```
 
-Both encoders load from OpenAI's official `RN50` checkpoint via `open_clip` (`RN50-quickgelu`, `pretrained="openai"`), pinned to its immutable SHA-256 revision `afeb0e10f9e5a86da6080e35cf09123aca3b358a0c3e3b6c78a7b63bc04b6762`. The BPE tokenizer is identical across OpenAI CLIP releases and is loaded from `openai/clip-vit-base-patch16` at revision `57c216476eefef5ab752ec549e440a49ae4ae5f3`. `models/image_encoder.py` extracts the `ModifiedResNet` visual trunk (`stem` and `layer1..4`, replacing the unused `attnpool` head with `nn.Identity()`), and `models/text_encoder.py` converts the paired 12-layer QuickGELU text transformer into `CLIPTextModel`.
+Both encoders load from OpenAI's official CLIP RN50 release packaged on Hugging Face Hub (`timm/resnet50_clip.openai`, `open_clip_model.safetensors`), pinned to its immutable 40-character commit `ec3d92cf63a5f9d591f0d611b736895966c73076`. The BPE tokenizer is identical across OpenAI CLIP releases and is loaded from `openai/clip-vit-base-patch16` at revision `57c216476eefef5ab752ec549e440a49ae4ae5f3`. `models/image_encoder.py` extracts the `ModifiedResNet` visual trunk (`stem` and `layer1..4`, replacing the unused `attnpool` head with `nn.Identity()`), and `models/text_encoder.py` converts the paired 12-layer QuickGELU text transformer into `CLIPTextModel`.
 
 Compared with primary ViT-L/14-336 B0, the vision backbone changes from a uniform `24x24` (`1024` ch) patch grid to a multiscale CNN pyramid (`84x84` `256` ch, `42x42` `512` ch, `21x21` `1024` ch, `10x10` `2048` ch). Instead of fusing all three skips at the bottleneck resolution, `FusionDecoder` upsamples the `10x10` bottleneck to `21x21` to fuse `s3`, then fuses `s2` at `42x42` (`128` ch) and `s1` at `84x84` (`64` ch) before question attention at `42x42`, `84x84` and `168x168`. Text width changes `768→512`; the learned cross-attention text projection becomes `512→2048` and each decoder stage's text projection accepts `512` channels. The decoder emits `336x336` logits rather than `384x384`; both paths resize logits to native dimensions for evaluation. Across-backbone scores compare complete pretrained encoder pairs, not image capacity alone.
 
-**Pass `--vision-backbone clip-rn50`.** Despite the retained CLI name, this selects the entire matching encoder pair. The default remains historical ViT-L B0 for backward compatibility. RN50 pins both encoders to the SHA-256 revision above; explicit `--vision-revision`/`--text-revision` must be identical immutable 40- or 64-character hex hashes. Checkpoints save both identities/revisions and reconstruct hierarchical skip fusion automatically. Historical B0 configs without the new fields retain their original path; mismatched-backbone resumes fail. Initialize from pretrained encoders and a new grounding head, never from a trained ViT-L or ViT-B/16 grounding checkpoint.
+**Pass `--vision-backbone clip-rn50`.** Despite the retained CLI name, this selects the entire matching encoder pair. The default remains historical ViT-L B0 for backward compatibility. RN50 pins both encoders to the commit hash above; explicit `--vision-revision`/`--text-revision` must be identical immutable 40-character commits. Checkpoints save both identities/revisions and reconstruct hierarchical skip fusion automatically. Historical B0 configs without the new fields retain their original path; mismatched-backbone resumes fail. Initialize from pretrained encoders and a new grounding head, never from a trained ViT-L or ViT-B/16 grounding checkpoint.
 
 ## Data
 
@@ -101,17 +101,14 @@ set -euo pipefail
 uv sync --frozen --quiet
 uv pip install -q --python /root/ocrg-rn50-venv wrapt hf_transfer open-clip-torch timm
 uv run --no-sync python - <<'PY'
-import open_clip
 from huggingface_hub import snapshot_download
 from models.model import RN50_NAME, RN50_REVISION, RN50_TOKENIZER_NAME, RN50_TOKENIZER_REVISION
-url = open_clip.pretrained.get_pretrained_url(RN50_NAME, 'openai')
-assert url and RN50_REVISION in url, url
-print(open_clip.pretrained.download_pretrained_from_url(url))
+print(snapshot_download(RN50_NAME, revision=RN50_REVISION, allow_patterns=['*.json', 'open_clip_model.safetensors']))
 print(snapshot_download(RN50_TOKENIZER_NAME, revision=RN50_TOKENIZER_REVISION, allow_patterns=['*.json', '*.txt']))
 PY
 ```
 
-The model and tokenizer are public; an `HF_TOKEN` environment variable is optional if you already use a Kaggle secret. One OpenAI `RN50.pt` file supplies both separately loaded vision and text encoders. CPU compatibility tests also cache the historical ViT-L tokenizer below; its model weights are not needed for RN50 training.
+The model and tokenizer are public; an `HF_TOKEN` environment variable is optional if you already use a Kaggle secret. One `timm/resnet50_clip.openai` snapshot (`open_clip_model.safetensors`) supplies both separately loaded vision and text encoders. CPU compatibility tests also cache the historical ViT-L tokenizer below; its model weights are not needed for RN50 training.
 
 ```python
 import hashlib, json, os, subprocess

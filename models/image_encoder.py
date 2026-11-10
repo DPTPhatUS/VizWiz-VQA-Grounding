@@ -55,12 +55,10 @@ class _TinyRN50Vision(nn.Module):
 
 def _load_rn50_vision(model_name: str, *, revision: str | None = None) -> nn.Module:
     import open_clip
+    from huggingface_hub import hf_hub_download
 
-    if revision is not None:
-        url = open_clip.pretrained.get_pretrained_url(model_name, "openai")
-        if not url or revision not in url:
-            raise ValueError(f"Expected RN50 revision {revision} in pretrained URL {url!r}")
-    return open_clip.create_model(model_name, pretrained="openai").visual
+    path = hf_hub_download(model_name, "open_clip_model.safetensors", revision=revision)
+    return open_clip.create_model("RN50-quickgelu", pretrained=path).visual
 
 
 class ImageEncoder(nn.Module):
