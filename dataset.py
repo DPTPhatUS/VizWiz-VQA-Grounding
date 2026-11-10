@@ -12,6 +12,7 @@ from torch.utils.data import Dataset
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 IMAGE_SIZE = 336  # CLIP ViT-L/14-336 input; the full frame is resized without keeping the aspect ratio
+CONVNEXT_IMAGE_SIZE = 384  # OpenCLIP ConvNeXt-Base input (divisible by stride 32 -> 96/48/24/12 pyramid)
 
 
 def load_image(path) -> Image.Image:

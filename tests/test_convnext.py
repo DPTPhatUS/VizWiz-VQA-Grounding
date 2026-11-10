@@ -21,7 +21,7 @@ from torch import nn
 
 import eval as evaluator
 import train
-from dataset import CLIP_MEAN, CLIP_STD
+from dataset import CLIP_MEAN, CLIP_STD, CONVNEXT_IMAGE_SIZE, IMAGE_SIZE
 from losses import segmentation_loss
 from models.image_encoder import TinyConvNeXtVisionConfig, _TinyConvNeXtVision
 from models.model import (
@@ -65,8 +65,11 @@ class ConvNeXtTests(unittest.TestCase):
         config = ModelConfig(vision_backbone="convnext-base")
         self.assertEqual((config.vision_name, config.clip_name), (CONVNEXT_NAME, CONVNEXT_NAME))
         self.assertEqual((config.vision_revision, config.text_revision), (CONVNEXT_REVISION, CONVNEXT_REVISION))
+        self.assertEqual(config.image_size, CONVNEXT_IMAGE_SIZE)
+        self.assertEqual(CONVNEXT_IMAGE_SIZE, 384)
         self.assertEqual(ModelConfig(**json.loads(json.dumps(config.to_dict()))), config)
         legacy = ModelConfig()
+        self.assertEqual(legacy.image_size, IMAGE_SIZE)
         old = {k: v for k, v in legacy.to_dict().items()
                if k not in ("vision_backbone", "vision_revision", "text_revision")}
         self.assertEqual(ModelConfig(**old), legacy)
@@ -123,11 +126,11 @@ class ConvNeXtTests(unittest.TestCase):
         self.assertIsInstance(model.image_encoder.vision_encoder.trunk.norm_pre, nn.Identity)
         self.assertIsInstance(model.image_encoder.vision_encoder.trunk.head, nn.Identity)
         self.assertIsInstance(model.image_encoder.vision_encoder.head, nn.Identity)
-        images = torch.randn(2, 3, 336, 336)
+        images = torch.randn(2, 3, 384, 384)
         features = model.image_encoder(images)
         self.assertEqual(
             [tuple(f.shape) for f in features],
-            [(2, 8, 84, 84), (2, 16, 42, 42), (2, 24, 21, 21), (2, 32, 10, 10)],
+            [(2, 8, 96, 96), (2, 16, 48, 48), (2, 24, 24, 24), (2, 32, 12, 12)],
         )
         self.assertIsInstance(model.text_proj, torch.nn.Linear)
         self.assertEqual((model.text_proj.in_features, model.text_proj.out_features), (16, 32))
@@ -143,8 +146,8 @@ class ConvNeXtTests(unittest.TestCase):
         logits = model(images, ["Q: what is this?", "Q: what text is on the box?"])
         for hook in hooks:
             hook.remove()
-        self.assertEqual(logits.shape, (2, 1, 336, 336))
-        self.assertEqual(stages, [(42, 42), (84, 84), (168, 168), (336, 336)])
+        self.assertEqual(logits.shape, (2, 1, 384, 384))
+        self.assertEqual(stages, [(48, 48), (96, 96), (192, 192), (384, 384)])
         segmentation_loss(logits, torch.ones_like(logits), 0.5).backward()
         for name, parameter in model.named_parameters():
             if parameter.requires_grad:
@@ -173,7 +176,7 @@ class ConvNeXtTests(unittest.TestCase):
             self.assertTrue(model.decoder.hierarchical_skips)
             with patch.object(model, "forward", wraps=model.forward) as forward:
                 self.assertEqual(model.predict(Image.new("RGB", (13, 9)), "What is this?").shape, (9, 13))
-                self.assertEqual(forward.call_args.args[0].shape, (1, 3, 336, 336))
+                self.assertEqual(forward.call_args.args[0].shape, (1, 3, 384, 384))
             evaluator.main(["--checkpoint", str(path), "--data-root", str(root), "--split", "val",
                             "--output-dir", str(out / "eval"), "--num-workers", "0", "--batch-size", "4", "--save-masks"])
             scores = json.loads((out / "eval/metrics.json").read_text())
