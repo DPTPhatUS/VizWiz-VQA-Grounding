@@ -191,11 +191,17 @@ class FusionDecoder(nn.Module):
     ATTENTION_STAGES = 3  # stages 1-3; the 384 px stage (16 channels) has none
 
     def __init__(self, in_channels: int = 1024, width: int = 256, stage_channels=(128, 64, 32, 16),
-                 text_dim: int = 768, stage_attention: bool = True):
+                 text_dim: int = 768, stage_attention: bool = True,
+                 skip_channels: tuple[int, int, int] | None = None):
         super().__init__()
+        self.hierarchical_skips = skip_channels is not None
+        target_widths = (width, stage_channels[0], stage_channels[1]) if self.hierarchical_skips else (width,) * 3
+        in_skips = (skip_channels[2], skip_channels[1], skip_channels[0]) if self.hierarchical_skips else (in_channels,) * 3
         self.input_proj = nn.Conv2d(in_channels, width, 1)
-        self.skip_proj = nn.ModuleList(nn.Conv2d(in_channels, width, 1) for _ in range(3))
-        self.fusion = nn.ModuleList(Bottleneck(width) for _ in range(3))
+        self.skip_proj = nn.ModuleList(
+            nn.Conv2d(c_in, c_out, 1) for c_in, c_out in zip(in_skips, target_widths, strict=True)
+        )
+        self.fusion = nn.ModuleList(Bottleneck(c_out) for c_out in target_widths)
         channels = (width, *stage_channels)
         self.stages = nn.ModuleList(
             nn.Sequential(conv_gn_gelu(c_in, c_out, 3), conv_gn_gelu(c_out, c_out, 3))
@@ -207,15 +213,30 @@ class FusionDecoder(nn.Module):
 
     def forward(self, fused: torch.Tensor, s1: torch.Tensor, s2: torch.Tensor, s3: torch.Tensor,
                 tokens: torch.Tensor | None = None, padding: torch.Tensor | None = None) -> torch.Tensor:
-        """fused, s1, s2, s3: (B, D_v, H_p, W_p); tokens (B, L, D_t) and padding (B, L) are required
-        with stage attention -> logits (B, 1, 16*H_p, 16*W_p)."""
+        """fused, s1, s2, s3: (B, D_v, H_p, W_p) or CNN pyramid; tokens (B, L, D_t) and padding (B, L) are
+        required with stage attention -> logits (B, 1, H_out, W_out)."""
         if self.stage_attention is not None and (tokens is None or padding is None):
             raise ValueError("Stage attention needs the question tokens and their padding mask")
         x = self.input_proj(fused)  # (B, W, H_p, W_p)
-        for proj, block, skip in zip(self.skip_proj, self.fusion, (s3, s2, s1), strict=True):  # deepest first
-            x = x + block(x + proj(skip))  # (B, W, H_p, W_p)
+        if not self.hierarchical_skips:
+            for proj, block, skip in zip(self.skip_proj, self.fusion, (s3, s2, s1), strict=True):  # deepest first
+                x = x + block(x + proj(skip))  # (B, W, H_p, W_p)
+            for i, stage in enumerate(self.stages):
+                x = stage(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False))  # 2x per stage
+                if self.stage_attention is not None and i < len(self.stage_attention):
+                    x = self.stage_attention[i](x, tokens, padding)
+            return self.head(x)  # (B, 1, 16*H_p, 16*W_p)
+
+        x = F.interpolate(x, size=s3.shape[-2:], mode="bilinear", align_corners=False)  # (B, W, H_3, W_3)
+        x = x + self.fusion[0](x + self.skip_proj[0](s3))  # (B, W, H_3, W_3)
+        stage_skips = (s2, s1)
         for i, stage in enumerate(self.stages):
-            x = stage(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False))  # 2x per stage
+            if i < len(stage_skips):
+                skip = stage_skips[i]
+                x = stage(F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False))
+                x = x + self.fusion[i + 1](x + self.skip_proj[i + 1](skip))
+            else:
+                x = stage(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False))
             if self.stage_attention is not None and i < len(self.stage_attention):
                 x = self.stage_attention[i](x, tokens, padding)
-        return self.head(x)  # (B, 1, 16*H_p, 16*W_p)
+        return self.head(x)

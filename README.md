@@ -1,216 +1,258 @@
-# VizWiz-VQA-Grounding: OCR evidence grounding (`ocrg/main`)
+# VizWiz-VQA-Grounding: CLIP RN50 baseline (`ocrg/exp-backbone-clip-rn50`)
 
-Question-only answer grounding on [VizWiz-VQA-Grounding](https://vizwiz.org/tasks-and-datasets/answer-grounding-for-vqa/): given a photo and a question, predict the mask of the image region that supports the answer. The model never sees the answer. This branch holds the no-OCR baseline **B0**; OCR models are built on top of it. Research decisions are logged in the project's decision log (D016, D017).
+Question-only answer grounding on [VizWiz-VQA-Grounding](https://vizwiz.org/tasks-and-datasets/answer-grounding-for-vqa/): given a photo and a question, predict the mask of the image region that supports the answer. The model never sees the answer. This branch replaces the `ocrg/main` backbone with the **paired CLIP RN50 vision and text encoders**. Text stays frozen; vision is fine-tuned. Learned text projection, three hierarchical skips, FusionDecoder structure, loss and native-resolution evaluation are retained. No OCR or B1/H1/H2 modules are used.
 
-## B0
+## B0 with CLIP RN50
 
 ```
-images 336x336 ─ CLIP ViT-L/14-336 (fine-tuned) ─ skips: blocks 4, 7, 9 ; last block V      (all 24x24, 1024 ch)
-question ─ CLIP text encoder (frozen) ─ tokens T ─ Linear 768→1024
-F = V + α · MHA(query=V, key=T, value=T)                      α learnable, init 0.01
-Decoder (FusionDecoder):
-  x = Conv1x1(F) → 256;  x ← x + Bottleneck(x + Conv1x1(s_j))  for j = 3, 2, 1   (24x24; last GN starts at 0)
-  4 × [bilinear ×2 → (Conv3x3 → GroupNorm → GELU) × 2]: 256→128→64→32→16, 24→384 px
-    stages 48², 96², 192² then: x ← x + γ_s · MHA(GN(x), T, T)    (T projected per stage; 4/2/1 heads of 32; γ_s init 0)
-  Conv1x1 → 1 logit map (384x384)
-Loss: BCE + 0.5 · per-image soft Dice, on logits resized to the 336 px training mask
+images 336x336 ─ CLIP RN50 ModifiedResNet (fine-tuned)
+  stem (84x84, 64 ch) → s1=layer1 (84x84, 256 ch) → s2=layer2 (42x42, 512 ch)
+                      → s3=layer3 (21x21, 1024 ch) → V=layer4 (10x10, 2048 ch)
+question ─ paired CLIP RN50 text encoder (frozen) ─ tokens T ─ Linear 512→2048
+F = V + α · MHA(query=V, key=T, value=T)                      α init 0.01; 8 heads
+Decoder (FusionDecoder, hierarchical skips):
+  x = Conv1x1(F) → 256 (10x10) → bilinear to 21x21; x ← x + Bottleneck_256(x + Conv1x1_1024→256(s3))
+  stage 0: bilinear to 42x42 → ConvBlock 256→128 → fuse s2 (512→128) → question attention (γ init 0)
+  stage 1: bilinear to 84x84 → ConvBlock 128→64  → fuse s1 (256→64)  → question attention (γ init 0)
+  stage 2: bilinear ×2 (168x168) → ConvBlock 64→32                   → question attention (γ init 0)
+  stage 3: bilinear ×2 (336x336) → ConvBlock 32→16
+  Conv1x1 → 1 logit map (336x336)
+Loss: BCE + 0.5 · per-image soft Dice against the 336px training mask
 ```
 
-Trainable: 310.6M (vision encoder 303.5M, attention 5.0M, decoder 2.11M of which stage attention 0.26M); text encoder 123.1M frozen. `--no-stage-attention` builds the decoder without the stage attentions (identical to B0 at initialisation, since every γ_s starts at 0). The upstream architecture remains available with `--decoder unet --no-attention-residual --no-stage-attention`.
+Both encoders load from OpenAI's official `RN50` checkpoint via `open_clip` (`RN50-quickgelu`, `pretrained="openai"`), pinned to its immutable SHA-256 revision `afeb0e10f9e5a86da6080e35cf09123aca3b358a0c3e3b6c78a7b63bc04b6762`. The BPE tokenizer is identical across OpenAI CLIP releases and is loaded from `openai/clip-vit-base-patch16` at revision `57c216476eefef5ab752ec549e440a49ae4ae5f3`. `models/image_encoder.py` extracts the `ModifiedResNet` visual trunk (`stem` and `layer1..4`, replacing the unused `attnpool` head with `nn.Identity()`), and `models/text_encoder.py` converts the paired 12-layer QuickGELU text transformer into `CLIPTextModel`.
+
+Compared with primary ViT-L/14-336 B0, the vision backbone changes from a uniform `24x24` (`1024` ch) patch grid to a multiscale CNN pyramid (`84x84` `256` ch, `42x42` `512` ch, `21x21` `1024` ch, `10x10` `2048` ch). Instead of fusing all three skips at the bottleneck resolution, `FusionDecoder` upsamples the `10x10` bottleneck to `21x21` to fuse `s3`, then fuses `s2` at `42x42` (`128` ch) and `s1` at `84x84` (`64` ch) before question attention at `42x42`, `84x84` and `168x168`. Text width changes `768→512`; the learned cross-attention text projection becomes `512→2048` and each decoder stage's text projection accepts `512` channels. The decoder emits `336x336` logits rather than `384x384`; both paths resize logits to native dimensions for evaluation. Across-backbone scores compare complete pretrained encoder pairs, not image capacity alone.
+
+**Pass `--vision-backbone clip-rn50`.** Despite the retained CLI name, this selects the entire matching encoder pair. The default remains historical ViT-L B0 for backward compatibility. RN50 pins both encoders to the SHA-256 revision above; explicit `--vision-revision`/`--text-revision` must be identical immutable 40- or 64-character hex hashes. Checkpoints save both identities/revisions and reconstruct hierarchical skip fusion automatically. Historical B0 configs without the new fields retain their original path; mismatched-backbone resumes fail. Initialize from pretrained encoders and a new grounding head, never from a trained ViT-L or ViT-B/16 grounding checkpoint.
 
 ## Data
 
-Point `--data-root` at a folder with `{train,val,test}_grounding.json`, `{train,val,test}/` images and `binary_masks_png/{train,val,test}/`. Images are EXIF-rotated, resized to 336×336 without keeping the aspect ratio (bicubic, antialiased) and CLIP-normalised; training masks use nearest resizing (no mask loses its foreground at 336 px). By default only the question is read (the task input). `--text-mode qa` also feeds the most common answer (`Q: … A: …`) for ablations only: it is recorded in the recipe, `eval.py` follows the checkpoint's mode unless `--text-mode` overrides it (e.g. a qa-trained model scored with the question only), results report `answer_in_input`, and qa mode fails on records without an answer (the test split). A missing or misaligned mask is an error.
+Point `--data-root` at a folder containing `{train,val}_grounding.json`, `{train,val}/` and `binary_masks_png/{train,val}/`. Full-frame images are EXIF-rotated, resized to 336x336 (bicubic, antialiased, without preserving aspect ratio), and CLIP-normalised (`mean=(0.48145466, 0.4578275, 0.40821073)`, `std=(0.26862954, 0.26130258, 0.27577711)`). Masks use nearest resizing. Question-only prompts and split membership remain unchanged. The optional `--text-mode qa` feeds the gold answer and is an ablation, not this baseline. Missing or misaligned masks fail.
 
 ## Train
 
 ```bash
-torchrun --nproc_per_node 2 train.py --data-root DATA --output-dir OUT --num-epochs 20 --batch-size 8 \
+torchrun --nproc_per_node 2 train.py --vision-backbone clip-rn50 \
+  --data-root DATA --output-dir OUT --num-epochs 20 --batch-size 8 \
   --dice-weight 0.5 --freeze-text-encoder --no-freeze-vision-encoder \
   --optimizer adamw --weight-decay 0.05 --lr 1e-4 --backbone-lr 1e-5 --lr-scheduler cosine --warmup-ratio 0.05 \
   --grad-clip-norm 1.0 --validate-every 2 --save-every 10 \
-  --expect dice_weight=0.5 --expect freeze_text_encoder=true --expect stage_attention=true --expect optimizer=adamw
+  --expect vision_backbone=clip-rn50 --expect freeze_text_encoder=true --expect optimizer=adamw
 ```
 
-- This is the B0 recipe (decision D017): AdamW (no decay on norms, biases, embeddings, α, γ), learning rate 1e-4 for new layers and 1e-5 for the vision encoder, cosine schedule with 5% warmup, gradient clipping 1.0. Without these flags the defaults are Adam at 1e-5, constant. `--batch-size` is global (split across GPUs); training uses FP16 autocast.
-- `--expect KEY=VALUE` stops before training if the resolved recipe differs. Resuming (`--resume-checkpoint`) refuses a checkpoint with a different recipe or architecture.
-- Outputs: `run_config_from_epoch<E>.json`, `history.jsonl` (loss, learning rate, seconds, seconds waiting for data), `val_curve.jsonl` (validation mIoU) and `checkpoint_epoch<E>.pt` (every `--save-every` epochs and always at the last epoch; written atomically). Checkpoints store the architecture and the recipe.
+- This retains the original B0 recipe: 20 epochs, AdamW, no decay on norms/biases/embeddings/α/γ, head LR 1e-4, vision LR 1e-5, cosine with 5% warmup and clipping 1.0. Under multi-GPU DDP (`world_size > 1`), `train.py` converts RN50's `BatchNorm2d` layers to `SyncBatchNorm`.
+- Global batch 8 means 4 per GPU on two GPUs; epoch validation also uses 4 per GPU. Training uses FP16 autocast; validation uses FP32 without gradients.
+- Use a fresh output directory per seed. Keep configs, history, the complete validation curve and full-state checkpoints 10/20. Select only between saved 10/20 on validation, not an unsaved epoch. Checkpoints include optimizer/scaler/scheduler state and are written atomically.
 
 ## Evaluate
 
-For a new Kaggle notebook exporting native validation masks for B0 seeds 41/42/43, follow [the validation-mask export guide](docs/kaggle_b0_mask_export.md). It supports one or two GPUs and verifies exports against the original validation metrics.
-
 ```bash
-uv run eval.py --checkpoint OUT/checkpoint_epoch20.pt --split val --data-root DATA --output-dir OUT/eval_val_ep20
-torchrun --nproc_per_node 2 eval.py ...   # same result, images split across GPUs
+uv run --no-sync python eval.py --checkpoint OUT/checkpoint_epoch20.pt --split val \
+  --data-root DATA --output-dir OUT/eval_val_ep20 --batch-size 4 --save-masks
 ```
 
-Metric: logits resized bilinearly to each image's native resolution, thresholded at 0, per-image IoU (two empty masks score 1), averaged over images. Validation during training uses the same code, so the logged validation mIoU equals `eval.py` on the saved checkpoint. Writes `metrics.json` (`summary`, `per_sample`); `--save-masks` also saves the predicted masks. Existing results are never overwritten. Choose checkpoints on validation only.
+Use `torchrun --nproc_per_node 2 eval.py …` to shard validation across GPUs. Evaluation batch size is per GPU. Every image is scored exactly once: bilinear resize of logits to native dimensions, threshold 0, per-image IoU (two empty masks score 1), then mean over images. Training validation and standalone evaluation use the same function. Existing evaluation metrics are never overwritten. No test evaluation is needed.
+
+The historical B0 source manifest/exporter remains unchanged and **intentionally rejects this branch**. Export original ViT-L B0 masks from `ocrg/main` using [its guide](https://github.com/DPTPhatUS/VizWiz-VQA-Grounding/blob/ocrg/main/docs/kaggle_b0_mask_export.md); do not weaken its source guard.
 
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -p "test_*.py"
+MPLBACKEND=Agg CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-Offline (tiny random encoders, cached CLIP tokenizer), including two-process CPU runs of training and evaluation.
+Tiny random encoders and the cached BPE and historical ViT-L tokenizers exercise B0 compatibility, RN50 pyramid shapes, hierarchical skip fusion, `open_clip` text conversion, gradients, checkpoint reconstruction, native masks, `predict()` and two-process CPU training. Cache the paired snapshot in Cell 1 and historical tokenizer in Cell 2 before offline tests. These are software checks, not pretrained accuracy or GPU-runtime measurements.
 
 ## Origin
 
-Research fork of [yjh9929/VizWiz-VQA-Grounding](https://github.com/yjh9929/VizWiz-VQA-Grounding) (CVPR 2025 VizWiz workshop spotlight), via `exp/baseline-fixes`. Licensed under [Creative Commons Attribution 4.0 International](http://creativecommons.org/licenses/by/4.0/).
+Research fork of [yjh9929/VizWiz-VQA-Grounding](https://github.com/yjh9929/VizWiz-VQA-Grounding), via `exp/baseline-fixes` and `ocrg/main`. Licensed under [Creative Commons Attribution 4.0 International](http://creativecommons.org/licenses/by/4.0/).
 
-## Kaggle: B0, seed 42 (first run)
+## Kaggle: CLIP RN50 B0, seed 42 (first run)
 
-Enable Internet and **two T4 GPUs**. Attach the VizWiz dataset (`vizwiz-vqa-grounding`). Run the cells in order. Every cell stops loudly when something is wrong; send its output instead of working around it. The recipe is decision D017 in the project log.
+Enable Internet and **two T4 GPUs**. Attach `phtphantun/vizwiz-vqa-grounding`. No B0 checkpoint or OCR Input is required. Run cells in order; every shell cell stops on failure. This branch must be pushed before Kaggle can clone it.
 
-| Cell | What | Time (estimate) |
-|---|---|---|
-| 1 | Setup: clone `ocrg/main`, install, fast HF download, cache CLIP, check GPUs and data | ~5 min |
-| 2 | Offline tests | ~2 min |
-| 3 | Memory probe: 4 images per GPU fit? Speed? | ~5 min |
-| 4 | Train B0 (20 epochs) | from Cell 3's estimate |
-| 5 | Evaluate epochs 10 and 20 on val and test | ~20 min |
-| Z | ZIP the results (no checkpoints) | ~1 min |
+| Cell | What |
+|---|---|
+| 1 | Clone this branch, install, cache pinned CLIP RN50 weights and tokenizer, check data/GPUs |
+| 2 | Offline CPU tests |
+| 3 | Optional memory/speed check |
+| 4 | Train the 20-epoch baseline |
+| 5 | Export validation masks at 10/20 and verify results |
+| Z | ZIP results without weights; retain checkpoints separately |
 
 ### Cell 1: setup
 
 ```python
-!git clone --depth 1 --single-branch --branch ocrg/main https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
+!git clone --depth 1 --single-branch --branch ocrg/exp-backbone-clip-rn50 https://github.com/DPTPhatUS/VizWiz-VQA-Grounding.git
 %cd /kaggle/working/VizWiz-VQA-Grounding
 !git log --oneline -1
-%env UV_PROJECT_ENVIRONMENT=/root/ocrg-venv
-!uv sync --frozen --quiet
+%env UV_PROJECT_ENVIRONMENT=/root/ocrg-rn50-venv
+%env OMP_NUM_THREADS=1
+%env MKL_NUM_THREADS=1
+%env MPLBACKEND=Agg
 ```
 
-`UV_PROJECT_ENVIRONMENT` puts the virtual environment (several GB with CUDA torch) outside `/kaggle/working`, keeping the 20 GB working disk for checkpoints; every later `uv run` uses it. It is rebuilt in each new session (rerun Cell 1, e.g. after a resume).
+The environment stays outside the 20GB working disk. Install Kaggle's required `wrapt` plus `open-clip-torch` and `timm` in that environment without changing the lockfile, and use `uv run --no-sync` in subsequent cells so `uv` keeps those extra packages installed:
 
-Extra packages (run this cell). `wrapt` is required on Kaggle: its `sitecustomize` imports it in every Python process, and without it each process prints `ModuleNotFoundError: No module named 'wrapt'`. `--python` targets the environment set by `UV_PROJECT_ENVIRONMENT` (plain `uv pip install` would install into `./.venv`). `hf_transfer` and `HF_TOKEN` (a Kaggle secret) speed up Hugging Face downloads. `uv pip install` adds the packages to the environment without editing `pyproject.toml` or `uv.lock`, so the checkout stays at the recorded commit (`uv add` would change both files):
-
-```python
-!uv pip install -q --python /root/ocrg-venv wrapt hf_transfer
-%env HF_HUB_ENABLE_HF_TRANSFER=1
-%env HF_XET_HIGH_PERFORMANCE=1
-
-import os
-from kaggle_secrets import UserSecretsClient
-os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+```bash
+%%bash
+set -euo pipefail
+uv sync --frozen --quiet
+uv pip install -q --python /root/ocrg-rn50-venv wrapt hf_transfer open-clip-torch timm
+uv run --no-sync python - <<'PY'
+import open_clip
+from huggingface_hub import snapshot_download
+from models.model import RN50_NAME, RN50_REVISION, RN50_TOKENIZER_NAME, RN50_TOKENIZER_REVISION
+url = open_clip.pretrained.get_pretrained_url(RN50_NAME, 'openai')
+assert url and RN50_REVISION in url, url
+print(open_clip.pretrained.download_pretrained_from_url(url))
+print(snapshot_download(RN50_TOKENIZER_NAME, revision=RN50_TOKENIZER_REVISION, allow_patterns=['*.json', '*.txt']))
+PY
 ```
 
-Download CLIP once (~1.7 GB). Every later cell starts two processes that load the model; with the cache filled they read it from disk instead of the network:
+The model and tokenizer are public; an `HF_TOKEN` environment variable is optional if you already use a Kaggle secret. One OpenAI `RN50.pt` file supplies both separately loaded vision and text encoders. CPU compatibility tests also cache the historical ViT-L tokenizer below; its model weights are not needed for RN50 training.
 
 ```python
-!uv run --frozen python -c "from huggingface_hub import snapshot_download; print(snapshot_download('openai/clip-vit-large-patch14-336', allow_patterns=['*.json', '*.txt', 'pytorch_model.bin']))"
-```
-
-```python
-import json, os, subprocess
+import hashlib, json, os, subprocess
 from pathlib import Path
-
+assert subprocess.check_output(['git', 'branch', '--show-current'], text=True).strip() == 'ocrg/exp-backbone-clip-rn50'
+assert not subprocess.check_output(['git', 'status', '--porcelain'], text=True).strip(), 'Use a clean checkout'
 os.environ['DATA_ROOT'] = '/kaggle/input/datasets/phtphantun/vizwiz-vqa-grounding/vizwiz'
-os.environ['RUN_NAME'] = 'ocrg_b0_s42'
-os.environ['OUT'] = f"outputs/{os.environ['RUN_NAME']}"
-os.environ['OMP_NUM_THREADS'] = '1'
-
+os.environ['RUN_NAME'] = 'ocrg_b0_rn50_336_s42'
+os.environ['OUT'] = f"/kaggle/working/outputs/{os.environ['RUN_NAME']}"
+os.environ['BATCH'] = '8'
+os.environ['SEED'] = '42'
 data = Path(os.environ['DATA_ROOT'])
-for split, n in (('train', 6494), ('val', 1131), ('test', 2373)):
+for split, n in (('train', 6494), ('val', 1131)):
     records = json.loads((data / f'{split}_grounding.json').read_text())
-    masks = len(list((data / 'binary_masks_png' / split).glob('*.png')))
-    assert len(records) == n and masks == n, (split, len(records), masks)
-print(subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv'], capture_output=True, text=True).stdout)
-assert not Path(os.environ['OUT']).exists(), 'Output folder exists: choose a new RUN_NAME'
+    assert len(records) == n, (split, len(records))
+    assert all((data / split / name).is_file() and
+               (data / 'binary_masks_png' / split / (Path(name).stem + '.png')).is_file() for name in records)
+gpu = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader'],
+                     check=True, capture_output=True, text=True)
+print(gpu.stdout)
+assert len(gpu.stdout.strip().splitlines()) == 2, 'Enable two GPUs'
+assert not Path(os.environ['OUT']).exists(), 'Choose a fresh RUN_NAME'
 ```
+
+If the Input mount differs, change only `DATA_ROOT` to the folder containing `train_grounding.json`. No WSL or ignored `personal/` file is required.
 
 ### Cell 2: offline tests
 
-Downloads the CLIP tokenizer once, then runs the 24 tests (tiny random models, including a two-process run).
-
 ```bash
 %%bash
-uv run --frozen python -c "from transformers import CLIPTokenizer; CLIPTokenizer.from_pretrained('openai/clip-vit-large-patch14-336')"
-HF_HUB_OFFLINE=1 uv run --frozen python -m unittest discover -s tests -p "test_*.py" 2>&1 | tail -5
+set -euo pipefail
+uv run --no-sync python -c "from transformers import CLIPTokenizer; CLIPTokenizer.from_pretrained('openai/clip-vit-large-patch14-336')"
+MPLBACKEND=Agg CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 uv run --no-sync python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-The last line must be `OK`.
+The last line must be `OK`. Do not continue after a failing cell.
 
-### Cell 3: memory probe
+### Cell 3: optional memory/speed check
 
-All cells use `--num-workers 2` (per GPU process): 2 processes × 2 workers match the 4 CPU cores of a Kaggle 2×T4 session. Workers change speed only, not results (no random augmentation; shuffling uses the seeded sampler). Keep the probe and training on the same value so the time estimate holds.
-
-Runs the real B0 training path (both GPUs, real data, mixed precision, full optimiser) for 30 steps with 4 images per GPU, then reports peak memory and speed. No checkpoint is written.
+This runs 30 updates through the real training path and writes `probe.json`, without checkpoints or validation. It is optional and does not establish accuracy. Keep batch 8 for matched comparisons; report an OOM before changing the recipe.
 
 ```bash
 %%bash
-uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
-  --data-root "$DATA_ROOT" --output-dir outputs/probe_bs8 --batch-size 8 --num-workers 2 --max-steps 30 \
+set -euo pipefail
+test ! -e /kaggle/working/outputs/probe_rn50_bs8
+uv run --no-sync torchrun --standalone --nproc_per_node=2 train.py --vision-backbone clip-rn50 \
+  --data-root "$DATA_ROOT" --output-dir /kaggle/working/outputs/probe_rn50_bs8 --batch-size "$BATCH" --num-workers 2 --max-steps 30 \
   --dice-weight 0.5 --freeze-text-encoder --no-freeze-vision-encoder \
   --optimizer adamw --weight-decay 0.05 --lr 1e-4 --backbone-lr 1e-5 --lr-scheduler cosine --warmup-ratio 0.05 \
-  --grad-clip-norm 1.0 2>&1 | grep -E "Probe:|Error|error" 
+  --grad-clip-norm 1.0 --seed "$SEED" --expect vision_backbone=clip-rn50
 ```
-
-```python
-probe = json.loads(Path('outputs/probe_bs8/probe.json').read_text())
-peak, total = max(probe['peak_memory_gib_per_gpu']), probe['gpu_memory_gib']
-steps_per_epoch = 6494 // 8 + (6494 % 8 > 0)
-hours = probe['seconds_per_step'] * steps_per_epoch * 20 / 3600
-print(f'peak {peak:.1f} of {total:.1f} GiB per GPU; {probe["seconds_per_step"]:.2f} s/step; '
-      f'data wait {probe["data_wait_seconds"]:.0f} s of {probe["seconds"]:.0f} s; training ~{hours:.1f} h + validation')
-os.environ['BATCH'] = '8' if peak <= total - 1.0 else '4'
-print('Use batch size', os.environ['BATCH'])
-```
-
-- **Out-of-memory error, or `Use batch size 4`:** rerun the probe with `--batch-size 4 --output-dir outputs/probe_bs4`, then set `os.environ['BATCH'] = '4'`.
-- **Training estimate above ~10.5 h:** the run will not fit in one 12-hour session. Run Cell 4 anyway; it saves a checkpoint at epoch 10, and the resume note below continues from there.
-- **Send the printed line in any case:** the speed and data-wait numbers go into the decision log.
 
 ### Cell 4: train B0
 
 ```bash
 %%bash
-uv run --frozen torchrun --standalone --nproc_per_node=2 train.py \
+set -euo pipefail
+test ! -e "$OUT"
+uv run --no-sync torchrun --standalone --nproc_per_node=2 train.py --vision-backbone clip-rn50 \
   --data-root "$DATA_ROOT" --output-dir "$OUT" --num-epochs 20 --batch-size "$BATCH" --num-workers 2 \
   --dice-weight 0.5 --freeze-text-encoder --no-freeze-vision-encoder \
   --optimizer adamw --weight-decay 0.05 --lr 1e-4 --backbone-lr 1e-5 --lr-scheduler cosine --warmup-ratio 0.05 \
-  --grad-clip-norm 1.0 --validate-every 2 --save-every 10 --seed 42 \
-  --expect text_mode=question --expect dice_weight=0.5 --expect freeze_text_encoder=true \
-  --expect freeze_vision_encoder=false --expect optimizer=adamw --expect lr_scheduler=cosine \
-  --expect decoder=fusion --expect attention_residual=true --expect stage_attention=true \
-  --expect grad_clip_norm=1.0 --expect world_size=2 2>&1 | grep -v "it/s\]"
+  --grad-clip-norm 1.0 --validate-every 2 --save-every 10 --seed "$SEED" \
+  --expect vision_backbone=clip-rn50 --expect text_mode=question --expect dice_weight=0.5 \
+  --expect freeze_text_encoder=true --expect freeze_vision_encoder=false --expect optimizer=adamw \
+  --expect lr_scheduler=cosine --expect decoder=fusion --expect attention_residual=true \
+  --expect stage_attention=true --expect grad_clip_norm=1.0 --expect world_size=2
 ```
 
-Progress: one line per epoch (loss, seconds, seconds waiting for data) and validation mIoU every 2 epochs. Checkpoints (about 4 GB each) are written at epochs 10 and 20.
+Progress: loss/timing each epoch, validation every 2 epochs, checkpoints 10/20. For seeds 41/43, choose a new `RUN_NAME`/`OUT` and matching `SEED`; keep the recipe fixed. If interrupted, persist the checkpoint and attach it to a new session. Use a fresh output directory and add `--resume-checkpoint /kaggle/input/<attached-output>/.../checkpoint_epoch10.pt` to Cell 4 with identical recipe flags. Optimizer/scaler/scheduler resume checks remain in force.
 
-**If the session ends before epoch 20:**
-1. Keep `checkpoint_epoch10.pt`: save the notebook version with its output, and attach that output to a new session.
-2. Rerun Cells 1–2.
-3. Run Cell 4 again with `--resume-checkpoint /kaggle/input/<attached output>/.../checkpoint_epoch10.pt` added. Everything else stays identical; the run refuses to resume if anything in the recipe differs.
+### Cell 5: validation masks
 
-### Cell 5: evaluate
-
-Validation chooses between epochs 10 and 20; test is reported for both but chooses nothing.
+Validation chooses between saved 10/20; no test split is accessed.
 
 ```bash
 %%bash
+set -euo pipefail
 for ep in 10 20; do
-  for split in val test; do
-    uv run --frozen torchrun --standalone --nproc_per_node=2 eval.py --checkpoint "$OUT/checkpoint_epoch${ep}.pt" \
-      --split "$split" --data-root "$DATA_ROOT" --output-dir "$OUT/eval_${split}_ep${ep}" --batch-size 8 --num-workers 2 \
-      2>&1 | grep "mean IoU"
-  done
+  uv run --no-sync torchrun --standalone --nproc_per_node=2 eval.py \
+    --checkpoint "$OUT/checkpoint_epoch${ep}.pt" --split val --data-root "$DATA_ROOT" \
+    --output-dir "$OUT/eval_val_ep${ep}" --batch-size 4 --num-workers 2 --save-masks
 done
+```
+
+```python
+from PIL import Image, ImageOps
+out = Path(os.environ['OUT'])
+records = json.loads((data / 'val_grounding.json').read_text())
+curve = {r['epoch']: r['val_miou'] for r in map(json.loads, (out / 'val_curve.jsonl').read_text().splitlines())}
+for ep in (10, 20):
+    folder = out / f'eval_val_ep{ep}'
+    metrics = json.loads((folder / 'metrics.json').read_text())
+    assert metrics['summary']['split'] == 'val'
+    assert metrics['summary']['model_config']['vision_backbone'] == 'clip-rn50'
+    assert len(metrics['per_sample']) == 1131 and set(metrics['per_sample']) == set(records)
+    assert abs(metrics['summary']['mean_iou'] - curve[ep]) < 1e-6
+    assert len(list((folder / 'masks').glob('*.png'))) == 1131
+    for name in records:
+        with Image.open(data / 'val' / name) as image, Image.open(folder / 'masks' / (Path(name).stem + '.png')) as mask:
+            assert mask.size == ImageOps.exif_transpose(image).size, name
+    print(ep, metrics['summary']['mean_iou'], '1131 native masks verified')
 ```
 
 ### Cell Z: ZIP results (no checkpoints)
 
 ```python
 from zipfile import ZIP_DEFLATED, ZipFile
-
+out = Path(os.environ['OUT'])
+def sha256(path):
+    h = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(2**20), b''):
+            h.update(block)
+    return h.hexdigest()
+provenance = out / 'artifact_provenance.json'
+assert not provenance.exists(), 'Provenance already exists'
+info = {
+    'git': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+    'git_status': subprocess.check_output(['git', 'status', '--porcelain'], text=True),
+    'annotations': {s: sha256(data / f'{s}_grounding.json') for s in ('train', 'val')},
+    'checkpoints': {p.name: sha256(p) for p in sorted(out.glob('checkpoint_epoch*.pt'))},
+}
+assert set(info['checkpoints']) == {'checkpoint_epoch10.pt', 'checkpoint_epoch20.pt'}
+provenance.write_text(json.dumps(info, indent=2))
 archive = Path('/kaggle/working') / f"{os.environ['RUN_NAME']}.zip"
-with ZipFile(archive, 'w', compression=ZIP_DEFLATED) as bundle:
-    for root in (Path(os.environ['OUT']), Path('outputs/probe_bs8'), Path('outputs/probe_bs4')):
-        for path in sorted(root.rglob('*')) if root.exists() else []:
-            if path.is_file() and path.suffix.lower() not in {'.pt', '.tmp', '.zip'}:
-                bundle.write(path, path.relative_to('outputs'))
-print('Download:', archive)
+members = {}
+with ZipFile(archive, 'x', compression=ZIP_DEFLATED) as bundle:
+    for path in sorted(out.rglob('*')):
+        if path.is_file() and path.suffix.lower() not in {'.pt', '.tmp', '.zip'}:
+            name = str(path.relative_to(out.parent))
+            members[name] = sha256(path)
+            bundle.write(path, name)
+with ZipFile(archive) as bundle:
+    assert bundle.testzip() is None
+    for name, expected in members.items():
+        assert hashlib.sha256(bundle.read(name)).hexdigest() == expected, name
+print('Verified ZIP:', archive)
+print('ZIP SHA256:', sha256(archive))
+with Path(str(archive) + '.sha256').open('x') as checksum:
+    checksum.write(sha256(archive) + '  ' + archive.name + '\n')
 ```
 
-Send `ocrg_b0_s42.zip`. It holds the run config, history, validation curve, `probe.json` and the four `metrics.json` files, and is analysed read-only.
+Persist the notebook outputs before ending the session. Use **Save Version → Save & Run All** for a fresh unattended execution; it starts the experiment again, so do not use it to rerun a completed interactive training merely for saving. Download `ocrg_b0_rn50_336_s42.zip` and keep the two `.pt` files separately in Kaggle outputs. The ZIP contains configs, curves, per-image validation metrics, native masks and checkpoint hashes, excluding heavyweight weights. No pretrained accuracy or GPU-runtime result is claimed until the actual run completes.
