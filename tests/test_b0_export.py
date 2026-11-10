@@ -19,8 +19,12 @@ spec.loader.exec_module(export)
 
 
 class ExportTests(unittest.TestCase):
-    def test_source_hashes(self):
-        manifest = export.verify_source()
+    def test_original_source_guard_rejects_backbone_branch(self):
+        # This experiment deliberately extends model/train sources. The historical
+        # exporter must reject it; do not update the original source manifest.
+        manifest = export.load(ROOT / "scripts/b0_source_manifest.json")
+        with self.assertRaisesRegex(ValueError, "Original B0 source changed"):
+            export.verify_source()
         self.assertEqual(
             manifest["baseline_commit"], "0677214ffbc3e05659719f66d30db519509eba4c"
         )
