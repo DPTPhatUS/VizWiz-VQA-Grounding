@@ -50,6 +50,12 @@ def membership_targets(output, mask):
     if roles not in (2, 3):
         raise ValueError('Membership supervision requires two or three roles')
     targets = targets[..., :roles]
+    if output.get('symmetric_targets', False):
+        # Reciprocal averaging preserves total class mass on the valid graph.
+        # A mixed binary pair has (include, exclude, neutral) = (0, .5, .5)
+        # in both directions, rather than incompatible exclude/neutral labels.
+        from models.connections import symmetric_logits
+        targets = symmetric_logits(targets, output['edge_indices'])
     targets = targets * output['edge_valid'][None, :, :, None]
     return targets
 

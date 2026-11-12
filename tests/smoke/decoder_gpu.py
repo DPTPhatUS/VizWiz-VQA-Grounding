@@ -10,19 +10,21 @@ from losses import segmentation_loss, membership_loss, affinity_loss
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--device', choices=('cpu','cuda'), default='cuda')
-parser.add_argument('--models', nargs='+', choices=('shared','separate','symmetric-affinity','two-role'),
+parser.add_argument('--models', nargs='+', choices=('shared','separate','symmetric-affinity','two-role','symmetric-membership'),
                     default=['shared','separate','symmetric-affinity','two-role'])
+parser.add_argument('--membership-steps', type=int, default=2)
 args = parser.parse_args()
 device = torch.device(args.device)
 torch.set_num_threads(2)
 for name in args.models:
     mode = 'shared' if name == 'shared' else 'separate'
-    refinement = name if name in ('symmetric-affinity','two-role') else 'membership'
+    refinement = name if name in ('symmetric-affinity','two-role','symmetric-membership') else 'membership'
     torch.manual_seed(42)
     if device.type == 'cuda':
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-    model = CompactDecoder(connection_mode=mode, local_refinement=refinement).to(device)
+    model = CompactDecoder(connection_mode=mode, local_refinement=refinement,
+                           membership_steps=args.membership_steps).to(device)
     features = [torch.randn(1, 1024, 24, 24, device=device, requires_grad=True) for _ in range(4)]
     attention = torch.ones(1, 20, dtype=torch.bool, device=device)
     valid = attention.clone(); valid[:, [0, -1]] = False
@@ -39,7 +41,8 @@ for name in args.models:
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
     assert torch.isfinite(loss)
-    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters() if p.requires_grad)
+    assert all(p.grad is None for p in model.parameters() if not p.requires_grad)
     assert all(f.grad is not None and torch.isfinite(f.grad).all() for f in features)
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
     scaler.step(optimizer); scaler.update()

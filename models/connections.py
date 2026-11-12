@@ -4,11 +4,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-LOCAL_REFINEMENTS = ('membership', 'symmetric-affinity', 'two-role')
+LOCAL_REFINEMENTS = ('membership', 'symmetric-affinity', 'two-role', 'symmetric-membership')
 
 
 def symmetric_logits(logits, indices):
-    """Average opposite edge scores; neighborhood() orders reverse slots as 7-k."""
+    """Average reciprocal scalar scores or role vectors; reverse slots are 7-k."""
     opposite = torch.arange(7, -1, -1, device=indices.device)
     return (logits + logits[:, indices, opposite]) * .5
 
@@ -98,6 +98,10 @@ class ContextMembership(nn.Module):
             raise ValueError(f'Unknown local refinement: {local_refinement}')
         if not membership and local_refinement != 'membership':
             raise ValueError('A local refinement control cannot disable membership')
+        if not isinstance(steps, int) or isinstance(steps, bool) or steps < 0:
+            raise ValueError('Membership steps must be a nonnegative integer')
+        if not membership and steps != 2:
+            raise ValueError('Membership steps require enabled membership')
         self.local_refinement = local_refinement
         self.mode, self.steps = mode, steps
         self.context_network = ConnectionNetwork(channels, text_dim, width, pair_width)
@@ -117,7 +121,7 @@ class ContextMembership(nn.Module):
         # Construct in the original order before trimming the output head. This
         # preserves every common weight and the RNG state, including the readout
         # constructed by CompactDecoder after this module. No unused rows remain.
-        if local_refinement != 'membership':
+        if local_refinement in ('symmetric-affinity', 'two-role'):
             roles = 1 if local_refinement == 'symmetric-affinity' else 2
             self.membership_head.out_features = roles
             self.membership_head.weight = nn.Parameter(self.membership_head.weight[:roles].detach().clone())
@@ -136,6 +140,9 @@ class ContextMembership(nn.Module):
             self.update_strength.requires_grad_(False)
             if self.membership_network is not None:
                 self.membership_network.requires_grad_(False)
+        if steps == 0:
+            # Relation supervision is retained, but update rates have no effect.
+            self.update_strength.requires_grad_(False)
 
     def forward(self, feature, text):
         batch, channels, height, width = feature.shape
@@ -166,6 +173,8 @@ class ContextMembership(nn.Module):
         indices, valid = neighborhood(height, width, feature.device)
         pairs = network.local_pairs(conditioned, positions, indices)
         edge_logits = self.membership_head(pairs)
+        if self.local_refinement == 'symmetric-membership':
+            edge_logits = symmetric_logits(edge_logits.float(), indices)
         if self.local_refinement == 'symmetric-affinity':
             affinity_logits = symmetric_logits(edge_logits.squeeze(-1).float(), indices)
             refined = propagate_affinity(unary, affinity_logits, indices, valid,
@@ -189,4 +198,5 @@ class ContextMembership(nn.Module):
             'edge_logits': edge_logits,
             'edge_indices': indices,
             'edge_valid': valid,
+            **({'symmetric_targets': True} if self.local_refinement == 'symmetric-membership' else {}),
         }

@@ -10,12 +10,15 @@ from runtime import environment, parameter_counts
 from artifacts import write_json
 
 
+def autocast_context(device, precision):
+    return torch.autocast(device.type, dtype=torch.float16) if precision == 'fp16' else contextlib.nullcontext()
+
+
 @torch.inference_mode()
 def time_forward(call,device,precision,warmup=10,repeats=50):
-    def autocast():return torch.autocast(device.type,dtype=torch.float16) if precision=='fp16' else contextlib.nullcontext()
     def sync():
         if device.type=='cuda':torch.cuda.synchronize(device)
-    with autocast():
+    with autocast_context(device, precision):
         for _ in range(warmup):call()
         sync()
         if device.type=='cuda':torch.cuda.reset_peak_memory_stats(device)
@@ -27,6 +30,28 @@ def time_forward(call,device,precision,warmup=10,repeats=50):
             'batch1_images_per_second':1000/statistics.mean(times),
             'peak_allocated_bytes':torch.cuda.max_memory_allocated(device) if device.type=='cuda' else None,
             'peak_reserved_bytes':torch.cuda.max_memory_reserved(device) if device.type=='cuda' else None}
+
+
+@torch.inference_mode()
+def count_flops(call, device, precision):
+    """Convolution/matrix/attention FLOPs, with multiply-add counted as two.
+
+    Use equivalent unfused attention for counting only. Latency and memory use
+    the normal execution backend. Elementwise activations, graph reductions,
+    normalization, and interpolation are not covered by PyTorch's registry.
+    """
+    from torch.utils.flop_counter import FlopCounterMode
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    fastpath = torch.backends.mha.get_fastpath_enabled()
+    try:
+        torch.backends.mha.set_fastpath_enabled(False)
+        with autocast_context(device, precision), sdpa_kernel(SDPBackend.MATH), FlopCounterMode(display=False) as counter:
+            call()
+        total = counter.get_total_flops()
+        operators = {str(op):value for op,value in counter.get_flop_counts().get('Global', {}).items()}
+        return {'counted_flops':total, 'counted_gflops':total/1e9, 'counted_operators':operators}
+    finally:
+        torch.backends.mha.set_fastpath_enabled(fastpath)
 
 
 @torch.inference_mode()
@@ -43,8 +68,10 @@ def decoder_inputs(model,batch):
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--models',nargs='+',choices=('ftc','cm-shared','cm-separate','cm-affinity','cm-two-role','ftc-capacity','unet'),
+    parser.add_argument('--models',nargs='+',choices=('ftc','cm-shared','cm-separate','cm-affinity','cm-two-role','cm-symmetric-membership','ftc-capacity','unet'),
                         default=['ftc','cm-shared','cm-separate','ftc-capacity','unet'])
+    parser.add_argument('--membership-steps',type=int,nargs='+',default=[2],
+                        help='Benchmark these refinement depths for each CM architecture; FTC/UNet run once')
     parser.add_argument('--device',default='cuda')
     parser.add_argument('--precision',choices=('fp32','fp16'),default='fp32')
     parser.add_argument('--warmup',type=int,default=10);parser.add_argument('--repeats',type=int,default=50)
@@ -54,6 +81,8 @@ def main(argv=None):
     from pathlib import Path
     if Path(args.output).exists():raise ValueError('Refusing to overwrite benchmark output')
     if args.warmup<1 or args.repeats<1:raise ValueError('Warmup and repeats must be positive')
+    if any(t < 0 for t in args.membership_steps) or len(set(args.membership_steps)) != len(args.membership_steps):
+        raise ValueError('Membership steps must be distinct nonnegative integers')
     device=torch.device(args.device)
     if args.precision=='fp16' and device.type!='cuda':raise ValueError('FP16 benchmark requires CUDA')
     if args.tiny and 'unet' in args.models:raise ValueError('Tiny smoke benchmark does not support U-Net')
@@ -62,8 +91,14 @@ def main(argv=None):
             'precision':args.precision,'batch_size':1,'input_size':32 if args.tiny else 336,
             'warmup':args.warmup,'repeats':args.repeats,'tiny_smoke':args.tiny,'tf32':False,
             'timing_boundary':'GPU-resident input, model forward including text tokenization; excludes file IO and native resizing',
+            'decoder_timing_boundary':'cached image/text encoders and bottleneck cross-attention; includes skip fusion, refinement and upsampling',
+            'weight_source':'pretrained encoders; initialized prediction layers; no training required for fixed-shape execution',
+            'flop_convention':'2 FLOPs per multiply-add; PyTorch convolution/matrix/attention registry; equivalent math attention for counting only',
+            'flop_exclusions':'elementwise operations, graph reductions, normalization, interpolation and tokenization; counted FLOPs are not total arithmetic cost',
             'throughput_definition':'1000 / mean batch-1 latency in milliseconds','models':{}}
-    for name in args.models:
+    variants = [(name, steps) for name in args.models
+                for steps in (args.membership_steps if name.startswith('cm-') else [2])]
+    for name, steps in variants:
         torch.manual_seed(42)
         if device.type=='cuda':torch.cuda.empty_cache()
         if name=='unet':
@@ -72,15 +107,22 @@ def main(argv=None):
         else:
             model=build_model('cm' if name.startswith('cm-') else name,tiny=args.tiny,
                               connection_mode='shared' if name=='cm-shared' else 'separate',
-                              local_refinement={'cm-affinity':'symmetric-affinity','cm-two-role':'two-role'}.get(name,'membership'))
+                              local_refinement={'cm-affinity':'symmetric-affinity','cm-two-role':'two-role',
+                                                'cm-symmetric-membership':'symmetric-membership'}.get(name,'membership'),
+                              membership_steps=steps)
         model.to(device).float().eval()
         size=32 if args.tiny else 336
         batch={'image':torch.rand(1,3,size,size,device=device),'text':['Q: What is the expiration date on this bottle?']}
         full=time_forward(lambda:model(batch),device,args.precision,args.warmup,args.repeats)
-        cached=decoder_inputs(model,batch)
+        with autocast_context(device,args.precision):
+            cached=decoder_inputs(model,batch)
         if device.type=='cuda':torch.cuda.empty_cache()
         decoder=time_forward(lambda:model.decoder(*cached),device,args.precision,args.warmup,args.repeats)
-        result['models'][name]={'parameters':parameter_counts(model),'experiment_config':model.experiment_config,
+        # Profile after timing, so counting cannot change warm-up or memory peaks.
+        full.update(count_flops(lambda:model(batch),device,args.precision))
+        decoder.update(count_flops(lambda:model.decoder(*cached),device,args.precision))
+        key = f'{name}_t{steps}' if name.startswith('cm-') and args.membership_steps != [2] else name
+        result['models'][key]={'parameters':parameter_counts(model),'experiment_config':model.experiment_config,
                                 'forward':full,'decoder':decoder}
         del cached,model,batch
     write_json(args.output,result);print(json.dumps(result))

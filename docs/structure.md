@@ -11,7 +11,7 @@ Implementation scripts and shared files live directly at the source root. There 
 | `predictions.py` | Logit export/index, native reconstruction, optional PNG export. |
 | `dataset.py` | Question-only inputs, image/mask alignment, loaders and collating. |
 | `losses.py` | Segmentation BCE, occupancy targets, three-/two-role loss, balanced affinity loss. |
-| `metrics.py` | Native-grid counts, image metrics, aggregate scores. |
+| `metrics.py` | Native-grid region/boundary counts, image metrics, aggregate scores. |
 | `validation.py` | Non-padding distributed validation, preserving training modes and RNG. |
 | `checkpoints.py` | Selected-model saving and strict architecture/tensor reconstruction. |
 | `runtime.py` | Device transfer, parameter counts, source commit and software information. |
@@ -26,6 +26,7 @@ Implementation scripts and shared files live directly at the source root. There 
 | `experiments/export.py` | Explicit manual archive export. |
 | `diagnostics/` | Threshold calibration, question dependence, relation-role analysis, efficiency. |
 | `configs/high_priority.json` | 27 model/seed configurations; affinity and two-role controls first; matched 30-epoch settings. |
+| `configs/instructor_high_priority.json` | 12 new symmetric-membership/depth runs plus three CM-Separate references; same training protocol. |
 | `docs/` | Vast/Kaggle setup and verification. |
 | `tests/` | Offline behavior tests, reference fixtures, optional hardware smoke tools. |
 

@@ -3,12 +3,14 @@ from models.cm import GroundingModel
 
 
 def build_model(model='cm', tiny=False, connection_mode='shared', context=True, membership=True, pretrained=True,
-                local_refinement='membership'):
+                local_refinement='membership', membership_steps=2):
     if model == 'cm':
         return GroundingModel(tiny, connection_mode, context, membership, pretrained,
-                              local_refinement=local_refinement)
+                              local_refinement=local_refinement, membership_steps=membership_steps)
     if local_refinement != 'membership':
         raise ValueError('Local refinement controls require a CM model')
+    if membership_steps != 2:
+        raise ValueError('Membership steps require a CM model')
     if model not in ('ftc', 'ftc-capacity'):
         raise ValueError(f'Unknown model: {model}')
     from models.ftc import FTCModel

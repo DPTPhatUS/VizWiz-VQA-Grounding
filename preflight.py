@@ -45,7 +45,8 @@ def main(argv=None):
     seed_everything(args.seed)
     model=build_model(args.model,tiny=args.tiny,connection_mode=args.connection_mode,
                       context=not args.disable_context,membership=not args.disable_membership,
-                      pretrained=True,local_refinement=args.local_refinement).to(args.device)
+                      pretrained=True,local_refinement=args.local_refinement,
+                      membership_steps=args.membership_steps).to(args.device)
     dataset=VizWizGroundingDataset(args.data_root,'train',32 if args.tiny else 336)
     objective=SupervisedObjective(args.edge_loss_weight)
     optimizer=torch.optim.Adam([p for p in model.parameters() if p.requires_grad],lr=args.lr)

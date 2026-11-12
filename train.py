@@ -47,6 +47,8 @@ def training_parser():
                         help='Relation supervision weight; default .1 when enabled')
     parser.add_argument('--local-refinement', choices=LOCAL_REFINEMENTS,
                         help='CM local update rule; default membership (three roles)')
+    parser.add_argument('--membership-steps', type=int,
+                        help='CM refinement iterations; default 2. Zero retains relation supervision.')
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=4, help="Global batch size across all ranks")
     parser.add_argument("--num-workers", type=int, default=4)
@@ -70,21 +72,26 @@ def check_arguments(args):
         raise ValueError("Workers cannot be negative; learning rate must be positive")
     if args.edge_loss_weight is not None and (not np.isfinite(args.edge_loss_weight) or args.edge_loss_weight < 0):
         raise ValueError('edge-loss-weight must be finite and nonnegative')
+    if args.membership_steps is not None and args.membership_steps < 0:
+        raise ValueError('membership-steps must be nonnegative')
 
 
 def configure_run(args):
     explicit = getattr(args, '_explicit', set())
     args.model = args.model or 'cm'
-    if args.model != 'cm' and any(k in explicit for k in ('connection_mode','disable_context','disable_membership','edge_loss_weight','local_refinement')):
+    if args.model != 'cm' and any(k in explicit for k in ('connection_mode','disable_context','disable_membership','edge_loss_weight','local_refinement','membership_steps')):
         raise ValueError('CM-specific options are not supported for FTC models')
     args.connection_mode = args.connection_mode or 'shared'
     args.local_refinement = args.local_refinement or 'membership'
+    args.membership_steps = 2 if args.membership_steps is None else args.membership_steps
     args.tiny = bool(args.tiny)
     args.disable_context, args.disable_membership = bool(args.disable_context), bool(args.disable_membership)
     if args.model != 'cm' and args.local_refinement != 'membership':
         raise ValueError('Local refinement controls require a CM model')
     if args.disable_membership and args.local_refinement != 'membership':
         raise ValueError('A local refinement control cannot disable membership')
+    if (args.model != 'cm' or args.disable_membership) and args.membership_steps != 2:
+        raise ValueError('Membership steps require CM with membership enabled')
     if args.edge_loss_weight is None:
         args.edge_loss_weight = .1 if args.model == 'cm' and not args.disable_membership else 0.
     if args.disable_membership and args.edge_loss_weight > 0:
@@ -140,6 +147,7 @@ def _train(args, rank, world, distributed, device):
         if args.disable_context: options['context'] = False
         if args.disable_membership: options['membership'] = False
         if args.local_refinement != 'membership': options['local_refinement'] = args.local_refinement
+        options['membership_steps'] = args.membership_steps
         model = GroundingModel(**options)
     else:
         model = build_model(model=args.model, tiny=args.tiny)

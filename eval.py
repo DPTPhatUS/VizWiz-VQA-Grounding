@@ -39,11 +39,14 @@ def eval_main(argv=None):
     loader = make_loader(dataset,args,args.batch_size)
     out = Path(args.output_dir); out.mkdir(parents=True,exist_ok=True)
     with LogitWriter(out/'logits.npz', args.dataset, info, config['image_size']) as logits:
-        counts = evaluate_counts(model,loader,device,out if args.save_masks else None,logit_writer=logits)
+        counts = evaluate_counts(model,loader,device,out if args.save_masks else None,
+                                 logit_writer=logits,boundary=True)
     summary = {**summarize_counts(counts),
                "dataset":args.dataset,"metric_resolution":"original",
                "text_mode":"question","checkpoint":info,
-               "threshold":.5}
+               "threshold":.5,
+               "boundary_definition":"mean image-wise inner-band IoU; 3x3 zero-padded erosion, "
+                                     "max(1, round(0.02 * native diagonal)) iterations"}
     write_json(out/'metrics.json', {'summary':summary,
         'run':os.path.relpath(record_path,out),
         'per_sample':{name:{**row, **sample_metrics(row)} for name,row in counts.items()},

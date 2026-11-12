@@ -1,0 +1,120 @@
+{
+  "name": "matched-30ep-v1",
+  "description": "Instructor high priorities: symmetric three-role membership, trained iteration sweep, and CM-Separate references. Same training cohort as high_priority.json.",
+  "hub": {
+    "repo_id": "Last-Bullet/vizwiz-cm-aciids-2027",
+    "prefix": "instructor-high-priority",
+    "private": false
+  },
+  "common": {
+    "num_epochs": 30,
+    "batch_size": 4,
+    "lr": 1e-05,
+    "num_workers": 2,
+    "val_every": 1
+  },
+  "runs": [
+    {
+      "id": "cm_symmetric_membership_s42",
+      "model": "cm",
+      "connection_mode": "separate",
+      "local_refinement": "symmetric-membership",
+      "seed": 42
+    },
+    {
+      "id": "cm_symmetric_membership_s123",
+      "model": "cm",
+      "connection_mode": "separate",
+      "local_refinement": "symmetric-membership",
+      "seed": 123
+    },
+    {
+      "id": "cm_symmetric_membership_s456",
+      "model": "cm",
+      "connection_mode": "separate",
+      "local_refinement": "symmetric-membership",
+      "seed": 456
+    },
+    {
+      "id": "cm_steps0_s42",
+      "model": "cm",
+      "connection_mode": "separate",
+      "membership_steps": 0,
+      "seed": 42
+    },
+    {
+      "id": "cm_steps0_s123",
+      "model": "cm",
+      "connection_mode": "separate",
+      "membership_steps": 0,
+      "seed": 123
+    },
+    {
+      "id": "cm_steps0_s456",
+      "model": "cm",
+      "connection_mode": "separate",
+      "membership_steps": 0,
+      "seed": 456
+    },
+    {
+      "id": "cm_steps1_s42",
+      "model": "cm",
+      "connection_mode": "separate",
+      "membership_steps": 1,
+      "seed": 42
+    },
+    {
+      "id": "cm_steps1_s123",
+      "model": "cm",
+      "connection_mode": "separate",
+      "membership_steps": 1,
+      "seed": 123
+    },
+    {
+      "id": "cm_steps1_s456",
+      "model": "cm",
+      "connection_mode": "separate",
+      "membership_steps": 1,
+      "seed": 456
+    },
+    {
+      "id": "cm_steps3_s42",
+      "model": "cm",
+      "connection_mode": "separate",
+      "membership_steps": 3,
+      "seed": 42
+    },
+    {
+      "id": "cm_steps3_s123",
+      "model": "cm",
+      "connection_mode": "separate",
+      "membership_steps": 3,
+      "seed": 123
+    },
+    {
+      "id": "cm_steps3_s456",
+      "model": "cm",
+      "connection_mode": "separate",
+      "membership_steps": 3,
+      "seed": 456
+    },
+    {
+      "id": "cm_separate_s42",
+      "model": "cm",
+      "connection_mode": "separate",
+      "seed": 42
+    },
+    {
+      "id": "cm_separate_s123",
+      "model": "cm",
+      "connection_mode": "separate",
+      "seed": 123
+    },
+    {
+      "id": "cm_separate_s456",
+      "model": "cm",
+      "connection_mode": "separate",
+      "seed": 456
+    }
+  ]
+}

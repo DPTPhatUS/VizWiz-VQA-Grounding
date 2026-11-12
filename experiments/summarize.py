@@ -8,12 +8,14 @@ from artifacts import write_json, new_output
 from runtime import DEFAULT_MANIFEST
 
 METRICS=('mean_iou','acc50','macro_precision','macro_recall','severe_count')
+OPTIONAL_METRICS=('boundary_miou',)
+VALIDATION_METRICS=('val_mean_iou','val_boundary_miou')
 
 
 def summary_stats(rows):
     return {key:{'mean':statistics.mean(r[key] for r in rows),
                  'sample_std':statistics.stdev(r[key] for r in rows) if len(rows)>1 else None}
-            for key in METRICS}
+            for key in (*METRICS, *OPTIONAL_METRICS, *VALIDATION_METRICS) if all(key in r for r in rows)}
 
 
 def summarize(root,manifest):
@@ -40,22 +42,32 @@ def summarize(root,manifest):
         if result['checkpoint']!=expected:
             raise ValueError('Test metrics do not match best checkpoint')
         label=run['id'].rsplit('_s',1)[0]
+        validation = folder/'val/metrics.json'
+        val = json.loads(validation.read_text())['summary'] if validation.exists() else {}
+        if val and (val.get('dataset') != 'val' or val.get('checkpoint') != expected):
+            raise ValueError('Validation metrics do not match best checkpoint')
         rows.append({'run_id':run['id'],'configuration':label,'seed':run['seed'],
-                     **{key:result[key] for key in METRICS},'source_commit':record['provenance']['git_commit']})
+                     **{key:result[key] for key in (*METRICS, *OPTIONAL_METRICS) if key in result},
+                     **{'val_'+key:val[key] for key in ('mean_iou','boundary_miou') if key in val},
+                     'source_commit':record['provenance']['git_commit']})
     groups={name:summary_stats([r for r in rows if r['configuration']==name]) for name in sorted({r['configuration'] for r in rows})}
     ftc={r['seed']:r for r in rows if r['configuration']=='ftc'}
     cm={r['seed']:r for r in rows if r['configuration']=='cm_separate'}
-    paired=[{'seed':seed,**{key:cm[seed][key]-ftc[seed][key] for key in METRICS}} for seed in sorted(ftc.keys()&cm.keys())]
+    def differences(control):
+        return [{'seed':seed, **{key:cm[seed][key]-control[seed][key]
+                 for key in (*METRICS, *OPTIONAL_METRICS) if key in cm[seed] and key in control[seed]}}
+                for seed in sorted(cm.keys()&control.keys())]
+    paired=differences(ftc)
     controls = {}
-    for label in ('cm_affinity', 'cm_two_role', 'context_only', 'membership_only', 'cm_noaux', 'ftc_capacity'):
+    for label in sorted(set(groups) - {'cm_separate','ftc'}):
         control = {r['seed']:r for r in rows if r['configuration']==label}
-        pairs = [{'seed':seed, **{key:cm[seed][key]-control[seed][key] for key in METRICS}}
-                 for seed in sorted(cm.keys()&control.keys())]
+        pairs = differences(control)
         if pairs:
             controls[label] = {'pairs':pairs, 'num_pairs':len(pairs), 'summary':summary_stats(pairs)}
     return {'cohort':manifest['name'],'runs':rows,'missing_runs':missing,'by_configuration':groups,
             'paired_cm_minus_ftc':paired,'paired_summary':summary_stats(paired) if paired else {},
             'paired_cm_minus_controls':controls,
+            'missing_boundary_runs':[r['run_id'] for r in rows if 'boundary_miou' not in r],
             'uncertainty':'sample standard deviation across training seeds; not an image-level confidence interval'}
 
 
@@ -68,7 +80,8 @@ def main(argv=None):
     result=summarize(args.root,json.loads(Path(args.manifest).read_text()))
     out=new_output(args.output_dir);write_json(out/'summary.json',result)
     with (out/'runs.csv').open('w',newline='') as stream:
-        keys=['run_id','configuration','seed',*METRICS,'source_commit']
+        keys=['run_id','configuration','seed',*METRICS,*OPTIONAL_METRICS,
+              'val_mean_iou','val_boundary_miou','source_commit']
         writer=csv.DictWriter(stream,fieldnames=keys);writer.writeheader();writer.writerows(result['runs'])
     print(json.dumps({'completed':len(result['runs']),'missing':result['missing_runs']}))
 

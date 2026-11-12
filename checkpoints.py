@@ -24,13 +24,14 @@ def model_options(saved, explicit_model=None):
         raise ValueError(f'Unsupported model in checkpoint: {kind}')
     if explicit_model is not None and kind != explicit_model:
         raise ValueError('Explicit model conflicts with checkpoint configuration')
-    required = ['tiny'] + (['connection_mode', 'context_enabled', 'membership_enabled'] if kind == 'cm' else [])
+    required = ['tiny'] + (['connection_mode', 'context_enabled', 'membership_enabled', 'membership_steps'] if kind == 'cm' else [])
     if any(key not in config for key in required):
         raise ValueError('Incomplete model configuration in checkpoint')
     return dict(model=kind, tiny=config['tiny'],
                 **({'connection_mode':config['connection_mode'], 'context':config['context_enabled'],
                     'membership':config['membership_enabled'],
-                    'local_refinement':config.get('local_refinement', 'membership')} if kind == 'cm' else {}))
+                    'local_refinement':config.get('local_refinement', 'membership'),
+                    'membership_steps':config['membership_steps']} if kind == 'cm' else {}))
 
 
 def load_model_weights(model, saved, assign=False):

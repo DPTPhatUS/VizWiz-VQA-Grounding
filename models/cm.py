@@ -10,7 +10,7 @@ EXPERIMENT = 'context-membership'
 
 class GroundingModel(nn.Module):
     def __init__(self, tiny=False, connection_mode='shared', context=True, membership=True, pretrained=True,
-                 local_refinement='membership'):
+                 local_refinement='membership', membership_steps=2):
         super().__init__()
         self.image_encoder = TinyVision() if tiny else ImageEncoder(pretrained=pretrained)
         self.text_encoder = TextEncoder(tiny, pretrained=pretrained).requires_grad_(False)
@@ -20,13 +20,14 @@ class GroundingModel(nn.Module):
         self.cross_attn = nn.MultiheadAttention(self.visual_dim, 2 if tiny else 8, batch_first=True)
         self.decoder = CompactDecoder(self.visual_dim, self.text_dim, width=16 if tiny else 128,
                                       connection_mode=connection_mode, tiny=tiny,
-                                      context=context, membership=membership, local_refinement=local_refinement)
+                                      context=context, membership=membership, local_refinement=local_refinement,
+                                      membership_steps=membership_steps)
         self.register_buffer("image_mean", torch.tensor([.48145466, .4578275, .40821073]).view(1,3,1,1))
         self.register_buffer("image_std", torch.tensor([.26862954, .26130258, .27577711]).view(1,3,1,1))
         self.experiment_config = {
             'experiment': EXPERIMENT, 'model': 'cm', 'architecture': 'compact', 'tiny': tiny,
             'connection_mode': connection_mode, 'connection_width': 16 if tiny else 128,
-            'pair_width': 16, 'membership_steps': 2, 'edge_neighborhood': 8,
+            'pair_width': 16, 'membership_steps': membership_steps, 'edge_neighborhood': 8,
             'freeze_text_encoder': True, 'skip_film': True, 'residual_fusion': False,
             'protocol': 'context-membership-v1',
             'context_enabled': context, 'membership_enabled': membership,

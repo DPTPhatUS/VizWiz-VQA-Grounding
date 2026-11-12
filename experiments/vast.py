@@ -40,9 +40,11 @@ def main(argv=None):
     parser.add_argument('--hf-repo',default=DEFAULT_REPO)
     parser.add_argument('--hf-prefix',default='matched-30ep-v1')
     parser.add_argument('--runs',nargs='+')
+    parser.add_argument('--manifest',default=str(DEFAULT_MANIFEST))
     parser.add_argument('--save-masks',action='store_true')
     args = parser.parse_args(argv)
-    run_study(args.work_dir,args.hf_repo,args.hf_prefix,args.runs,save_masks=args.save_masks)
+    run_study(args.work_dir,args.hf_repo,args.hf_prefix,args.runs,
+              manifest=args.manifest,save_masks=args.save_masks)
 
 
 if __name__ == '__main__':
