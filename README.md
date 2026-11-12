@@ -1062,6 +1062,116 @@ for line in Path('q_verified.txt').read_text().splitlines():
 
 Then run Cell Z (the ZIP is named `q_mask_agreement.zip`).
 
+## Session R: which stage uses its detail map, and does amplifying the maps help? (inference only, about 2–3 h)
+
+**Why.** Session P zeroed all detail maps at once. This session (`revision/stagewise_detail.py`) asks three finer questions on the validation split only, with the trained models unchanged:
+1. Zeroing one map at a time (`zero_p0` … `zero_p4`): does any single decoder stage, or the refiner, use its map?
+2. Multiplying all maps by 2 or 4 (`scale_x2`, `scale_x4`): do the maps carry information the trained model weights too weakly?
+3. Gradient × input attribution of each map against the decoder features it is fused with, plus the gradient reaching each parameter group: how much of the training signal reaches the pathway?
+
+No training. The test split is not used. Session P and Q files are not used or changed. The analysis is fixed in advance in `analyze_stagewise_detail.py` (with the paper's analysis scripts).
+
+**Attach** the same checkpoints as Sessions P and Q: the dataset, the published epoch-20 checkpoint (run 1, Cell 1), and `g_image_s43/checkpoint_epoch20.pt`, `g_image_s44/checkpoint_epoch10.pt`, `g_image_s45/checkpoint_epoch20.pt`, `g_image_s46/checkpoint_epoch20.pt`. Run Cell 1 first.
+
+### Cell R1: checkpoint paths
+
+```python
+CKPTS = {  # run name: selected checkpoint ('' if not attached)
+    'image_s42': os.environ['PARENT_CKPT'],
+    'image_s43': '',   # .../g_image_s43/checkpoint_epoch20.pt
+    'image_s44': '',   # .../g_image_s44/checkpoint_epoch10.pt
+    'image_s45': '',   # .../g_image_s45/checkpoint_epoch20.pt
+    'image_s46': '',   # .../g_image_s46/checkpoint_epoch20.pt
+}
+EXPECTED_VAL = {  # published validation mean IoU of each selected checkpoint
+    'image_s42': 0.6577, 'image_s43': 0.6504, 'image_s44': 0.6499, 'image_s45': 0.6424, 'image_s46': 0.6513,
+}
+CKPTS = {k: v for k, v in CKPTS.items() if v}
+for name, path in CKPTS.items():
+    assert Path(path).is_file(), f'{name}: {path} not found'
+Path('r_runs.txt').write_text(''.join(f'{k} {v}\n' for k, v in CKPTS.items()))
+os.environ['RUN_NAME'] = 'r_stagewise'
+print('attached runs:', list(CKPTS))
+if not set(CKPTS) - {'image_s42'}:
+    print('Only run 1 is attached: Sessions P and Q excluded run 1, so the analysis will be descriptive only.')
+```
+
+### Cell R2: verify every checkpoint before any intervention (both GPUs, about 20 min)
+
+```bash
+%%bash
+set -euo pipefail
+out="$RUN_ROOT/$RUN_NAME/verify"
+mkdir -p "$out"
+work() {
+    gpu=$1; shift
+    for run in "$@"; do
+        ckpt=$(awk -v r="$run" '$1 == r {print $2}' r_runs.txt)
+        [[ -f "$out/${run}_val.json" ]] && continue
+        CUDA_VISIBLE_DEVICES=$gpu uv run --frozen python revision/detail_intervention.py \
+            --checkpoint "$ckpt" --data-root "$DATA_ROOT" --dataset val --device cuda \
+            --conditions original --batch-size "$EVAL_BATCH" --num-workers 2 \
+            --output "$out/${run}_val.json" > "$out/${run}_val.log" 2>&1
+    done
+}
+mapfile -t runs < <(awk '{print $1}' r_runs.txt)
+work 0 "${runs[@]:0:3}" &
+work 1 "${runs[@]:3}" &
+wait
+```
+
+```python
+import json
+verified, bad = [], []
+for name in CKPTS:
+    got = json.loads(Path(os.environ['RUN_ROOT'], os.environ['RUN_NAME'], 'verify', f'{name}_val.json')
+                     .read_text())['summary']['mean_iou']['original']
+    print(f'{name} val: {got:.4f} (published {EXPECTED_VAL[name]:.4f})')
+    (verified if abs(got - EXPECTED_VAL[name]) <= 5e-5 else bad).append(name)
+Path('r_verified.txt').write_text(''.join(f'{k} {CKPTS[k]}\n' for k in verified))
+print('verified:', verified, '| NOT verified (excluded):', bad)
+assert verified, 'No checkpoint reproduces its published score: stop here'
+```
+
+### Cell R3: stagewise interventions and gradients on the verified checkpoints (both GPUs, about 2 h for five runs)
+
+The batch size is the same as in Cell R2, so the unchanged model's per-image IoU can be compared exactly. The gradient pass does not backpropagate through the encoders, so it fits on a T4 at this batch size. If a run still runs out of memory, stop and report it rather than changing the batch size.
+
+```bash
+%%bash
+set -euo pipefail
+out="$RUN_ROOT/$RUN_NAME"
+work() {
+    gpu=$1; shift
+    for run in "$@"; do
+        ckpt=$(awk -v r="$run" '$1 == r {print $2}' r_verified.txt)
+        [[ -f "$out/${run}_val.json" ]] && continue
+        CUDA_VISIBLE_DEVICES=$gpu uv run --frozen python revision/stagewise_detail.py \
+            --checkpoint "$ckpt" --data-root "$DATA_ROOT" --dataset val --device cuda \
+            --batch-size "$EVAL_BATCH" --num-workers 2 --output "$out/${run}_val.json" \
+            > "$out/${run}_val.log" 2>&1
+        tail -1 "$out/${run}_val.log" | cut -c1-400
+    done
+}
+mapfile -t runs < <(awk '{print $1}' r_verified.txt)
+work 0 "${runs[@]:0:3}" &
+work 1 "${runs[@]:3}" &
+wait
+```
+
+```python
+for line in Path('r_verified.txt').read_text().splitlines():
+    run = line.split()[0]
+    a = json.loads(Path(os.environ['RUN_ROOT'], os.environ['RUN_NAME'], f'{run}_val.json').read_text())
+    b = json.loads(Path(os.environ['RUN_ROOT'], os.environ['RUN_NAME'], 'verify', f'{run}_val.json').read_text())
+    mine = {n: r['iou_original'] for n, r in a['per_sample'].items()}
+    assert mine == b['per_sample']['original'], f'{run}: original changed between cells'
+    s = a['summary']
+    print(run, {c: round(s[c]['iou'] - s['mean_iou_original'], 4) for c in a['conditions'][1:]})
+```
+
+Then run Cell Z (the ZIP is named `r_stagewise.zip`) and return it.
+
 ## Cell Z: ZIP results, excluding checkpoints
 
 ```python
